@@ -1,0 +1,13 @@
+sudo docker run -d -it \
+    -v ${PWD}:/workspace/mlsys \
+    -v /data:/cache \
+    --name sk-sslo \
+    --ipc=host \
+    --runtime=nvidia \
+    --gpus all \
+    --cap-add=SYS_ADMIN \
+    --ulimit memlock=-1 \
+    --restart=unless-stopped \
+    --privileged \
+    --network=host \
+    nvcr.io/nvidia/pytorch:25.10-py3 bash
