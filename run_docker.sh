@@ -10,4 +10,4 @@ sudo docker run -d -it \
     --restart=unless-stopped \
     --privileged \
     --network=host \
-    nvcr.io/nvidia/pytorch:25.10-py3 bash
+    nvcr.io/nvidia/pytorch:26.03-py3 bash
