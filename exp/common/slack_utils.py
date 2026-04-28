@@ -99,6 +99,58 @@ AUDIO_TIMELINE_COLUMNS = TimelineColumns(
 )
 
 
+@dataclass(frozen=True)
+class TextOutputPaths:
+    summary_json: Path
+    requests_jsonl: Path
+    chunks_jsonl: Path
+    chunks_csv: Path
+
+
+@dataclass(frozen=True)
+class AudioDurationPaths:
+    durations_jsonl: Path
+    durations_csv: Path
+    duration_cache_jsonl: Path
+
+
+@dataclass(frozen=True)
+class ResultOutputPaths:
+    slack_rows_jsonl: Path
+    slack_rows_csv: Path
+    summary_json: Path
+    slack_distribution_png: Path
+
+
+def text_output_paths(output_dir: str | Path) -> TextOutputPaths:
+    root = Path(output_dir)
+    return TextOutputPaths(
+        summary_json=root / "summary.json",
+        requests_jsonl=root / "requests.jsonl",
+        chunks_jsonl=root / "chunks.jsonl",
+        chunks_csv=root / "chunks.csv",
+    )
+
+
+def audio_duration_paths(output_dir: str | Path) -> AudioDurationPaths:
+    root = Path(output_dir)
+    return AudioDurationPaths(
+        durations_jsonl=root / "durations.jsonl",
+        durations_csv=root / "durations.csv",
+        duration_cache_jsonl=root / "duration_cache.jsonl",
+    )
+
+
+def result_output_paths(output_dir: str | Path) -> ResultOutputPaths:
+    root = Path(output_dir)
+    return ResultOutputPaths(
+        slack_rows_jsonl=root / "slack_rows.jsonl",
+        slack_rows_csv=root / "slack_rows.csv",
+        summary_json=root / "summary.json",
+        slack_distribution_png=root / "slack_distribution.png",
+    )
+
+
 def request_idx(record: dict[str, Any], fallback: int) -> int:
     request_id = str(record.get("request_id", ""))
     if request_id.startswith("test") and request_id[4:].isdigit():

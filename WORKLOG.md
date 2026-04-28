@@ -74,3 +74,31 @@
 - Modified: Consolidated repeated human/audio deadline-slack timeline math into `exp/common/slack_utils.py:add_deadline_slack_columns`, moved shared mean/stat helpers there, reused common JSON writers in `exp/benchmark.py`, and made the TTS `sitecustomize` path call the same runtime patch helper as `exp/audio_duration.py`.
 - Modified: Added short role comments to the experiment launcher and Python stages so the config blocks, three stages, cache handling, mode mapping, and plotting sections are easier to scan.
 - Debugging/verification: Re-ran container-only `py_compile`/`bash -n` checks in `sk-sslo` and `sk-sslo-omni`, a synthetic two-mode analysis smoke test in `sk-sslo`, and a `PYTHONPATH=exp/torchaudio_stub` sitecustomize smoke test.
+- Modified: Moved canonical stage filenames out of `exp/run_experiment.sh` and into Python path helpers in `exp/common/slack_utils.py`; the launcher now passes only stage directories via `--output-dir`, `--input-dir`, `--text-output-dir`, and `--audio-duration-dir`.
+- Debugging/verification: Re-ran container-only syntax checks in `sk-sslo` and `sk-sslo-omni`, verified the new directory-based analysis smoke path, and checked the updated `audio_duration.py`/`analyze_results.py` CLI help in `sk-sslo-omni`.
+- Modified: Removed unused LoRA support from `exp/benchmark.py`, including `lora_requests`, the LoRA import, sample kwargs, CLI flags, and `llm.generate(..., lora_request=...)`.
+- Debugging/verification: Confirmed `rg` finds no remaining LoRA references under `exp/`, then re-ran container-only syntax checks in `sk-sslo` and `sk-sslo-omni`.
+- Modified: Added measured-stage GPU warmup support to `exp/benchmark.py` via `--warmup-requests`, and added request arrival pacing via `--request-rate` plus `--request-burstiness`; `exp/run_experiment.sh` exposes these as top-level constants.
+- Modified: Recorded warmup/request-rate settings in benchmark `summary.json` and documented the new stage-1 behavior in `exp/README.md`.
+- Debugging/verification: Re-ran container-only syntax checks in `sk-sslo` and `sk-sslo-omni`, checked the new benchmark CLI options, and ran a small request-arrival helper smoke test in `sk-sslo`.
+- Modified: Kept `exp/benchmark.py` independent of SSLO-specific vLLM chunk timing fields by using the local streamed `RequestOutput` chunk collector, while preserving `request_submit_ts`, warmup, and request-rate pacing.
+- Modified: Updated `exp/README.md` to state that chunk timestamps come from the benchmark stream receive path and do not require custom vLLM fields such as `chunk_timings`.
+- Debugging/verification: Re-ran container-only `py_compile`/`bash -n` checks in `sk-sslo` and `sk-sslo-omni`, and ran a helper-level smoke test for request-arrival delays, stream chunk collection, and `request_submit_ts` schema.
+- Modified: Moved fixed benchmark options into `exp/benchmark.py`: vLLM backend, async engine mode, and chat-template application are now set internally instead of passed from `exp/run_experiment.sh`.
+- Modified: Simplified the stage-1 launcher command and documented the fixed benchmark options in `exp/README.md`.
+- Debugging/verification: Re-ran container-only syntax checks in `sk-sslo` and `sk-sslo-omni`, checked `exp/run_experiment.sh` with `bash -n`, and verified `benchmark.py --help` no longer exposes the removed fixed-option flags.
+- Modified: Added `MAX_CHUNKS_PER_REQUEST=48` to `exp/run_experiment.sh` and `--max-chunks-per-request` handling in `exp/benchmark.py`, so each measured request writes at most 48 sentence chunks to downstream text outputs.
+- Modified: Recorded chunk cap metadata in request timelines (`num_chunks_before_cap`, `max_chunks_per_request`, `chunks_truncated`) and documented the cap in `exp/README.md`.
+- Debugging/verification: Re-ran container-only syntax checks in `sk-sslo` and `sk-sslo-omni`, ran a helper smoke test proving 60 collected chunks are capped to 48, removed pycache, and stopped leftover vLLM-Omni processes from the interrupted full run.
+- Modified: Refactored `exp/audio_duration.py` prompt-length handling into a `PromptLengthEstimator` object that owns the Qwen3-TTS tokenizer/config once per TTS run, removing the ambiguous in-memory prompt-length cache dict.
+- Modified: Renamed the resumable TTS result cache variable to `duration_cache` so it is clearly separate from prompt-length estimation.
+- Debugging/verification: Stopped the restarted benchmark/TTS launcher and cleaned remaining vLLM processes, then ran `python3 -m py_compile exp/audio_duration.py` inside `sk-sslo-omni`.
+- Debugging/verification: Stopped the interrupted `sk-sslo-omni` TTS run, killed the remaining orphan `VLLM::EngineCore`, and confirmed both GPUs returned to 0 MiB used memory.
+- Modified: Converted `exp/run_experiment_read.sh` into a human-reading-only launcher by removing the vLLM-Omni container, TTS config rendering, audio duration generation, and audio output directories.
+- Modified: Added `--analysis-target human` to `exp/analyze_results.py` so read-only runs can create per-mode human slack rows, summaries, and figures directly from benchmark text outputs.
+- Debugging/verification: In `sk-sslo`, ran `python3 -m py_compile` for the touched Python files, `bash -n exp/run_experiment_read.sh`, and a human-only `analyze_results.py` smoke run using existing text outputs.
+- Modified: Added optional `tqdm` progress bars to `exp/benchmark.py` for warmup requests and measured request completion in the async vLLM benchmark loop.
+- Debugging/verification: In `sk-sslo`, ran `python3 -m py_compile exp/benchmark.py` and `bash -n exp/run_experiment_read.sh`.
+- Modified: Added sentence/paragraph chunk grouping to `exp/benchmark.py`, including multi-output chunk groups from a single inference pass.
+- Modified: Updated `exp/run_experiment_read.sh` to write human-read outputs under `exp/output/{model_slug}/{dataset_slug}/{chunk_unit}/{slack_mode}/...` for both `sentence` and `paragraph`.
+- Debugging/verification: In `sk-sslo`, reran `py_compile`, `bash -n exp/run_experiment_read.sh`, and a small collector smoke test for sentence and paragraph boundaries.
