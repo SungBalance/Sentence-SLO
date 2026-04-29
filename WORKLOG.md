@@ -102,3 +102,23 @@
 - Modified: Added sentence/paragraph chunk grouping to `exp/benchmark.py`, including multi-output chunk groups from a single inference pass.
 - Modified: Updated `exp/run_experiment_read.sh` to write human-read outputs under `exp/output/{model_slug}/{dataset_slug}/{chunk_unit}/{slack_mode}/...` for both `sentence` and `paragraph`.
 - Debugging/verification: In `sk-sslo`, reran `py_compile`, `bash -n exp/run_experiment_read.sh`, and a small collector smoke test for sentence and paragraph boundaries.
+- Modified: Set the read-only launcher to `NUM_PROMPTS=256`, `MAX_MODEL_LEN=8192`, `GENERATION_MAX_TOKENS=8192`, `TENSOR_PARALLEL_SIZE=2`, and `CUDA_VISIBLE_DEVICES=0,1`.
+- Modified: Added benchmark summary metadata for max model length, tensor parallel size, and GPU memory utilization.
+- Debugging/verification: Stopped the interrupted no-cap run, cleared the model/dataset output folders, ran the 256-request human-read experiment to completion in `sk-sslo`, backfilled the generated benchmark summaries with the 8K/TP=2 metadata, and confirmed both GPUs were idle afterward.
+- Modified: Updated `exp/analyze_results.py` so final slack result rows, summaries, and figures exclude each request's first decoding chunk while preserving it for subsequent deadline calculation.
+- Modified: Documented the first-decoding-chunk exclusion in `exp/README.md`.
+- Debugging/verification: Re-ran container-only `py_compile`/`bash -n`, regenerated the human-read analysis outputs for the completed 256-request run, and verified every result CSV starts at `chunk_idx=1` with 256 excluded rows per model/chunk unit/slack mode.
+- Added: Created `exp/eval_datasets.py` to load and clean the supported evaluation dataset, `HuggingFaceH4/Koala-test-set`, with deterministic prompt repetition when `NUM_PROMPTS` exceeds the dataset size.
+- Modified: Removed vLLM benchmark dataset sampling from `exp/benchmark.py`; the benchmark now receives cleaned eval prompts, applies the model chat template, and records `dataset_item_id` in request timelines.
+- Modified: Updated `exp/run_experiment.sh`, `exp/run_experiment_read.sh`, and `exp/README.md` for the Koala dataset flow and the new `--dataset-split` option.
+- Debugging/verification: In `sk-sslo`, ran Python compile checks, `bash -n` for both launchers, a Koala loader smoke test for 185 prompts, and checked `benchmark.py --help` for the simplified dataset CLI.
+- Debugging/verification: Cleared the regenerated Koala human-read result folders, reran `exp/run_experiment_read.sh` in `sk-sslo` for 256 requests across Qwen3.5 35B-A3B and 27B, and verified sentence/paragraph `previous_chunk` and `cumulative` summaries were recreated with first decoding chunks excluded.
+- Modified: Changed `exp/eval_datasets.py` prompt selection so `NUM_PROMPTS` larger than the dataset size is clamped to the available rows instead of repeating prompts.
+- Modified: Updated the `exp/benchmark.py --num-prompts` help text to describe the new clamp behavior.
+- Debugging/verification: In `sk-sslo`, ran `python3 -m py_compile exp/eval_datasets.py exp/benchmark.py` and verified Koala `num_prompts=256` returns 180 unique dataset rows with no `__r` repeat ids.
+- Modified: Removed mode-level duplication of shared experiment artifacts from `exp/run_experiment.sh` and `exp/run_experiment_read.sh`; text outputs and audio durations now live once outside `previous_chunk`/`cumulative`, while only analysis results are mode-specific.
+- Modified: Updated `exp/README.md` to document the deduplicated output layout for full and human-read-only runs.
+- Debugging/verification: In `sk-sslo`, ran `bash -n exp/run_experiment.sh && bash -n exp/run_experiment_read.sh` and checked that the old copy helper/source-mode paths are gone from the launchers.
+- Modified: Added read-only batch sweep support around `max_num_seqs` in `exp/run_experiment_read.sh`, propagated `max_num_seqs` into benchmark and analysis summaries, and added `exp/compare_read_batch_results.py` for batch-size summary tables and comparison figures.
+- Modified: Updated `exp/README.md` for the new `batch_{max_num_seqs}` read-only output layout and batch comparison outputs.
+- Debugging/verification: In `sk-sslo`, ran `py_compile` for `exp/benchmark.py`, `exp/analyze_results.py`, `exp/common/slack_utils.py`, and `exp/compare_read_batch_results.py`, `bash -n exp/run_experiment_read.sh`, a synthetic human-only batch comparison smoke test, and a partial clean rerun where `batch_16` and `batch_32` completed before an operator interrupt during `batch_64`.

@@ -8,21 +8,30 @@ export HF_HUB_CACHE=/cache/hub
 CONTAINER_REPO="/workspace/mlsys"
 BENCH_CONTAINER="sk-sslo"
 ANALYSIS_CONTAINER="sk-sslo"
-CUDA_VISIBLE_DEVICES_VALUE="0"
+CUDA_VISIBLE_DEVICES_VALUE="0,1"
 
 EXP_ROOT="${CONTAINER_REPO}/exp"
 OUTPUT_ROOT="${EXP_ROOT}/output"
 
 # Benchmark options.
-NUM_PROMPTS=128
+NUM_PROMPTS=256
+MAX_MODEL_LEN=8192
+GENERATION_MAX_TOKENS=8192
+TENSOR_PARALLEL_SIZE=1
 GPU_MEMORY_UTILIZATION=0.95
 WARMUP_REQUESTS=1
 REQUEST_RATE="inf"
 REQUEST_BURSTINESS=1.0
+MAX_NUM_SEQS_VALUES=(
+  "16"
+  "32"
+  "64"
+  "128"
+)
 
-# Dataset options. DATASET_PATH is used for the output slug when it is set.
-DATASET_NAME="hf"
-DATASET_PATH="Aeala/ShareGPT_Vicuna_unfiltered"
+# Dataset options.
+DATASET_NAME="HuggingFaceH4/Koala-test-set"
+DATASET_SPLIT="test"
 
 # Human reading speed used for slack analysis.
 SECONDS_PER_WORD=0.28
@@ -51,23 +60,6 @@ slugify() {
   printf '%s' "${value}"
 }
 
-copy_directory_files() {
-  local source_dir="$1"
-  local target_dir="$2"
-
-  docker exec "${ANALYSIS_CONTAINER}" bash -lc '
-    set -euo pipefail
-    source_dir="$1"
-    target_dir="$2"
-    mkdir -p "${target_dir}"
-    shopt -s nullglob
-    files=("${source_dir}"/*)
-    if ((${#files[@]})); then
-      cp -f "${files[@]}" "${target_dir}/"
-    fi
-  ' bash "${source_dir}" "${target_dir}"
-}
-
 run_in_container() {
   local container="$1"
   shift
@@ -93,60 +85,86 @@ require_container() {
 require_container "${BENCH_CONTAINER}"
 require_container "${ANALYSIS_CONTAINER}"
 
+delete_model_dataset_root() {
+  local model_dataset_root="$1"
+
+  docker exec "${ANALYSIS_CONTAINER}" bash -lc '
+    set -euo pipefail
+    rm -rf "$1"
+  ' bash "${model_dataset_root}"
+}
+
 # Build dataset arguments once so every model run sees the same inputs.
-DATASET_SLUG_SOURCE="${DATASET_PATH:-${DATASET_NAME}}"
-DATASET_SLUG="$(slugify "${DATASET_SLUG_SOURCE}")"
-DATASET_ARGS=(--dataset-name "${DATASET_NAME}")
-if [[ -n "${DATASET_PATH}" ]]; then
-  DATASET_ARGS+=(--dataset-path "${DATASET_PATH}")
-fi
+DATASET_SLUG="$(slugify "${DATASET_NAME}")"
+DATASET_ARGS=(--dataset-name "${DATASET_NAME}" --dataset-split "${DATASET_SPLIT}")
 
 for MODEL in "${MODELS[@]}"; do
   MODEL_SLUG="$(slugify "${MODEL}")"
   MODEL_DATASET_ROOT="${OUTPUT_ROOT}/${MODEL_SLUG}/${DATASET_SLUG}"
-  SOURCE_MODE="${SLACK_MODES[0]}"
-  CHUNK_OUTPUT_ARGS=()
+  delete_model_dataset_root "${MODEL_DATASET_ROOT}"
 
-  for CHUNK_UNIT in "${CHUNK_UNITS[@]}"; do
-    CHUNK_OUTPUT_ROOT="${MODEL_DATASET_ROOT}/${CHUNK_UNIT}"
-    SOURCE_TEXT_DIR="${CHUNK_OUTPUT_ROOT}/${SOURCE_MODE}/text_outputs"
-    run_in_container "${ANALYSIS_CONTAINER}" mkdir -p "${SOURCE_TEXT_DIR}"
-    CHUNK_OUTPUT_ARGS+=(--chunk-output-group "${CHUNK_UNIT}=${SOURCE_TEXT_DIR}")
+  for MAX_NUM_SEQS in "${MAX_NUM_SEQS_VALUES[@]}"; do
+    BATCH_ROOT="${MODEL_DATASET_ROOT}/batch_${MAX_NUM_SEQS}"
+    CHUNK_OUTPUT_ARGS=()
+
+    for CHUNK_UNIT in "${CHUNK_UNITS[@]}"; do
+      CHUNK_OUTPUT_ROOT="${BATCH_ROOT}/${CHUNK_UNIT}"
+      TEXT_DIR="${CHUNK_OUTPUT_ROOT}/text_outputs"
+      run_in_container "${ANALYSIS_CONTAINER}" mkdir -p "${TEXT_DIR}"
+      CHUNK_OUTPUT_ARGS+=(--chunk-output-group "${CHUNK_UNIT}=${TEXT_DIR}")
+    done
+
+    # Stage 1: one LLM inference pass per max_num_seqs, with both chunk collectors.
+    run_in_container "${BENCH_CONTAINER}" python3 "${EXP_ROOT}/benchmark.py" \
+      --model "${MODEL}" \
+      "${DATASET_ARGS[@]}" \
+      --num-prompts "${NUM_PROMPTS}" \
+      --max-model-len "${MAX_MODEL_LEN}" \
+      --max-num-seqs "${MAX_NUM_SEQS}" \
+      --generation-max-tokens "${GENERATION_MAX_TOKENS}" \
+      --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
+      --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+      --warmup-requests "${WARMUP_REQUESTS}" \
+      --request-rate "${REQUEST_RATE}" \
+      --request-burstiness "${REQUEST_BURSTINESS}" \
+      "${CHUNK_OUTPUT_ARGS[@]}" \
+      --seconds-per-word "${SECONDS_PER_WORD}"
+
+    for CHUNK_UNIT in "${CHUNK_UNITS[@]}"; do
+      CHUNK_OUTPUT_ROOT="${BATCH_ROOT}/${CHUNK_UNIT}"
+      TEXT_DIR="${CHUNK_OUTPUT_ROOT}/text_outputs"
+      for SLACK_MODE in "${SLACK_MODES[@]}"; do
+        MODE_ROOT="${CHUNK_OUTPUT_ROOT}/${SLACK_MODE}"
+        RESULTS_DIR="${MODE_ROOT}/results"
+        run_in_container "${ANALYSIS_CONTAINER}" mkdir -p "${RESULTS_DIR}"
+
+        # Stage 2: compute one human reading slack mode for this batch setting.
+        run_in_container "${ANALYSIS_CONTAINER}" python3 "${EXP_ROOT}/analyze_results.py" \
+          --analysis-target human \
+          --text-output-dir "${TEXT_DIR}" \
+          --slack-mode "${SLACK_MODE}" \
+          --output-dir "${RESULTS_DIR}"
+      done
+    done
   done
 
-  # Stage 1: one LLM inference pass, with multiple chunk collectors attached.
-  run_in_container "${BENCH_CONTAINER}" python3 "${EXP_ROOT}/benchmark.py" \
-    --model "${MODEL}" \
-    "${DATASET_ARGS[@]}" \
-    --num-prompts "${NUM_PROMPTS}" \
-    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
-    --warmup-requests "${WARMUP_REQUESTS}" \
-    --request-rate "${REQUEST_RATE}" \
-    --request-burstiness "${REQUEST_BURSTINESS}" \
-    "${CHUNK_OUTPUT_ARGS[@]}" \
-    --seconds-per-word "${SECONDS_PER_WORD}"
-
   for CHUNK_UNIT in "${CHUNK_UNITS[@]}"; do
-    CHUNK_OUTPUT_ROOT="${MODEL_DATASET_ROOT}/${CHUNK_UNIT}"
-    SOURCE_TEXT_DIR="${CHUNK_OUTPUT_ROOT}/${SOURCE_MODE}/text_outputs"
+    COMPARISON_ROOT="${MODEL_DATASET_ROOT}/batch_size_comparison/${CHUNK_UNIT}"
     for SLACK_MODE in "${SLACK_MODES[@]}"; do
-      MODE_ROOT="${CHUNK_OUTPUT_ROOT}/${SLACK_MODE}"
-      TEXT_DIR="${MODE_ROOT}/text_outputs"
-      RESULTS_DIR="${MODE_ROOT}/results"
-      run_in_container "${ANALYSIS_CONTAINER}" mkdir -p \
-        "${TEXT_DIR}" "${RESULTS_DIR}"
+      COMPARISON_DIR="${COMPARISON_ROOT}/${SLACK_MODE}"
+      BATCH_RESULT_ARGS=()
+      for MAX_NUM_SEQS in "${MAX_NUM_SEQS_VALUES[@]}"; do
+        BATCH_RESULT_ARGS+=(
+          --batch-result
+          "${MAX_NUM_SEQS}=${MODEL_DATASET_ROOT}/batch_${MAX_NUM_SEQS}/${CHUNK_UNIT}/${SLACK_MODE}/results"
+        )
+      done
 
-      if [[ "${SLACK_MODE}" != "${SOURCE_MODE}" ]]; then
-        # Reuse source text outputs so only mode-specific analysis is repeated.
-        copy_directory_files "${SOURCE_TEXT_DIR}" "${TEXT_DIR}"
-      fi
-
-      # Stage 2: compute and plot one human reading slack mode.
-      run_in_container "${ANALYSIS_CONTAINER}" python3 "${EXP_ROOT}/analyze_results.py" \
-        --analysis-target human \
-        --text-output-dir "${TEXT_DIR}" \
+      # Stage 3: compare one chunk unit + slack mode across max_num_seqs runs.
+      run_in_container "${ANALYSIS_CONTAINER}" python3 "${EXP_ROOT}/compare_read_batch_results.py" \
         --slack-mode "${SLACK_MODE}" \
-        --output-dir "${RESULTS_DIR}"
+        --output-dir "${COMPARISON_DIR}" \
+        "${BATCH_RESULT_ARGS[@]}"
     done
   done
 done

@@ -64,6 +64,14 @@ HUMAN_RESULT_COLUMNS = [
 ]
 
 
+def exclude_first_decoding_chunks(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    # The first generated chunk has no prior chunk to compare against.
+    filtered_rows = [row for row in rows if int(row["chunk_idx"]) != 0]
+    return filtered_rows, len(rows) - len(filtered_rows)
+
+
 def build_human_result_rows(
     *,
     chunk_rows: list[dict[str, Any]],
@@ -136,21 +144,38 @@ def build_result_rows(
     return result_rows
 
 
+def _negative_stats(values: list[float]) -> dict[str, Any]:
+    n = sum(1 for v in values if v < 0)
+    return {
+        "count": n,
+        "fraction": n / len(values) if values else 0.0,
+    }
+
+
 def summarize(
     rows: list[dict[str, Any]],
     *,
     slack_mode: str,
     include_audio: bool,
+    excluded_first_decoding_chunks: int,
+    text_summary: dict[str, Any] | None,
 ) -> dict[str, Any]:
     human_values = [float(row["human_slack_seconds"]) for row in rows]
     summary: dict[str, Any] = {
         "slack_mode": slack_mode,
         "row_count": len(rows),
+        "excluded_first_decoding_chunks": excluded_first_decoding_chunks,
         "human": summary_stats(human_values),
+        "human_negative": _negative_stats(human_values),
     }
     if include_audio:
         audio_values = [float(row["audio_slack_seconds"]) for row in rows]
         summary["audio"] = summary_stats(audio_values)
+        summary["audio_negative"] = _negative_stats(audio_values)
+    if text_summary is not None:
+        for key in ("max_num_seqs", "tensor_parallel_size", "gpu_memory_utilization"):
+            if key in text_summary:
+                summary[key] = text_summary[key]
     return summary
 
 
@@ -270,13 +295,20 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     input_chunks_jsonl, input_durations_jsonl = resolve_input_paths(args)
     output_paths = result_output_paths(output_dir)
+    text_summary = None
+    if args.text_output_dir:
+        summary_path = text_output_paths(args.text_output_dir).summary_json
+        if summary_path.exists():
+            import json
+
+            text_summary = json.loads(summary_path.read_text())
 
     chunk_rows = read_jsonl(input_chunks_jsonl)
     include_audio = args.analysis_target == "both"
     if include_audio:
         if input_durations_jsonl is None:
             raise ValueError("Audio analysis requires duration rows.")
-        result_rows = build_result_rows(
+        raw_result_rows = build_result_rows(
             chunk_rows=chunk_rows,
             duration_rows=read_jsonl(input_durations_jsonl),
             slack_mode=args.slack_mode,
@@ -284,22 +316,34 @@ def main() -> None:
         )
         csv_columns = RESULT_COLUMNS
     else:
-        result_rows = build_human_result_rows(
+        raw_result_rows = build_human_result_rows(
             chunk_rows=chunk_rows,
             slack_mode=args.slack_mode,
         )
         csv_columns = HUMAN_RESULT_COLUMNS
+    result_rows, excluded_first_decoding_chunks = exclude_first_decoding_chunks(
+        raw_result_rows
+    )
 
     write_jsonl(output_paths.slack_rows_jsonl, result_rows)
     write_csv(output_paths.slack_rows_csv, result_rows, columns=csv_columns)
-    write_json(
-        output_paths.summary_json,
-        summarize(
-            result_rows,
-            slack_mode=args.slack_mode,
-            include_audio=include_audio,
-        ),
+
+    neg_human = [r for r in result_rows if float(r["human_slack_seconds"]) < 0]
+    write_jsonl(output_dir / "negative_slack_human.jsonl", neg_human)
+    write_csv(output_dir / "negative_slack_human.csv", neg_human, columns=csv_columns)
+    if include_audio:
+        neg_audio = [r for r in result_rows if float(r["audio_slack_seconds"]) < 0]
+        write_jsonl(output_dir / "negative_slack_audio.jsonl", neg_audio)
+        write_csv(output_dir / "negative_slack_audio.csv", neg_audio, columns=csv_columns)
+
+    summary = summarize(
+        result_rows,
+        slack_mode=args.slack_mode,
+        include_audio=include_audio,
+        excluded_first_decoding_chunks=excluded_first_decoding_chunks,
+        text_summary=text_summary,
     )
+    write_json(output_paths.summary_json, summary)
     plot_distribution(
         rows=result_rows,
         output_path=output_paths.slack_distribution_png,
@@ -308,6 +352,17 @@ def main() -> None:
         include_audio=include_audio,
     )
     print(f"Wrote {args.slack_mode} slack results under {output_dir}")
+    hn = summary["human_negative"]
+    print(
+        f"  human negative slack: {hn['count']} / {summary['row_count']} "
+        f"({hn['fraction']:.1%}) -> negative_slack_human.jsonl"
+    )
+    if include_audio:
+        an = summary["audio_negative"]
+        print(
+            f"  audio negative slack: {an['count']} / {summary['row_count']} "
+            f"({an['fraction']:.1%}) -> negative_slack_audio.jsonl"
+        )
 
 
 if __name__ == "__main__":

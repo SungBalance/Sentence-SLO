@@ -1,0 +1,60 @@
+model,request_idx,chunk_idx,token_count,word_count,text,start_time_ts,end_time_ts,duration_seconds,slack_mode,human_consume_seconds,human_deadline_ts,human_slack_seconds
+Qwen/Qwen3.5-27B,2,1,22,12,"  **Analyze the Request:**
+    *   Task: List the layers of the TCP/IP model.",857265.333522093,857266.201024517,0.8675024239346385,cumulative,4.2,857266.132200922,-0.0688235949492082
+Qwen/Qwen3.5-27B,5,1,34,14,"  **Analyze the Request:**
+    *   Input time: December 21, 1:00 – 1:50 PM Pacific Time.",857265.333629545,857266.69707519,1.3634456449653953,cumulative,4.760000000000001,857266.132090659,-0.5649845310254022
+Qwen/Qwen3.5-27B,12,1,24,12,"  **Analyze the Request:**
+    *   **Topic:** A family sailing vacation in Bora Bora.",857265.333622325,857266.283885112,0.9502627870533615,cumulative,4.2,857266.13211144,-0.15177367208525538
+Qwen/Qwen3.5-27B,16,1,22,10,"  **Analyze the Request:**
+    *   **Task:** Create 10 marketing punch lines.",857311.958785889,857312.842432954,0.8836470650276169,cumulative,3.6400000000000006,857312.756776324,-0.08565662999171764
+Qwen/Qwen3.5-27B,19,1,33,18,"  **Analyze the Request:**
+    *   **Topic:** A play about a porcupine named Prickles who wants to be a seamstress.",857354.800239506,857356.164114618,1.3638751120306551,cumulative,5.880000000000001,857355.597294136,-0.566820482024923
+Qwen/Qwen3.5-27B,38,1,26,15,"  **Analyze the Request:**
+    *   Premise 1: A tree is on the top of a mountain.",857548.923156831,857550.008997073,1.0858402420999482,cumulative,5.04,857549.719666932,-0.28933014103677124
+Qwen/Qwen3.5-27B,42,1,22,12,"  **Analyze the Request:**
+    *   Subject: The book ""The Art of Thinking Clearly"".",857589.258500314,857590.172357975,0.9138576610712335,cumulative,4.2,857590.054895279,-0.11746269604191184
+Qwen/Qwen3.5-27B,49,1,26,10,"  **Analyze the Request:**
+    *   **Task:** Create a 2000-word conversational article.",857623.856125277,857624.929776674,1.0736513970186934,cumulative,3.6400000000000006,857624.653295924,-0.27648075006436557
+Qwen/Qwen3.5-27B,51,1,35,25,"  **Analyze the Request:** The user is presenting a riddle/puzzle based on a specific sentence: ""One One was a race horse Two Two was one too.",857626.84676243,857628.305145036,1.458382605924271,cumulative,7.840000000000001,857627.643904318,-0.6612407179782167
+Qwen/Qwen3.5-27B,56,1,84,35,"  **Analyze the Request:**
+    *   **Given:** Profit percentages for four quarters:
+        *   Q1: 90%
+        *   Q2: 92%
+        *   Q3: 81%
+        *   Q4: 88%
+    *   **Question:** What is the ""total profit percent over a period of time""?",857673.235142499,857676.786090855,3.55094835604541,cumulative,12.88,857676.2721280099,-0.5139628450851887
+Qwen/Qwen3.5-27B,72,1,25,12,"  **Analyze the Request:**
+    *   **Role:** Content Writer, Proficient SEO Writer, Fluent English.",857823.809703324,857824.841397705,1.031694381032139,cumulative,4.2,857824.606407441,-0.23499026405625045
+Qwen/Qwen3.5-27B,78,1,47,24,"  **Analyze the Request:**
+    *   Context: It's 2023 (according to the prompt, though I know it's currently 2024, I must adhere to the prompt's context).",857865.613857237,857867.574070498,1.9602132609579712,cumulative,7.5600000000000005,857866.411036845,-1.163033653050661
+Qwen/Qwen3.5-27B,83,1,24,14,"  **Analyze the Request:**
+    *   Action 1: Put a plate on top of an apple.",857901.785967303,857902.76606331,0.9800960069987923,cumulative,4.760000000000001,857902.583002463,-0.18306084698997438
+Qwen/Qwen3.5-27B,88,1,35,18,"  **Analyze the Request:**
+    *   Input: ""Write ""Test""""
+    *   Intent: The user wants me to output the word ""Test"".",857928.916394231,857930.35506595,1.4386717189336196,cumulative,5.880000000000001,857929.713876645,-0.6411893049953505
+Qwen/Qwen3.5-27B,90,1,22,12,"  **Analyze the Request:**
+    *   **Topic:** Role of digital health in preventing diseases.",857959.557067599,857960.473647339,0.9165797400055453,cumulative,4.2,857960.354390381,-0.1192569580161944
+Qwen/Qwen3.5-27B,93,1,21,11,"  **Analyze the Request:**
+    *   Topic: Daily exercise routine (Monday to Sunday).",857965.856827828,857966.707512136,0.8506843079812825,cumulative,3.92,857966.654171102,-0.05334103398490697
+Qwen/Qwen3.5-27B,98,1,54,31,"  **Analyze the Request:**
+    *   Question: ""Who will be the president of South Korea in 2023?""
+    *   Context: The user is asking about the president of South Korea for the year 2023.",858008.765056648,858011.024890327,2.2598336790688336,cumulative,9.520000000000001,858009.5629894299,-1.4619008970912546
+Qwen/Qwen3.5-27B,100,1,39,21,"  **Analyze the Request:**
+    *   **Input Data:** A snippet of information describing the ""NSW Residential Building Contract for Small Works over $20,000"".",858016.460949765,858018.0782893,1.6173395349178463,cumulative,6.720000000000001,858017.258677977,-0.8196113229496405
+Qwen/Qwen3.5-27B,102,1,45,22,"  **Analyze the Request:**
+    *   Question: ""what language does argentina people speak""
+    *   Subject: Argentina (country)
+    *   Object: Language(s) spoken by its people.",858019.009156122,858020.877700906,1.8685447840252891,cumulative,7.0,858019.8068612149,-1.0708396910922602
+Qwen/Qwen3.5-27B,103,1,21,9,"  **Analyze the Request:**
+    *   **Task:** Write 50 short stories.",858031.793439359,858032.645113444,0.8516740849008784,cumulative,3.3600000000000003,858032.590786221,-0.05432722298428416
+Qwen/Qwen3.5-27B,105,1,24,9,"  **Analyze the Request:**
+    *   **Brand:** Hush Blankets (Weighted Blankets).",858044.07678152,858045.058106384,0.9813248639693484,cumulative,3.3600000000000003,858044.874381487,-0.1837248969823122
+Qwen/Qwen3.5-27B,128,1,25,15,"  **Analyze the Request:**
+    *   **Topic:** The importance of documenting history in relation to the future.",858257.444529459,858258.473580066,1.029050607001409,cumulative,5.04,858258.241370384,-0.23220968199893832
+Qwen/Qwen3.5-27B,132,1,42,19,"  **Analyze the Request:**
+    *   Question: ""is a bannana a fruit or a herb""
+    *   Subject: Banana (misspelled as ""bannana"").",858281.779421575,858283.534426435,1.755004859995097,cumulative,6.16,858282.576631367,-0.9577950680395588
+Qwen/Qwen3.5-27B,152,1,22,8,"  **Analyze the Request:**
+    *   Subject: Lady Gaga (singer/actress).",858441.575082648,858442.468588778,0.8935061300871894,cumulative,3.08,858442.3719295079,-0.0966592701151967
+Qwen/Qwen3.5-27B,167,1,46,31,"  **Analyze the Request:**
+    *   Input: An email text (""Thanks for your email, it has been a rough year here, but perhaps a chatbot could improve things, let's arrange a chat soon."").",858565.101725182,858567.038800865,1.9370756829157472,cumulative,9.520000000000001,858565.899121844,-1.1396790209691972

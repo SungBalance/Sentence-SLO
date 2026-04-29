@@ -29,29 +29,12 @@ try:
 except ImportError:
     tqdm = None
 
-from vllm.benchmarks.datasets import (
-    AIMODataset,
-    BurstGPTDataset,
-    ConversationDataset,
-    InstructCoderDataset,
-    MultiModalConversationDataset,
-    PrefixRepetitionRandomDataset,
-    RandomDataset,
-    RandomDatasetForReranking,
-    RandomMultiModalDataset,
-    SampleRequest,
-    ShareGPTDataset,
-    SonnetDataset,
-    VisionArenaDataset,
-    add_random_dataset_base_args,
-    add_random_multimodal_dataset_args,
-)
 from vllm.benchmarks.lib.utils import (
     convert_to_pytorch_benchmark_format,
     write_to_json,
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.inputs import TextPrompt, TokensPrompt
+from vllm.inputs import TextPrompt
 from vllm.outputs import RequestOutput
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.async_utils import merge_async_iterators
@@ -66,6 +49,12 @@ from common.slack_utils import (
     write_csv,
     write_json,
     write_jsonl,
+)
+from eval_datasets import (
+    KOALA_DATASET_ID,
+    EvalDatasetItem,
+    load_eval_dataset,
+    normalize_dataset_name,
 )
 
 
@@ -332,6 +321,7 @@ def limit_chunks_per_request(
 
 def build_timeline_record(
     request_output: RequestOutput,
+    eval_item: EvalDatasetItem,
     chunks: list[ChunkRecord],
     *,
     request_submit_ts: float,
@@ -390,6 +380,7 @@ def build_timeline_record(
 
     return {
         "request_id": request_output.request_id,
+        "dataset_item_id": eval_item.item_id,
         "chunk_unit": chunk_unit,
         "prompt_tokens": prompt_tokens,
         "output_tokens": output_tokens,
@@ -458,167 +449,38 @@ def save_to_pytorch_benchmark_format(
         write_to_json(pt_file, pt_records)
 
 
-def filter_requests_for_dp(
-    requests: list[SampleRequest],
+def filter_items_for_dp(
+    items: list[EvalDatasetItem],
     data_parallel_size: int,
-) -> list[SampleRequest]:
+) -> list[EvalDatasetItem]:
     if data_parallel_size == 1:
-        return requests
+        return items
 
     global_rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     data_parallel_rank = global_rank // (world_size // data_parallel_size)
     return [
-        request
-        for i, request in enumerate(requests)
+        item
+        for i, item in enumerate(items)
         if i % data_parallel_size == data_parallel_rank
     ]
 
 
-def get_requests(
+def get_eval_items(
     args: argparse.Namespace,
-    tokenizer: Any,
-) -> list[SampleRequest]:
-    # Keep vLLM benchmark dataset sampling in one place.
-    common_kwargs = {
-        "dataset_path": args.dataset_path,
-        "random_seed": args.seed,
-    }
-    sample_kwargs: dict[str, Any] = {
-        "tokenizer": tokenizer,
-        "num_requests": args.num_prompts,
-    }
-
-    if args.dataset_name == "random" or (
-        args.dataset_path is None
-        and args.dataset_name not in {"prefix_repetition", "random-mm", "random-rerank"}
-    ):
-        sample_kwargs["range_ratio"] = args.random_range_ratio
-        sample_kwargs["prefix_len"] = (
-            args.random_prefix_len
-            if getattr(args, "random_prefix_len", None) is not None
-            else args.prefix_len
-        )
-        sample_kwargs["input_len"] = (
-            args.random_input_len
-            if getattr(args, "random_input_len", None) is not None
-            else args.input_len
-        )
-        sample_kwargs["output_len"] = (
-            args.random_output_len
-            if getattr(args, "random_output_len", None) is not None
-            else args.output_len
-        )
-        dataset_cls = RandomDataset
-    elif args.dataset_name == "sharegpt":
-        dataset_cls = ShareGPTDataset
-        if args.output_len is not None:
-            sample_kwargs["output_len"] = args.output_len
-    elif args.dataset_name == "sonnet":
-        assert tokenizer.chat_template or tokenizer.default_chat_template, (
-            "Tokenizer/model must have chat template for sonnet dataset."
-        )
-        dataset_cls = SonnetDataset
-        sample_kwargs["prefix_len"] = args.prefix_len
-        sample_kwargs["return_prompt_formatted"] = True
-        if args.input_len is not None:
-            sample_kwargs["input_len"] = args.input_len
-        if args.output_len is not None:
-            sample_kwargs["output_len"] = args.output_len
-    elif args.dataset_name == "burstgpt":
-        dataset_cls = BurstGPTDataset
-    elif args.dataset_name == "hf":
-        if args.output_len is not None:
-            sample_kwargs["output_len"] = args.output_len
-        common_kwargs["dataset_split"] = args.hf_split or "train"
-        if args.dataset_path in VisionArenaDataset.SUPPORTED_DATASET_PATHS:
-            dataset_cls = VisionArenaDataset
-            common_kwargs["dataset_subset"] = None
-            sample_kwargs["enable_multimodal_chat"] = True
-        elif args.dataset_path in InstructCoderDataset.SUPPORTED_DATASET_PATHS:
-            dataset_cls = InstructCoderDataset
-        elif args.dataset_path in MultiModalConversationDataset.SUPPORTED_DATASET_PATHS:
-            dataset_cls = MultiModalConversationDataset
-            common_kwargs["dataset_subset"] = args.hf_subset
-            sample_kwargs["enable_multimodal_chat"] = True
-        elif args.dataset_path in ConversationDataset.SUPPORTED_DATASET_PATHS:
-            dataset_cls = ConversationDataset
-            common_kwargs["dataset_subset"] = args.hf_subset
-        elif args.dataset_path in AIMODataset.SUPPORTED_DATASET_PATHS:
-            dataset_cls = AIMODataset
-            common_kwargs["dataset_subset"] = None
-            common_kwargs["dataset_split"] = "train"
-        else:
-            raise ValueError(f"{args.dataset_path} is not supported by hf dataset.")
-    elif args.dataset_name == "prefix_repetition":
-        dataset_cls = PrefixRepetitionRandomDataset
-        sample_kwargs["prefix_len"] = args.prefix_repetition_prefix_len
-        sample_kwargs["suffix_len"] = args.prefix_repetition_suffix_len
-        sample_kwargs["num_prefixes"] = args.prefix_repetition_num_prefixes
-        sample_kwargs["output_len"] = args.prefix_repetition_output_len
-    elif args.dataset_name == "random-mm":
-        dataset_cls = RandomMultiModalDataset
-        sample_kwargs["input_len"] = (
-            args.random_input_len
-            if getattr(args, "random_input_len", None) is not None
-            else getattr(args, "input_len", None)
-        )
-        sample_kwargs["output_len"] = (
-            args.random_output_len
-            if getattr(args, "random_output_len", None) is not None
-            else getattr(args, "output_len", None)
-        )
-        sample_kwargs["base_items_per_request"] = getattr(
-            args, "random_mm_base_items_per_request", None
-        )
-        sample_kwargs["num_mm_items_range_ratio"] = getattr(
-            args, "random_mm_num_mm_items_range_ratio", None
-        )
-        sample_kwargs["limit_mm_per_prompt"] = getattr(
-            args, "random_mm_limit_mm_per_prompt", None
-        )
-        sample_kwargs["bucket_config"] = getattr(args, "random_mm_bucket_config", None)
-        sample_kwargs["enable_multimodal_chat"] = True
-        sample_kwargs["prefix_len"] = (
-            args.random_prefix_len
-            if getattr(args, "random_prefix_len", None) is not None
-            else getattr(args, "prefix_len", None)
-        )
-        sample_kwargs["range_ratio"] = args.random_range_ratio
-    elif args.dataset_name == "random-rerank":
-        dataset_cls = RandomDatasetForReranking
-        sample_kwargs["input_len"] = (
-            args.random_input_len
-            if getattr(args, "random_input_len", None) is not None
-            else getattr(args, "input_len", None)
-        )
-        sample_kwargs["output_len"] = (
-            args.random_output_len
-            if getattr(args, "random_output_len", None) is not None
-            else getattr(args, "output_len", None)
-        )
-        sample_kwargs["batchsize"] = getattr(args, "random_batch_size", 1)
-        sample_kwargs["is_reranker"] = not getattr(args, "no_reranker", False)
-        sample_kwargs["range_ratio"] = args.random_range_ratio
-    else:
-        raise ValueError(f"Unknown dataset name: {args.dataset_name}")
-
-    sample_kwargs = {key: value for key, value in sample_kwargs.items() if value is not None}
-    requests = dataset_cls(**common_kwargs).sample(**sample_kwargs)
-    return filter_requests_for_dp(requests, args.data_parallel_size)
+) -> list[EvalDatasetItem]:
+    items = load_eval_dataset(
+        dataset_name=args.dataset_name,
+        split=args.dataset_split,
+        num_prompts=args.num_prompts,
+    )
+    return filter_items_for_dp(items, args.data_parallel_size)
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.dataset is not None:
-        warnings.warn(
-            "The '--dataset' argument will be deprecated. "
-            "Please use '--dataset-name' and '--dataset-path' instead.",
-            stacklevel=2,
-        )
-        args.dataset_path = args.dataset
-
     if not getattr(args, "tokenizer", None):
         args.tokenizer = args.model
+    normalize_dataset_name(args.dataset_name)
 
     if getattr(args, "disable_log_stats", False):
         raise ValueError(
@@ -639,19 +501,6 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.max_chunks_per_request is not None and args.max_chunks_per_request <= 0:
         raise ValueError("--max-chunks-per-request must be positive when set.")
 
-    if (
-        not args.dataset
-        and not args.dataset_path
-        and args.dataset_name not in {"prefix_repetition"}
-    ):
-        print("When dataset path is not set, it will default to random dataset")
-        args.dataset_name = "random"
-        if args.input_len is None and getattr(args, "random_input_len", None) is None:
-            raise ValueError(
-                "Either --input-len or --random-input-len must be provided "
-                "for a random dataset."
-            )
-
     if args.data_parallel_size > 1 and (
         args.distributed_executor_backend != "external_launcher" or args.async_engine
     ):
@@ -662,7 +511,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 async def run_vllm_async(
-    requests: list[SampleRequest],
+    eval_items: list[EvalDatasetItem],
     n: int,
     engine_args: AsyncEngineArgs,
     do_profile: bool,
@@ -688,28 +537,16 @@ async def run_vllm_async(
         model_config = llm.model_config
         default_sampling_kwargs = dict(model_config.get_diff_sampling_param())
 
-        prompts: list[TextPrompt | TokensPrompt] = []
+        prompts: list[TextPrompt] = []
         sampling_params = []
-        for request in requests:
-            if FIXED_APPLY_CHAT_TEMPLATE:
-                if not isinstance(request.prompt, str):
-                    raise ValueError(
-                        "Fixed chat-template benchmark mode supports text prompts only."
-                    )
-                templated_prompt = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": request.prompt}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                prompt = TextPrompt(prompt=templated_prompt)
-                prompt_len = len(tokenizer(templated_prompt).input_ids)
-            elif "prompt_token_ids" in request.prompt:
-                prompt_token_ids = request.prompt["prompt_token_ids"]
-                prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
-                prompt_len = len(prompt_token_ids)
-            else:
-                prompt = TextPrompt(prompt=request.prompt)
-                prompt_len = request.prompt_len
+        for item in eval_items:
+            templated_prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": item.prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            prompt = TextPrompt(prompt=templated_prompt)
+            prompt_len = len(tokenizer(templated_prompt).input_ids)
 
             max_tokens = model_config.max_model_len - prompt_len
             if generation_max_tokens is not None:
@@ -721,9 +558,6 @@ async def run_vllm_async(
                     f"Got prompt_len={prompt_len}, "
                     f"max_model_len={model_config.max_model_len}."
                 )
-            if request.multi_modal_data:
-                assert isinstance(request.multi_modal_data, dict)
-                prompt["multi_modal_data"] = request.multi_modal_data
 
             prompts.append(prompt)
             sampling_kwargs = dict(default_sampling_kwargs)
@@ -777,7 +611,7 @@ async def run_vllm_async(
         async def delayed_generate(
             *,
             delay: float,
-            prompt: TextPrompt | TokensPrompt,
+            prompt: TextPrompt,
             sampling_param: SamplingParams,
             request_id: str,
         ):
@@ -862,7 +696,7 @@ async def run_vllm_async(
         end = time.perf_counter()
 
         final_outputs = [
-            final_outputs_by_request_id[f"test{i}"] for i in range(len(requests))
+            final_outputs_by_request_id[f"test{i}"] for i in range(len(eval_items))
         ]
         chunk_records_by_unit = {
             chunk_unit: {
@@ -884,25 +718,20 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dataset-name",
         type=str,
-        choices=[
-            "sharegpt",
-            "random",
-            "sonnet",
-            "burstgpt",
-            "hf",
-            "prefix_repetition",
-            "random-mm",
-            "random-rerank",
-        ],
-        default="sharegpt",
-        help="Name of the dataset to benchmark on.",
+        default=KOALA_DATASET_ID,
+        help="Evaluation dataset name. Currently supports HuggingFaceH4/Koala-test-set.",
     )
-    parser.add_argument("--dataset", type=str, default=None)
-    parser.add_argument("--dataset-path", type=str, default=None)
-    parser.add_argument("--input-len", type=int, default=None)
-    parser.add_argument("--output-len", type=int, default=None)
+    parser.add_argument("--dataset-split", type=str, default="test")
     parser.add_argument("--n", type=int, default=1)
-    parser.add_argument("--num-prompts", type=int, default=1000)
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        default=None,
+        help=(
+            "Number of prompts to use. Values larger than the dataset are "
+            "clamped to the dataset size."
+        ),
+    )
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--output-json", type=str, default=None)
     parser.add_argument("--slack-output-jsonl", type=str, default=None)
@@ -961,16 +790,7 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--disable-detokenize", action="store_true")
-    parser.add_argument("--prefix-len", type=int, default=0)
-    parser.add_argument("--hf-subset", type=str, default=None)
-    parser.add_argument("--hf-split", type=str, default=None)
     parser.add_argument("--profile", action="store_true", default=False)
-    parser.add_argument("--prefix-repetition-prefix-len", type=int, default=None)
-    parser.add_argument("--prefix-repetition-suffix-len", type=int, default=None)
-    parser.add_argument("--prefix-repetition-num-prefixes", type=int, default=None)
-    parser.add_argument("--prefix-repetition-output-len", type=int, default=None)
-    add_random_dataset_base_args(parser)
-    add_random_multimodal_dataset_args(parser)
     AsyncEngineArgs.add_cli_args(parser)
 
 
@@ -989,7 +809,7 @@ def main(args: argparse.Namespace) -> None:
         tokenizer_mode=args.tokenizer_mode,
         trust_remote_code=args.trust_remote_code,
     )
-    requests = get_requests(args, tokenizer)
+    eval_items = get_eval_items(args)
     # Stage 1: run LLM inference and keep per-request streaming timelines.
     (
         elapsed_time,
@@ -999,7 +819,7 @@ def main(args: argparse.Namespace) -> None:
         request_submit_ts_by_request_id,
     ) = run_async(
         run_vllm_async(
-            requests,
+            eval_items,
             args.n,
             AsyncEngineArgs.from_cli_args(args),
             do_profile=args.profile,
@@ -1026,7 +846,7 @@ def main(args: argparse.Namespace) -> None:
     total_num_tokens = total_prompt_tokens + total_output_tokens
 
     print(
-        f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
+        f"Throughput: {len(eval_items) / elapsed_time:.2f} requests/s, "
         f"{total_num_tokens / elapsed_time:.2f} total tokens/s, "
         f"{total_output_tokens / elapsed_time:.2f} output tokens/s"
     )
@@ -1044,15 +864,16 @@ def main(args: argparse.Namespace) -> None:
     base_results = {
         "model": args.model,
         "dataset_name": args.dataset_name,
-        "dataset_path": args.dataset_path,
+        "dataset_id": normalize_dataset_name(args.dataset_name),
+        "dataset_split": args.dataset_split,
         "elapsed_time": elapsed_time,
         "warmup_elapsed_time": warmup_elapsed_time,
         "warmup_requests": args.warmup_requests,
-        "num_requests": len(requests),
+        "num_requests": len(eval_items),
         "total_num_tokens": total_num_tokens,
         "total_prompt_tokens": total_prompt_tokens,
         "total_output_tokens": total_output_tokens,
-        "requests_per_second": len(requests) / elapsed_time,
+        "requests_per_second": len(eval_items) / elapsed_time,
         "tokens_per_second": total_num_tokens / elapsed_time,
         "output_tokens_per_second": total_output_tokens / elapsed_time,
         "request_rate": request_rate_for_json(args.request_rate),
@@ -1062,6 +883,10 @@ def main(args: argparse.Namespace) -> None:
         "apply_chat_template": FIXED_APPLY_CHAT_TEMPLATE,
         "backend": FIXED_BACKEND,
         "async_engine": FIXED_ASYNC_ENGINE,
+        "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_num_seqs,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
         "generation_max_tokens": args.generation_max_tokens,
         "max_chunks_per_request": args.max_chunks_per_request,
     }
@@ -1071,6 +896,7 @@ def main(args: argparse.Namespace) -> None:
         records = [
             build_timeline_record(
                 request_output,
+                eval_item,
                 chunk_records.get(request_output.request_id, []),
                 request_submit_ts=request_submit_ts_by_request_id[
                     request_output.request_id
@@ -1078,7 +904,7 @@ def main(args: argparse.Namespace) -> None:
                 max_chunks_per_request=args.max_chunks_per_request,
                 chunk_unit=chunk_unit,
             )
-            for request_output in request_outputs
+            for request_output, eval_item in zip(request_outputs, eval_items)
         ]
         timeline_summary = summarize_timeline_records(records)
         output_group.requests_jsonl.parent.mkdir(parents=True, exist_ok=True)

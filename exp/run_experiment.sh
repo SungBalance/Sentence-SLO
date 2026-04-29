@@ -24,9 +24,9 @@ REQUEST_RATE="inf"
 REQUEST_BURSTINESS=1.0
 MAX_CHUNKS_PER_REQUEST=48
 
-# Dataset options. DATASET_PATH is used for the output slug when it is set.
-DATASET_NAME="hf"
-DATASET_PATH="Aeala/ShareGPT_Vicuna_unfiltered"
+# Dataset options.
+DATASET_NAME="HuggingFaceH4/Koala-test-set"
+DATASET_SPLIT="test"
 
 # Human reading speed used for slack analysis.
 SECONDS_PER_WORD=0.28
@@ -64,23 +64,6 @@ slugify() {
   value="${value// /_}"
   value="$(printf '%s' "${value}" | tr -c 'A-Za-z0-9._-' '_')"
   printf '%s' "${value}"
-}
-
-copy_directory_files() {
-  local source_dir="$1"
-  local target_dir="$2"
-
-  docker exec "${ANALYSIS_CONTAINER}" bash -lc '
-    set -euo pipefail
-    source_dir="$1"
-    target_dir="$2"
-    mkdir -p "${target_dir}"
-    shopt -s nullglob
-    files=("${source_dir}"/*)
-    if ((${#files[@]})); then
-      cp -f "${files[@]}" "${target_dir}/"
-    fi
-  ' bash "${source_dir}" "${target_dir}"
 }
 
 run_in_container() {
@@ -181,21 +164,16 @@ PY
 render_tts_stage_config
 
 # Build dataset arguments once so every model run sees the same inputs.
-DATASET_SLUG_SOURCE="${DATASET_PATH:-${DATASET_NAME}}"
-DATASET_SLUG="$(slugify "${DATASET_SLUG_SOURCE}")"
-DATASET_ARGS=(--dataset-name "${DATASET_NAME}")
-if [[ -n "${DATASET_PATH}" ]]; then
-  DATASET_ARGS+=(--dataset-path "${DATASET_PATH}")
-fi
+DATASET_SLUG="$(slugify "${DATASET_NAME}")"
+DATASET_ARGS=(--dataset-name "${DATASET_NAME}" --dataset-split "${DATASET_SPLIT}")
 
 for MODEL in "${MODELS[@]}"; do
   MODEL_SLUG="$(slugify "${MODEL}")"
   MODEL_OUTPUT_ROOT="${OUTPUT_ROOT}/${MODEL_SLUG}/${DATASET_SLUG}"
-  SOURCE_MODE="${SLACK_MODES[0]}"
-  SOURCE_TEXT_DIR="${MODEL_OUTPUT_ROOT}/${SOURCE_MODE}/text_outputs"
-  SOURCE_AUDIO_DIR="${MODEL_OUTPUT_ROOT}/${SOURCE_MODE}/audio_durations"
+  TEXT_DIR="${MODEL_OUTPUT_ROOT}/text_outputs"
+  AUDIO_DIR="${MODEL_OUTPUT_ROOT}/audio_durations"
   run_in_container "${ANALYSIS_CONTAINER}" mkdir -p \
-    "${SOURCE_TEXT_DIR}" "${SOURCE_AUDIO_DIR}"
+    "${TEXT_DIR}" "${AUDIO_DIR}"
 
   # Stage 1: LLM inference and per-chunk text timeline.
   run_in_container "${BENCH_CONTAINER}" python3 "${EXP_ROOT}/benchmark.py" \
@@ -209,7 +187,7 @@ for MODEL in "${MODELS[@]}"; do
     --request-rate "${REQUEST_RATE}" \
     --request-burstiness "${REQUEST_BURSTINESS}" \
     --max-chunks-per-request "${MAX_CHUNKS_PER_REQUEST}" \
-    --output-dir "${SOURCE_TEXT_DIR}" \
+    --output-dir "${TEXT_DIR}" \
     --seconds-per-word "${SECONDS_PER_WORD}"
 
   EXTRA_ARGS=()
@@ -221,8 +199,8 @@ for MODEL in "${MODELS[@]}"; do
 
   # Stage 2: TTS duration generation for the chunk rows.
   run_in_container "${TTS_CONTAINER}" python3 "${EXP_ROOT}/audio_duration.py" \
-    --input-dir "${SOURCE_TEXT_DIR}" \
-    --output-dir "${SOURCE_AUDIO_DIR}" \
+    --input-dir "${TEXT_DIR}" \
+    --output-dir "${AUDIO_DIR}" \
     --stage-configs-path "${TTS_STAGE_CONFIG}" \
     --tts-model "${TTS_MODEL}" \
     --batch-size "${TTS_BATCH_SIZE}" \
@@ -236,17 +214,8 @@ for MODEL in "${MODELS[@]}"; do
 
   for SLACK_MODE in "${SLACK_MODES[@]}"; do
     MODE_ROOT="${MODEL_OUTPUT_ROOT}/${SLACK_MODE}"
-    TEXT_DIR="${MODE_ROOT}/text_outputs"
-    AUDIO_DIR="${MODE_ROOT}/audio_durations"
     RESULTS_DIR="${MODE_ROOT}/results"
-    run_in_container "${ANALYSIS_CONTAINER}" mkdir -p \
-      "${TEXT_DIR}" "${AUDIO_DIR}" "${RESULTS_DIR}"
-
-    if [[ "${SLACK_MODE}" != "${SOURCE_MODE}" ]]; then
-      # Reuse source stage outputs so only analysis is repeated per mode.
-      copy_directory_files "${SOURCE_TEXT_DIR}" "${TEXT_DIR}"
-      copy_directory_files "${SOURCE_AUDIO_DIR}" "${AUDIO_DIR}"
-    fi
+    run_in_container "${ANALYSIS_CONTAINER}" mkdir -p "${RESULTS_DIR}"
 
     # Stage 3: compute and plot one slack mode.
     run_in_container "${ANALYSIS_CONTAINER}" python3 "${EXP_ROOT}/analyze_results.py" \
