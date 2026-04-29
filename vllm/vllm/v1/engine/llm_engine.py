@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
+import weakref
 from collections.abc import Callable, Mapping
 from copy import copy
 from typing import Any
@@ -287,9 +288,12 @@ class LLMEngine:
         return req_id
 
     def _bind_slo_state(self, req_id: str) -> None:
-        """Wire Request._rs so that Request.slo_state delegates to
-        RequestState.slo_state (InprocClient / single-process mode only)."""
-        import weakref
+        """Wire Request._rs so Request.slo_state delegates to RequestState.slo_state.
+
+        Only takes effect in single-process (InprocClient) mode. In multiprocess
+        or async mode (MPClient / AsyncLLM) this is a no-op, and Request.slo_state
+        will return None — SSLO tracking is not supported in those modes.
+        """
         inproc_core = getattr(self.engine_core, "engine_core", None)
         if inproc_core is None:
             return

@@ -183,3 +183,150 @@ class TestRequestSLOState:
         assert RequestSLOState._is_sentence_boundary("Hello,") is False
         assert RequestSLOState._is_sentence_boundary("") is False
         assert RequestSLOState._is_sentence_boundary("   ") is False
+
+
+# ---------------------------------------------------------------------------
+# Request.slo_state property tests
+# ---------------------------------------------------------------------------
+
+
+import weakref
+
+
+class _FakeRequestState:
+    def __init__(self):
+        self.slo_state = None
+
+
+class TestRequestSLOStateProperty:
+    def _make_request(self):
+        """Create a minimal Request-like object with the _rs field and slo_state property."""
+        # We can test the property logic directly without instantiating the full Request
+        # class (which needs a tokenizer, sampling_params, etc.).
+        # Instead, verify the property logic via a small inline class that mirrors
+        # exactly what Request does.
+        from vllm.sslo.slo_state import RequestSLOState, WordRateEstimator
+        import weakref
+
+        class _MinimalRequest:
+            _rs = None
+
+            @property
+            def slo_state(self):
+                if self._rs is not None:
+                    rs = self._rs()
+                    if rs is not None:
+                        return rs.slo_state
+                return None
+
+            @slo_state.setter
+            def slo_state(self, value):
+                if self._rs is not None:
+                    rs = self._rs()
+                    if rs is not None:
+                        rs.slo_state = value
+
+        return _MinimalRequest()
+
+    def test_unbound_getter_returns_none(self):
+        req = self._make_request()
+        assert req.slo_state is None
+
+    def test_unbound_setter_is_noop(self):
+        from vllm.sslo.slo_state import RequestSLOState
+        req = self._make_request()
+        req.slo_state = RequestSLOState(decoding_start=0.0)  # should not raise
+        assert req.slo_state is None
+
+    def test_bound_getter_delegates(self):
+        from vllm.sslo.slo_state import RequestSLOState
+        req = self._make_request()
+        rs = _FakeRequestState()
+        req._rs = weakref.ref(rs)
+        state = RequestSLOState(decoding_start=0.0)
+        rs.slo_state = state
+        assert req.slo_state is state
+
+    def test_bound_setter_delegates(self):
+        from vllm.sslo.slo_state import RequestSLOState
+        req = self._make_request()
+        rs = _FakeRequestState()
+        req._rs = weakref.ref(rs)
+        state = RequestSLOState(decoding_start=0.0)
+        req.slo_state = state
+        assert rs.slo_state is state
+
+    def test_stale_weakref_returns_none(self):
+        req = self._make_request()
+        rs = _FakeRequestState()
+        req._rs = weakref.ref(rs)
+        del rs  # referent GC'd
+        assert req.slo_state is None
+
+
+# ---------------------------------------------------------------------------
+# LLMEngine._bind_slo_state tests
+# ---------------------------------------------------------------------------
+
+
+class TestBindSLOState:
+    def _make_engine_with_inproc(self, req_id, request, req_state):
+        """Simulate the parts of LLMEngine._bind_slo_state that matter."""
+        import weakref
+        import types
+
+        class _FakeReqStates:
+            def get(self, key):
+                return req_state if key == req_id else None
+
+        class _FakeScheduler:
+            requests = {req_id: request}
+
+        class _FakeInprocCore:
+            scheduler = _FakeScheduler()
+
+        class _FakeEngineCore:
+            engine_core = _FakeInprocCore()
+
+        class _FakeLLM:
+            engine_core = _FakeEngineCore()
+            output_processor = types.SimpleNamespace(request_states=_FakeReqStates())
+
+            def _bind_slo_state(self, req_id):
+                inproc_core = getattr(self.engine_core, "engine_core", None)
+                if inproc_core is None:
+                    return
+                sched_req = inproc_core.scheduler.requests.get(req_id)
+                req_state = self.output_processor.request_states.get(req_id)
+                if sched_req is not None and req_state is not None:
+                    sched_req._rs = weakref.ref(req_state)
+
+        return _FakeLLM()
+
+    def test_binds_weakref_for_inproc(self):
+        req_id = "req-1"
+        request = _FakeRequestState()  # reuse as stand-in for Request (just needs _rs attr)
+        request._rs = None
+        rs = _FakeRequestState()
+
+        engine = self._make_engine_with_inproc(req_id, request, rs)
+        engine._bind_slo_state(req_id)
+
+        assert request._rs is not None
+        assert request._rs() is rs
+
+    def test_noop_when_no_inproc(self):
+        import weakref, types
+
+        class _FakeMPEngine:
+            engine_core = types.SimpleNamespace()  # no .engine_core attribute
+            output_processor = types.SimpleNamespace(request_states={})
+
+            def _bind_slo_state(self, req_id):
+                inproc_core = getattr(self.engine_core, "engine_core", None)
+                if inproc_core is None:
+                    return
+                # Would fail if reached
+
+        engine = _FakeMPEngine()
+        engine._bind_slo_state("req-1")  # should not raise

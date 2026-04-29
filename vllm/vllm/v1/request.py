@@ -292,6 +292,12 @@ class Request:
 
     @property
     def slo_state(self) -> "RequestSLOState | None":
+        """SLO state for this request.
+
+        Delegates to RequestState.slo_state via a weakref set by LLMEngine.
+        Returns None (and setter is a no-op) when running in multiprocess or
+        async mode (MPClient / AsyncLLM) where _rs is never bound.
+        """
         if self._rs is not None:
             rs = self._rs()
             if rs is not None:
