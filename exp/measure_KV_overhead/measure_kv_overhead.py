@@ -79,7 +79,11 @@ def measure_transfer(
     warmup_runs: int,
     timed_runs: int,
 ) -> tuple[float, float]:
-    """Return (avg_offload_ms, avg_onload_ms) measured with CUDA events."""
+    """Return (avg_offload_ms, avg_onload_ms) measured with CUDA events.
+
+    Uses synchronous copy_() (no non_blocking) to measure wall-time transfer
+    latency as seen by the caller — the same path vLLM's swap uses.
+    """
     for _ in range(warmup_runs):
         cpu_tensor.copy_(gpu_tensor)
         gpu_tensor.copy_(cpu_tensor)
@@ -199,6 +203,7 @@ def main() -> None:
     plt.tight_layout()
     plot_path = output_dir / "kv_overhead.png"
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"Plot saved to {plot_path}")
 
 

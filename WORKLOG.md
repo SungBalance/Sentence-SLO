@@ -1,5 +1,13 @@
 # Work Log
 
+## 2026-04-30
+
+- Added: Created `exp/measure_KV_overhead/` experiment for profiling GPU↔CPU KV cache block transfer overhead.
+  - `measure_kv_overhead.py`: reads HF model config (no weights) to derive KV shape (`num_layers`, `num_kv_heads`, `head_dim`), allocates GPU tensor + pinned CPU tensor of shape `[num_layers, 2, num_blocks, block_size, num_kv_heads, head_dim]`, sweeps `num_blocks` values, measures offload/onload wall-time with CUDA events, writes `kv_overhead.csv` and `kv_overhead.png`.
+  - `run_experiment.sh`: host-side `docker exec` launcher for `sk-sslo`, defaults to Qwen/Qwen3-8B, block_size=16, bfloat16, 12-point sweep (1–2048 blocks).
+  - `README.md`: documents experiment purpose, usage, output layout, and all CLI flags.
+- Debugging/verification: Smoke-tested inside `sk-sslo` with Qwen/Qwen3-8B (`num_layers=36`, `num_kv_heads=8`, `head_dim=128`), `--num-blocks 1 2 4`, produced correct CSV with header `num_blocks,total_bytes,offload_ms,onload_ms,offload_bandwidth_GBs,onload_bandwidth_GBs` and PNG plot. Measured ~34–53 GB/s PCIe bandwidth (expected range).
+
 ## 2026-04-20
 
 - Modified: Added vLLM editable install instructions to root `README.md`, root `AGENTS.md`, and `vllm/AGENTS.md`, including `sk-sslo`, `/workspace/mlsys/vllm`, git safe-directory, precompiled editable install, and build-helper prerequisites.
