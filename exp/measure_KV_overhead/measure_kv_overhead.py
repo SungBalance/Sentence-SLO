@@ -119,7 +119,7 @@ def main() -> None:
         "float32": torch.float32,
     }
     dtype = dtype_map[args.dtype]
-    bytes_per_element = torch.finfo(dtype).bits // 8
+    bytes_per_element = torch.empty([], dtype=dtype).element_size()
 
     print(f"Loading config for {args.model} ...")
     num_layers, num_kv_heads, head_dim = get_kv_shape(args.model)
