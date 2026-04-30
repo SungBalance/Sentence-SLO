@@ -1,0 +1,10 @@
+{
+  "num_duration_rows": 13597,
+  "num_summary_rows": 84,
+  "models": [
+    "hexgrad/Kokoro-82M"
+  ],
+  "chunk_units": [
+    "sentence"
+  ]
+}

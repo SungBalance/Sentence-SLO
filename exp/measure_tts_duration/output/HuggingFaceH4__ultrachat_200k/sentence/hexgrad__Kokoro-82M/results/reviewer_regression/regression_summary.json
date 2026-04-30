@@ -1,0 +1,25 @@
+{
+  "degree": 2,
+  "num_groups": 1,
+  "groups": [
+    {
+      "model": "hexgrad/Kokoro-82M",
+      "chunk_unit": "sentence",
+      "degree": 2,
+      "coefficients": [
+        0.0008534163842531581,
+        0.34890836964565275,
+        0.7666056833850328
+      ],
+      "intercept_last": 0.7666056833850328,
+      "r2": 0.9073709554767151,
+      "mae_seconds": 0.9075706952370413,
+      "rmse_seconds": 1.376162080962645,
+      "row_count": 13597,
+      "word_count_min": 1,
+      "word_count_max": 227,
+      "figure_path": "exp/measure_tts_duration/output/HuggingFaceH4__ultrachat_200k/sentence/hexgrad__Kokoro-82M/results/reviewer_regression/hexgrad__Kokoro-82M__sentence/regression_fit.png",
+      "quantile_figure_path": "exp/measure_tts_duration/output/HuggingFaceH4__ultrachat_200k/sentence/hexgrad__Kokoro-82M/results/reviewer_regression/hexgrad__Kokoro-82M__sentence/quantile_regression_fit.png"
+    }
+  ]
+}

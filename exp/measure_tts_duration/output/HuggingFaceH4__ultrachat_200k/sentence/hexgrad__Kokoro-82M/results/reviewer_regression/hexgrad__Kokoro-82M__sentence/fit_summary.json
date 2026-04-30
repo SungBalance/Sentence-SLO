@@ -1,0 +1,53 @@
+{
+  "model": "hexgrad/Kokoro-82M",
+  "chunk_unit": "sentence",
+  "degree": 2,
+  "coefficients": [
+    0.0008534163842531581,
+    0.34890836964565275,
+    0.7666056833850328
+  ],
+  "intercept_last": 0.7666056833850328,
+  "r2": 0.9073709554767151,
+  "mae_seconds": 0.9075706952370413,
+  "rmse_seconds": 1.376162080962645,
+  "row_count": 13597,
+  "word_count_min": 1,
+  "word_count_max": 227,
+  "figure_path": "exp/measure_tts_duration/output/HuggingFaceH4__ultrachat_200k/sentence/hexgrad__Kokoro-82M/results/reviewer_regression/hexgrad__Kokoro-82M__sentence/regression_fit.png",
+  "quantile_figure_path": "exp/measure_tts_duration/output/HuggingFaceH4__ultrachat_200k/sentence/hexgrad__Kokoro-82M/results/reviewer_regression/hexgrad__Kokoro-82M__sentence/quantile_regression_fit.png",
+  "quantile_fits": {
+    "0.1": {
+      "coefficients_low_to_high": [
+        0.0,
+        0.26836274555468864,
+        0.0008571852766165564
+      ],
+      "pinball_loss": 0.17226355020518652
+    },
+    "0.5": {
+      "coefficients_low_to_high": [
+        0.0,
+        0.31816260062138124,
+        0.0013447076684084164
+      ],
+      "pinball_loss": 0.4421327225201814
+    },
+    "0.9": {
+      "coefficients_low_to_high": [
+        0.0,
+        0.4008138173302107,
+        0.001609777517564406
+      ],
+      "pinball_loss": 0.22602919473428754
+    },
+    "0.95": {
+      "coefficients_low_to_high": [
+        0.0,
+        0.41805682719892506,
+        0.0014985045473966958
+      ],
+      "pinball_loss": 0.144274009743129
+    }
+  }
+}

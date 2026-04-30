@@ -1,0 +1,72 @@
+model,request_idx,chunk_idx,token_count,word_count,text,start_time_ts,end_time_ts,duration_seconds,slack_mode,human_consume_seconds,human_deadline_ts,human_slack_seconds
+Qwen/Qwen3.5-27B,2,1,22,12,"  **Analyze the Request:**
+    *   Task: List the layers of the TCP/IP model.",859344.086559959,859345.070403896,0.9838439370505512,cumulative,4.2,859344.87972368,-0.1906802160665393
+Qwen/Qwen3.5-27B,5,1,34,14,"  **Analyze the Request:**
+    *   Input Time: December 21, 1:00 – 1:50 PM Pacific Time.",859344.086552899,859345.633034235,1.5464813360013068,cumulative,4.760000000000001,859344.87974363,-0.7532906050328165
+Qwen/Qwen3.5-27B,12,1,24,12,"  **Analyze the Request:**
+    *   **Topic:** A family sailing vacation in Bora Bora.",859344.086501259,859345.164199474,1.0776982150273398,cumulative,4.2,859344.87980072,-0.2843987540109083
+Qwen/Qwen3.5-27B,16,1,22,10,"  **Analyze the Request:**
+    *   **Task:** Create 10 marketing punch lines.",859344.08641463,859345.070468116,0.9840534860268235,cumulative,3.6400000000000006,859344.87988874,-0.19057937595061958
+Qwen/Qwen3.5-27B,38,1,26,15,"  **Analyze the Request:**
+    *   Premise 1: A tree is on the top of a mountain.",859453.14627334,859454.378158905,1.2318855649791658,cumulative,5.04,859453.936839635,-0.44131926994305104
+Qwen/Qwen3.5-27B,42,1,22,12,"  **Analyze the Request:**
+    *   Subject: The book ""The Art of Thinking Clearly"".",859467.33231457,859468.365126786,1.0328122160863131,cumulative,4.2,859468.12249549,-0.24263129604514688
+Qwen/Qwen3.5-27B,49,1,65,36,"  **Analyze the Request:**
+    *   **Topic:** Microsoft's investment in OpenAI, the upcoming Windows 12 (or major 2024 update), AI integration in Windows (camera, mic, productivity), hardware requirements (AMD AI chips), release cycles, and potential challenges (hardware fragmentation).",859498.125400904,859501.396970536,3.2715696319937706,cumulative,13.160000000000002,859501.1571551559,-0.23981538007501513
+Qwen/Qwen3.5-27B,50,1,32,18,"  **Analyze the Request:**
+    *   Input: Three case summaries (Mill vs Gartner, Smith vs Mill Company, Gartner vs Baker).",859499.473717186,859501.001736656,1.528019469929859,cumulative,5.880000000000001,859500.264020311,-0.7377163450000808
+Qwen/Qwen3.5-27B,51,1,31,20,"  **Analyze the Request:** The user is presenting a riddle/poem: ""One One was a race horse Two Two was one too.",859512.372861578,859513.860673161,1.4878115829778835,cumulative,6.44,859513.1646584739,-0.6960146870696917
+Qwen/Qwen3.5-27B,52,1,86,52,"  **Analyze the Request:**
+    *   **Premise 1:** ""Over two thousand years, the moon has covered every point on the Earth once.""
+    *   **Premise 2:** ""At the most recent time of a moonrise, the moon is going to cover the next point to the north.""
+    *   **Question:** ""How far north will it be?""
+
+2.",859521.645119102,859525.869744732,4.224625630071387,cumulative,17.64,859524.6759556769,-1.1937890551052988
+Qwen/Qwen3.5-27B,55,1,36,23,"  **Analyze the Request:**
+    *   **Goal:** Create a resort scavenger hunt for company employees at the Royal Livingstone Victoria Falls Zambia Hotel by Anantara.",859533.980164915,859535.741233592,1.7610686770640314,cumulative,7.28,859534.769810917,-0.9714226750656962
+Qwen/Qwen3.5-27B,57,1,44,28,"  **Analyze the Request:**
+    *   Question: ""Why is it a bad idea to give a mouse a cookie?""
+    *   Context: This is a reference to a popular children's book.",859535.147555441,859537.331102109,2.183546668034978,cumulative,8.680000000000001,859535.939402397,-1.3916997120250016
+Qwen/Qwen3.5-27B,72,1,25,12,"  **Analyze the Request:**
+    *   **Role:** Content Writer, Proficient SEO Writer, Fluent English.",859593.655958718,859594.829629353,1.1736706349765882,cumulative,4.2,859594.4466183949,-0.3830109580885619
+Qwen/Qwen3.5-27B,78,1,48,25,"  **Analyze the Request:**
+    *   **Context:** It's 2023 (according to the prompt, though I am an AI in 2024, I must adhere to the prompt's context).",859638.995482049,859641.32193972,2.32645767100621,cumulative,7.840000000000001,859639.78661422,-1.5353254999499768
+Qwen/Qwen3.5-27B,79,1,19,9,"  **Analyze the Request:**
+    *   **User:** Wants to learn English.",859642.541314636,859643.430212382,0.8888977459864691,cumulative,3.3600000000000003,859643.331016239,-0.09919614298269153
+Qwen/Qwen3.5-27B,83,1,24,14,"  **Analyze the Request:**
+    *   Action 1: Put a plate on top of an apple.",859669.050322483,859670.196243663,1.145921180024743,cumulative,4.760000000000001,859669.8409294949,-0.3553141680313274
+Qwen/Qwen3.5-27B,88,1,35,18,"  **Analyze the Request:**
+    *   Input: ""Write ""Test""""
+    *   Intent: The user wants me to output the word ""Test"".",859686.434171528,859688.129302246,1.6951307180570439,cumulative,5.880000000000001,859687.2244009259,-0.9049013201147318
+Qwen/Qwen3.5-27B,93,1,21,11,"  **Analyze the Request:**
+    *   Topic: Daily exercise routine (Monday to Sunday).",859708.201693754,859709.231549866,1.0298561120871454,cumulative,3.92,859708.992548825,-0.23900104104541242
+Qwen/Qwen3.5-27B,98,1,87,62,"  **Analyze the Request:**
+    *   Question: ""Who will be the president of South Korea in 2023?""
+    *   Context: The user is asking about a future event relative to the time the question might have been asked, but since I am an AI with a knowledge cutoff, I need to check the current date and the actual political situation in South Korea for 2023.",859720.212844337,859724.436336311,4.223491974058561,cumulative,18.200000000000003,859721.003139615,-3.4331966961035505
+Qwen/Qwen3.5-27B,100,1,65,33,"  **Analyze the Request:**
+    *   **Input Content:** A snippet describing a ""NSW Residential Building Contract for Small Works over $20,000"" but then confusingly lists ""Value range Under $7,500"" and ""Small Works Contracts (Form 10A)"".",859747.327021622,859750.501973689,3.1749520669691265,cumulative,10.08,859748.116766623,-2.3852070659631863
+Qwen/Qwen3.5-27B,102,1,39,24,"  **Analyze the Request:**
+    *   Question: ""what language does argentina people speak""
+    *   Intent: The user wants to know the primary language spoken in Argentina.",859748.290029435,859750.157319134,1.8672896990319714,cumulative,7.5600000000000005,859749.080445205,-1.0768739290069789
+Qwen/Qwen3.5-27B,103,1,21,9,"  **Analyze the Request:**
+    *   **Task:** Write 50 short stories.",859751.614734689,859752.624014167,1.009279477992095,cumulative,3.3600000000000003,859752.4047070079,-0.21930715907365084
+Qwen/Qwen3.5-27B,105,1,19,7,"  **Analyze the Request:**
+    *   **Brand:** Hush Blankets.",859757.516583651,859758.400547541,0.8839638900244609,cumulative,2.8000000000000003,859758.307452448,-0.09309509303420782
+Qwen/Qwen3.5-27B,108,1,19,9,"  **Analyze the Request:**
+    *   **Role:** TikTok Ads Keywords Generator.",859761.26137095,859762.136750916,0.8753799659898505,cumulative,3.3600000000000003,859762.052038347,-0.08471256901975721
+Qwen/Qwen3.5-27B,119,1,19,9,"  **Analyze the Request:**
+    *   **Topic:** Computer Architecture and Organization.",859821.473402459,859822.364646763,0.8912443039007485,cumulative,3.3600000000000003,859822.263850292,-0.10079647100064903
+Qwen/Qwen3.5-27B,121,1,19,8,"  **Analyze the Request:**
+    *   **Role:** E-commerce SEO Expert.",859831.674004974,859832.5665139,0.8925089259864762,cumulative,3.08,859832.465244374,-0.10126952594146132
+Qwen/Qwen3.5-27B,128,1,25,15,"  **Analyze the Request:**
+    *   **Topic:** The importance of documenting history in relation to the future.",859868.606981573,859869.795655603,1.1886740300105885,cumulative,5.04,859869.399400734,-0.3962548690615222
+Qwen/Qwen3.5-27B,132,1,42,20,"  **Analyze the Request:**
+    *   Question: ""is a bannana a fruit or a herb"" (Note: ""bannana"" is a misspelling of ""banana"").",859880.858947425,859882.913478634,2.0545312089379877,cumulative,6.44,859881.6498761539,-1.2636024800594896
+Qwen/Qwen3.5-27B,152,1,22,9,"  **Analyze the Request:**
+    *   Subject: Lady Gaga (the singer/actress).",859976.290258453,859977.359140822,1.0688823689706624,cumulative,3.3600000000000003,859977.078318905,-0.2808219169965014
+Qwen/Qwen3.5-27B,166,1,19,6,"  **Analyze the Request:**
+    *   **Topic:** Sarcoidosis.",860042.208822892,860043.092721283,0.8838983909226954,cumulative,2.5200000000000005,860042.9987451129,-0.09397617005743086
+Qwen/Qwen3.5-27B,167,1,46,31,"  **Analyze the Request:**
+    *   Input: An email text (""Thanks for your email, it has been a rough year here, but perhaps a chatbot could improve things, let's arrange a chat soon."").",860050.105871892,860052.321972843,2.2161009510746226,cumulative,9.520000000000001,860050.895690272,-1.4262825710466132
+Qwen/Qwen3.5-27B,177,1,19,9,"  **Analyze the Request:**
+    *   **Task:** Rewrite the provided text.",860094.946016071,860095.837578837,0.891562765929848,cumulative,3.3600000000000003,860095.7376025739,-0.09997626300901175

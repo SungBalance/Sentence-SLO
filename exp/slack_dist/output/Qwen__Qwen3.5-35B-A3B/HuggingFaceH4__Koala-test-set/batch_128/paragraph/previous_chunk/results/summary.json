@@ -1,0 +1,17 @@
+{
+  "slack_mode": "previous_chunk",
+  "row_count": 6843,
+  "excluded_first_decoding_chunks": 180,
+  "human": {
+    "count": 6843,
+    "mean": 9.458003870833835,
+    "p05": -5.935203453071881,
+    "p50": 6.6388267850270495,
+    "p95": 33.48637799971036,
+    "min": -273.2069835871225,
+    "max": 301.90855191403534
+  },
+  "max_num_seqs": 128,
+  "tensor_parallel_size": 1,
+  "gpu_memory_utilization": 0.95
+}

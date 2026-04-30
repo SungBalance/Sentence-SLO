@@ -122,3 +122,19 @@
 - Modified: Added read-only batch sweep support around `max_num_seqs` in `exp/run_experiment_read.sh`, propagated `max_num_seqs` into benchmark and analysis summaries, and added `exp/compare_read_batch_results.py` for batch-size summary tables and comparison figures.
 - Modified: Updated `exp/README.md` for the new `batch_{max_num_seqs}` read-only output layout and batch comparison outputs.
 - Debugging/verification: In `sk-sslo`, ran `py_compile` for `exp/benchmark.py`, `exp/analyze_results.py`, `exp/common/slack_utils.py`, and `exp/compare_read_batch_results.py`, `bash -n exp/run_experiment_read.sh`, a synthetic human-only batch comparison smoke test, and a partial clean rerun where `batch_16` and `batch_32` completed before an operator interrupt during `batch_64`.
+- Modified: Updated repo-root `AGENTS.md` so `exp/` is treated as a collection of experiment-specific folders rather than a flat script bucket.
+- Modified: Added the rule that every experiment folder under `exp/` must include a concise `README.md` describing the experiment, main scripts, and output layout.
+- Debugging/verification: Inspected the current `exp/` tree and confirmed the existing `exp/slack_dist/README.md` already satisfies the new documentation rule.
+- Added: Created the new `exp/measure_tts_duration/` experiment folder with its own `README.md`, shared helpers, dataset chunk preparation, per-model TTS duration measurement, word-count summary aggregation, and a container-first launcher.
+- Modified: Scoped the first version of the experiment to `hexgrad/Kokoro-82M` and `Qwen/Qwen3-TTS-12Hz-1.7B-Base` in `sk-sslo-omni`, leaving `microsoft/VibeVoice-Realtime-0.5B` out for now.
+- Modified: Set the default Qwen batch size for `exp/measure_tts_duration/run_experiment.sh` to `64`.
+- Modified: Improved `exp/measure_tts_duration/measure_audio_duration.py` so Kokoro writes resumable cache rows incrementally and shows progress while running.
+- Debugging/verification: Re-ran `bash -n exp/measure_tts_duration/run_experiment.sh`, container-side `py_compile`, and relaunched the experiment detached after clearing stray duplicate TTS processes.
+- Added: Created `exp/measure_tts_duration/fit_duration_regression.py` to fit `word_count -> duration_seconds` regressions from raw duration rows and save per-group summaries plus figures.
+- Modified: Documented the regression stage in `exp/measure_tts_duration/README.md`.
+- Debugging/verification: In `sk-sslo-omni`, ran `python3 -m py_compile exp/measure_tts_duration/fit_duration_regression.py` and fit a linear regression for the existing Kokoro sentence-duration CSV.
+- Modified: Extended `fit_duration_regression.py` with reviewer-facing quantile regression outputs and figures using `p10/p50/p90/p95` by default.
+- Modified: Updated `exp/measure_tts_duration/README.md` to mention the quantile-regression artifact.
+- Debugging/verification: In `sk-sslo-omni`, re-ran `py_compile` and generated the new quantile-regression outputs for the existing Kokoro sentence-duration CSV.
+- Added: Created repo-root `.gitignore` entries for editor noise, local assistant/tool settings, Python caches/build artifacts, virtual environments, scratch files, experiment output/runtime directories, and local model/data artifacts.
+- Debugging/verification: Verified representative paths with `git check-ignore`, including `.claude/`, nested `exp/.claude/`, `__pycache__/`, `exp/slack_dist/output/`, and experiment log files.

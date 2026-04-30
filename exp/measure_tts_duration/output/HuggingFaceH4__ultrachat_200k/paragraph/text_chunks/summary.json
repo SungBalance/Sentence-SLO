@@ -1,0 +1,8 @@
+{
+  "dataset_name": "HuggingFaceH4/ultrachat_200k",
+  "dataset_slug": "HuggingFaceH4__ultrachat_200k",
+  "chunk_unit": "paragraph",
+  "num_turns": 1547,
+  "num_chunks": 4695,
+  "mean_words_per_chunk": 46.00681576144835
+}

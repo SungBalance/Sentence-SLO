@@ -1,0 +1,64 @@
+{
+  "degree": 2,
+  "quantiles": [
+    0.1,
+    0.5,
+    0.9,
+    0.95
+  ],
+  "num_groups": 1,
+  "groups": [
+    {
+      "model": "hexgrad/Kokoro-82M",
+      "chunk_unit": "sentence",
+      "degree": 2,
+      "quantile": 0.1,
+      "coefficients_low_to_high": [
+        0.0,
+        0.26836274555468864,
+        0.0008571852766165564
+      ],
+      "pinball_loss": 0.17226355020518652,
+      "row_count": 13597
+    },
+    {
+      "model": "hexgrad/Kokoro-82M",
+      "chunk_unit": "sentence",
+      "degree": 2,
+      "quantile": 0.5,
+      "coefficients_low_to_high": [
+        0.0,
+        0.31816260062138124,
+        0.0013447076684084164
+      ],
+      "pinball_loss": 0.4421327225201814,
+      "row_count": 13597
+    },
+    {
+      "model": "hexgrad/Kokoro-82M",
+      "chunk_unit": "sentence",
+      "degree": 2,
+      "quantile": 0.9,
+      "coefficients_low_to_high": [
+        0.0,
+        0.4008138173302107,
+        0.001609777517564406
+      ],
+      "pinball_loss": 0.22602919473428754,
+      "row_count": 13597
+    },
+    {
+      "model": "hexgrad/Kokoro-82M",
+      "chunk_unit": "sentence",
+      "degree": 2,
+      "quantile": 0.95,
+      "coefficients_low_to_high": [
+        0.0,
+        0.41805682719892506,
+        0.0014985045473966958
+      ],
+      "pinball_loss": 0.144274009743129,
+      "row_count": 13597
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+model,chunk_unit,degree,coefficients,intercept_last,r2,mae_seconds,rmse_seconds,row_count,word_count_min,word_count_max,figure_path
+hexgrad/Kokoro-82M,sentence,1,"[0.40086702395546775, 0.25367147838280835]",0.25367147838280835,0.8943461939825638,0.9893166301601306,1.4697334149194203,13597,1,227,exp/measure_tts_duration/output/HuggingFaceH4__ultrachat_200k/sentence/hexgrad__Kokoro-82M/results/regression/hexgrad__Kokoro-82M__sentence/regression_fit.png

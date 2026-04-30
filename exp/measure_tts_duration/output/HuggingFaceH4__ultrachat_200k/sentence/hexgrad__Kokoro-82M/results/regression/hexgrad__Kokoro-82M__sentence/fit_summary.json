@@ -1,0 +1,17 @@
+{
+  "model": "hexgrad/Kokoro-82M",
+  "chunk_unit": "sentence",
+  "degree": 1,
+  "coefficients": [
+    0.40086702395546775,
+    0.25367147838280835
+  ],
+  "intercept_last": 0.25367147838280835,
+  "r2": 0.8943461939825638,
+  "mae_seconds": 0.9893166301601306,
+  "rmse_seconds": 1.4697334149194203,
+  "row_count": 13597,
+  "word_count_min": 1,
+  "word_count_max": 227,
+  "figure_path": "exp/measure_tts_duration/output/HuggingFaceH4__ultrachat_200k/sentence/hexgrad__Kokoro-82M/results/regression/hexgrad__Kokoro-82M__sentence/regression_fit.png"
+}

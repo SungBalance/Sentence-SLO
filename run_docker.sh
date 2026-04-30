@@ -30,10 +30,18 @@ fi
 start_container() {
     local name="$1"
     local image="$2"
+    local entrypoint="${3:-}"
 
-    "${DOCKER[@]}" run "${COMMON_DOCKER_ARGS[@]}" \
-        --name "${name}" \
-        "${image}" bash
+    if [[ -n "${entrypoint}" ]]; then
+        "${DOCKER[@]}" run "${COMMON_DOCKER_ARGS[@]}" \
+            --entrypoint "${entrypoint}" \
+            --name "${name}" \
+            "${image}"
+    else
+        "${DOCKER[@]}" run "${COMMON_DOCKER_ARGS[@]}" \
+            --name "${name}" \
+            "${image}" bash
+    fi
 }
 
 case "${1:-vllm}" in
@@ -46,8 +54,11 @@ case "${1:-vllm}" in
     omni-0.16|omni-0.16.0)
         start_container "sk-sslo-omni-016" "vllm/vllm-omni:v0.16.0"
         ;;
+    vllm-openai|vllm-0.20|vllm-0.20.0)
+        start_container "sk-sslo-vllm" "vllm/vllm-openai:v0.20.0-cu130-ubuntu2404" bash
+        ;;
     *)
-        echo "Usage: $0 [vllm|omni|omni-0.18|omni-0.16]" >&2
+        echo "Usage: $0 [vllm|omni|omni-0.18|omni-0.16|vllm-openai]" >&2
         exit 1
         ;;
 esac
