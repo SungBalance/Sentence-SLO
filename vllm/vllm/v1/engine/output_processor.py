@@ -6,10 +6,9 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
-if TYPE_CHECKING:
-    from vllm.sslo.slo_state import RequestSLOState
+from vllm.sslo.slo_state import RequestSLOState
 
 import numpy as np
 import torch
@@ -114,6 +113,7 @@ class RequestOutputCollector:
 class OutputProcessorOutput:
     request_outputs: list[RequestOutput | PoolingRequestOutput]
     reqs_to_abort: list[str]
+    slo_updates: list[tuple[str, float]]
 
 
 @dataclass
@@ -189,9 +189,8 @@ class RequestState:
             deque() if stream_input else None
         )
 
-        # SSLO: optional SLO state; set externally before decoding starts.
-        # No-op when None.
-        self.slo_state: "RequestSLOState | None" = None
+        # SSLO: SLO state for this request.
+        self.slo_state: RequestSLOState = RequestSLOState()
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
@@ -613,6 +612,7 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        slo_updates: list[tuple[str, float]] = []
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -673,6 +673,10 @@ class OutputProcessor:
                     # LLMEngine: return list of RequestOutputs.
                     request_outputs.append(request_output)
 
+            slack = req_state.slo_state.take_slack_update()
+            if slack is not None:
+                slo_updates.append((req_id, slack))
+
             # Free completed requests.
             if finish_reason is not None:
                 if req_state.streaming_input:
@@ -698,6 +702,7 @@ class OutputProcessor:
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
+            slo_updates=slo_updates,
         )
 
     def _finish_request(self, req_state: RequestState) -> None:

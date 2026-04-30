@@ -300,6 +300,9 @@ class InprocClient(EngineCoreClient):
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
 
+    def send_slo_updates(self, updates: list[tuple[str, float]]) -> None:
+        pass
+
     def shutdown(self, timeout: float | None = None) -> None:
         self.engine_core.shutdown()
 
@@ -829,6 +832,10 @@ class SyncMPClient(MPClient):
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
+    def send_slo_updates(self, updates: list[tuple[str, float]]) -> None:
+        if updates:
+            self._send_input(EngineCoreRequestType.SLO_UPDATE, updates)
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         self.call_utility("profile", is_start, profile_prefix)
 
@@ -1063,6 +1070,10 @@ class AsyncMPClient(MPClient):
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
+
+    async def send_slo_updates_async(self, updates: list[tuple[str, float]]) -> None:
+        if updates:
+            await self._send_input(EngineCoreRequestType.SLO_UPDATE, updates)
 
     async def pause_scheduler_async(
         self, mode: PauseMode = "abort", clear_cache: bool = True

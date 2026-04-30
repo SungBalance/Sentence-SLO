@@ -343,6 +343,8 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+        from vllm.sslo.slo_state import RequestSLOState
+        request.slo_state = RequestSLOState()
         self.scheduler.add_request(request)
 
     def abort_requests(self, request_ids: list[str]):
@@ -352,6 +354,12 @@ class EngineCore:
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
+    def update_slo_slack(self, updates: list[tuple[str, float]]) -> None:
+        for req_id, slack in updates:
+            req = self.scheduler.requests.get(req_id)
+            if req is not None and req.slo_state is not None:
+                req.slo_state.cumulative_slack = slack
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -1293,6 +1301,8 @@ class EngineCoreProc(EngineCore):
             self._invoke_utility_method(method_name, get_result, output, enqueue_output)
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
             raise RuntimeError("Executor failed.")
+        elif request_type == EngineCoreRequestType.SLO_UPDATE:
+            self.update_slo_slack(request)
         else:
             logger.error(
                 "Unrecognized input request type encountered: %s", request_type

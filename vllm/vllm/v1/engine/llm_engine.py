@@ -287,25 +287,22 @@ class LLMEngine:
         return req_id
 
     def _bind_slo_state(self, req_id: str) -> None:
-        """Create a shared RequestSLOState and assign to both Request and RequestState.
+        """Share RequestState.slo_state with the scheduler's Request object.
 
-        Both sides hold a plain reference to the same mutable object. The output
-        processor updates it via on_text_delta(); the scheduler reads
-        cumulative_slack from Request.slo_state.
+        For InprocClient: both sides hold a reference to the same object so
+        the scheduler sees updates immediately without IPC.
 
-        Only takes effect in single-process (InprocClient) mode. In multiprocess
-        or async mode (MPClient / AsyncLLM) this is a no-op and slo_state stays None.
+        For MPClient: RequestState already has slo_state from __init__ and
+        EngineCore.add_request() created a stub; IPC via send_slo_updates
+        keeps them in sync.
         """
-        from vllm.sslo.slo_state import RequestSLOState
         inproc_core = getattr(self.engine_core, "engine_core", None)
         if inproc_core is None:
-            return
+            return  # MPClient: IPC path handles sync
         sched_req = inproc_core.scheduler.requests.get(req_id)
         req_state = self.output_processor.request_states.get(req_id)
         if sched_req is not None and req_state is not None:
-            slo_state = RequestSLOState()
-            sched_req.slo_state = slo_state
-            req_state.slo_state = slo_state
+            sched_req.slo_state = req_state.slo_state  # share the already-created object
 
     def step(self) -> list[RequestOutput | PoolingRequestOutput]:
         if self.should_execute_dummy_batch:
@@ -330,6 +327,9 @@ class LLMEngine:
         # 3) Abort any reqs that finished due to stop strings.
         with record_function_or_nullcontext("llm_engine step: abort_requests"):
             self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
+
+        if processed_outputs.slo_updates:
+            self.engine_core.send_slo_updates(processed_outputs.slo_updates)
 
         # 4) Record stats
         with record_function_or_nullcontext("llm_engine step: record_stats"):

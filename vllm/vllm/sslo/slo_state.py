@@ -60,6 +60,7 @@ class RequestSLOState:
         self._pending_text: str = ""
         self._chunk_count: int = 0
         self.cumulative_slack: float = 0.0
+        self._slack_dirty: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -82,6 +83,13 @@ class RequestSLOState:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def take_slack_update(self) -> float | None:
+        """Return cumulative_slack if updated since last call, else None."""
+        if self._slack_dirty:
+            self._slack_dirty = False
+            return self.cumulative_slack
+        return None
+
     def _flush_chunk(self, now: float) -> None:
         """Compute slack for the completed chunk and update state."""
         # Chunk 0 slack is fixed at 0.0; only update from chunk 1 onward.
@@ -89,6 +97,7 @@ class RequestSLOState:
             assert self._decoding_start is not None
             deadline = self._decoding_start + self._cumulative_consume
             self.cumulative_slack = deadline - now
+            self._slack_dirty = True
         # Always accumulate consume time (chunk 0's time feeds chunk 1's deadline).
         self._cumulative_consume += self._estimator(self._pending_text)
         self._chunk_count += 1
