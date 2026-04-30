@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
-import weakref
 from collections.abc import Callable, Mapping
 from copy import copy
 from typing import Any
@@ -288,19 +287,25 @@ class LLMEngine:
         return req_id
 
     def _bind_slo_state(self, req_id: str) -> None:
-        """Wire Request._rs so Request.slo_state delegates to RequestState.slo_state.
+        """Create a shared RequestSLOState and assign to both Request and RequestState.
+
+        Both sides hold a plain reference to the same mutable object. The output
+        processor updates it via on_text_delta(); the scheduler reads
+        cumulative_slack from Request.slo_state.
 
         Only takes effect in single-process (InprocClient) mode. In multiprocess
-        or async mode (MPClient / AsyncLLM) this is a no-op, and Request.slo_state
-        will return None — SSLO tracking is not supported in those modes.
+        or async mode (MPClient / AsyncLLM) this is a no-op and slo_state stays None.
         """
+        from vllm.sslo.slo_state import RequestSLOState
         inproc_core = getattr(self.engine_core, "engine_core", None)
         if inproc_core is None:
             return
         sched_req = inproc_core.scheduler.requests.get(req_id)
         req_state = self.output_processor.request_states.get(req_id)
         if sched_req is not None and req_state is not None:
-            sched_req._rs = weakref.ref(req_state)
+            slo_state = RequestSLOState()
+            sched_req.slo_state = slo_state
+            req_state.slo_state = slo_state
 
     def step(self) -> list[RequestOutput | PoolingRequestOutput]:
         if self.should_execute_dummy_batch:

@@ -50,66 +50,68 @@ class TestWordRateEstimator:
 
 class TestRequestSLOState:
     def test_initial_slack_is_zero(self):
-        state = RequestSLOState(decoding_start=10.0)
+        state = RequestSLOState()
         assert state.cumulative_slack == 0.0
 
     def test_no_flush_without_boundary(self):
-        state = RequestSLOState(decoding_start=0.0)
+        state = RequestSLOState()
         state.on_text_delta("hello world", 1.0)
         # No sentence boundary -> no flush -> slack stays 0.0
         assert state.cumulative_slack == 0.0
 
     def test_single_chunk_slack(self):
         """Chunk 0 slack is fixed at 0.0 (not computed)."""
-        state = RequestSLOState(decoding_start=0.0)
+        state = RequestSLOState()
         state.on_text_delta("Hello world.", 5.0)
         assert state.cumulative_slack == pytest.approx(0.0)
 
-    def test_decoding_start_offset(self):
-        """Chunk 0 slack is fixed at 0.0 regardless of decoding_start."""
-        state = RequestSLOState(decoding_start=10.0)
-        state.on_text_delta("Hello world.", 12.0)
-        assert state.cumulative_slack == pytest.approx(0.0)
+    def test_decoding_start_set_from_first_delta(self):
+        """decoding_start is set from the now of the first on_text_delta call."""
+        est = WordRateEstimator(seconds_per_word=1.0)
+        state = RequestSLOState(estimator=est)
+        state.on_text_delta("Hello world.", 10.0)  # chunk 0, decoding_start = 10.0
+        state.on_text_delta("How are you?", 13.0)  # chunk 1: deadline = 10 + 2 = 12, slack = -1
+        assert state.cumulative_slack == pytest.approx(-1.0)
 
     def test_second_chunk_deadline_includes_first_consume(self):
         """
-        decoding_start = 0.0, seconds_per_word = 1.0 for simplicity.
+        decoding_start = 5.0 (first on_text_delta call), seconds_per_word = 1.0.
 
         Chunk 0: "Hello world." (2 words -> 2.0 s consume), ends at t=5.
           slack_0 = 0.0 (fixed, not computed)
 
         Chunk 1: "How are you?" (3 words -> 3.0 s consume), ends at t=8.
-          deadline_1 = 0 + 2.0 (chunk 0's consume) = 2.0
-          slack_1 = 2.0 - 8 = -6
+          deadline_1 = 5.0 + 2.0 (chunk 0's consume) = 7.0
+          slack_1 = 7.0 - 8 = -1.0
         """
         est = WordRateEstimator(seconds_per_word=1.0)
-        state = RequestSLOState(estimator=est, decoding_start=0.0)
+        state = RequestSLOState(estimator=est)
 
         state.on_text_delta("Hello world.", 5.0)
         assert state.cumulative_slack == pytest.approx(0.0)
 
         state.on_text_delta("How are you?", 8.0)
-        assert state.cumulative_slack == pytest.approx(-6.0)
+        assert state.cumulative_slack == pytest.approx(-1.0)
 
     def test_positive_slack(self):
         """Second chunk arrives before deadline -> positive slack.
 
-        Chunk 0: "Hi." (1 word, 0.28 s consume) ends at t=100.1
+        Chunk 0: "Hi." (1 word, 0.28 s consume) ends at t=100.1, decoding_start = 100.1
           slack_0 = 0.0 (fixed, not computed)
         Chunk 1: "Hey?" (1 word, 0.28 s consume) ends at t=100.2
-          deadline_1 = 100.0 + 0.28 = 100.28; slack_1 = 100.28 - 100.2 = +0.08
+          deadline_1 = 100.1 + 0.28 = 100.38; slack_1 = 100.38 - 100.2 = +0.18
         """
-        state = RequestSLOState(decoding_start=100.0)
+        state = RequestSLOState()
         state.on_text_delta("Hi.", 100.1)
         state.on_text_delta("Hey?", 100.2)
-        # deadline_1 = 100.0 + 0.28 (1 word * 0.28) = 100.28
-        expected_slack = 100.0 + 0.28 - 100.2
+        # deadline_1 = 100.1 + 0.28 (1 word * 0.28) = 100.38
+        expected_slack = 100.1 + 0.28 - 100.2
         assert state.cumulative_slack == pytest.approx(expected_slack, abs=1e-9)
 
     def test_on_finish_flushes_remaining_text(self):
         """on_finish should flush non-boundary text as a final chunk."""
         est = WordRateEstimator(seconds_per_word=1.0)
-        state = RequestSLOState(estimator=est, decoding_start=0.0)
+        state = RequestSLOState(estimator=est)
         # No boundary — text is held as pending
         state.on_text_delta("some partial text", 3.0)
         assert state.cumulative_slack == 0.0
@@ -119,7 +121,7 @@ class TestRequestSLOState:
 
     def test_on_finish_no_pending_is_noop(self):
         """on_finish with nothing pending should not change slack."""
-        state = RequestSLOState(decoding_start=0.0)
+        state = RequestSLOState()
         state.on_text_delta("Done.", 2.0)
         slack_before = state.cumulative_slack
         state.on_finish(3.0)
@@ -129,7 +131,7 @@ class TestRequestSLOState:
     def test_boundary_characters(self):
         """All sentence boundary chars should trigger a flush (chunk 0 -> 0.0)."""
         for char in ".!?。！？…":
-            state = RequestSLOState(decoding_start=0.0)
+            state = RequestSLOState()
             state.on_text_delta(f"text{char}", 1.0)
             # Chunk 0 slack is fixed at 0.0 regardless of arrival time.
             assert state.cumulative_slack == pytest.approx(0.0), \
@@ -137,7 +139,7 @@ class TestRequestSLOState:
 
     def test_non_boundary_chars_no_flush(self):
         """Non-boundary text should not flush."""
-        state = RequestSLOState(decoding_start=0.0)
+        state = RequestSLOState()
         state.on_text_delta("hello", 1.0)
         state.on_text_delta(" world", 2.0)
         assert state.cumulative_slack == pytest.approx(0.0)
@@ -151,18 +153,18 @@ class TestRequestSLOState:
 
         assert isinstance(FixedEstimator(), ConsumeEstimator)
 
-        state = RequestSLOState(estimator=FixedEstimator(), decoding_start=0.0)
+        state = RequestSLOState(estimator=FixedEstimator())
         state.on_text_delta("chunk zero.", 1.0)
         # slack_0 = 0.0 (fixed)
         assert state.cumulative_slack == pytest.approx(0.0)
 
         state.on_text_delta("chunk one.", 2.0)
-        # deadline_1 = 0.0 + 3.0 (fixed estimator) = 3.0; slack_1 = 3.0 - 2.0 = 1.0
-        assert state.cumulative_slack == pytest.approx(1.0)
+        # deadline_1 = 1.0 (decoding_start) + 3.0 (fixed estimator) = 4.0; slack_1 = 4.0 - 2.0 = 2.0
+        assert state.cumulative_slack == pytest.approx(2.0)
 
     def test_multi_delta_accumulates_before_boundary(self):
         """Multiple on_text_delta calls should accumulate until boundary."""
-        state = RequestSLOState(decoding_start=0.0)
+        state = RequestSLOState()
         state.on_text_delta("Hello", 1.0)
         state.on_text_delta(" world", 2.0)
         assert state.cumulative_slack == pytest.approx(0.0)
@@ -186,147 +188,53 @@ class TestRequestSLOState:
 
 
 # ---------------------------------------------------------------------------
-# Request.slo_state property tests
-# ---------------------------------------------------------------------------
-
-
-import weakref
-
-
-class _FakeRequestState:
-    def __init__(self):
-        self.slo_state = None
-
-
-class TestRequestSLOStateProperty:
-    def _make_request(self):
-        """Create a minimal Request-like object with the _rs field and slo_state property."""
-        # We can test the property logic directly without instantiating the full Request
-        # class (which needs a tokenizer, sampling_params, etc.).
-        # Instead, verify the property logic via a small inline class that mirrors
-        # exactly what Request does.
-        from vllm.sslo.slo_state import RequestSLOState, WordRateEstimator
-        import weakref
-
-        class _MinimalRequest:
-            _rs = None
-
-            @property
-            def slo_state(self):
-                if self._rs is not None:
-                    rs = self._rs()
-                    if rs is not None:
-                        return rs.slo_state
-                return None
-
-            @slo_state.setter
-            def slo_state(self, value):
-                if self._rs is not None:
-                    rs = self._rs()
-                    if rs is not None:
-                        rs.slo_state = value
-
-        return _MinimalRequest()
-
-    def test_unbound_getter_returns_none(self):
-        req = self._make_request()
-        assert req.slo_state is None
-
-    def test_unbound_setter_is_noop(self):
-        from vllm.sslo.slo_state import RequestSLOState
-        req = self._make_request()
-        req.slo_state = RequestSLOState(decoding_start=0.0)  # should not raise
-        assert req.slo_state is None
-
-    def test_bound_getter_delegates(self):
-        from vllm.sslo.slo_state import RequestSLOState
-        req = self._make_request()
-        rs = _FakeRequestState()
-        req._rs = weakref.ref(rs)
-        state = RequestSLOState(decoding_start=0.0)
-        rs.slo_state = state
-        assert req.slo_state is state
-
-    def test_bound_setter_delegates(self):
-        from vllm.sslo.slo_state import RequestSLOState
-        req = self._make_request()
-        rs = _FakeRequestState()
-        req._rs = weakref.ref(rs)
-        state = RequestSLOState(decoding_start=0.0)
-        req.slo_state = state
-        assert rs.slo_state is state
-
-    def test_stale_weakref_returns_none(self):
-        req = self._make_request()
-        rs = _FakeRequestState()
-        req._rs = weakref.ref(rs)
-        del rs  # referent GC'd
-        assert req.slo_state is None
-
-
-# ---------------------------------------------------------------------------
 # LLMEngine._bind_slo_state tests
 # ---------------------------------------------------------------------------
 
 
 class TestBindSLOState:
-    def _make_engine_with_inproc(self, req_id, request, req_state):
-        """Simulate the parts of LLMEngine._bind_slo_state that matter."""
-        import weakref
-        import types
+    """Tests for the shared-reference binding pattern."""
 
-        class _FakeReqStates:
-            def get(self, key):
-                return req_state if key == req_id else None
+    def test_shared_reference_after_bind(self):
+        """Both sides hold the same RequestSLOState instance after binding."""
+        from vllm.sslo.slo_state import RequestSLOState
 
-        class _FakeScheduler:
-            requests = {req_id: request}
+        class _FakeReq:
+            slo_state = None
 
-        class _FakeInprocCore:
-            scheduler = _FakeScheduler()
+        class _FakeReqState:
+            slo_state = None
 
-        class _FakeEngineCore:
-            engine_core = _FakeInprocCore()
+        sched_req = _FakeReq()
+        req_state = _FakeReqState()
 
-        class _FakeLLM:
-            engine_core = _FakeEngineCore()
-            output_processor = types.SimpleNamespace(request_states=_FakeReqStates())
+        # Simulate what _bind_slo_state does
+        slo = RequestSLOState()
+        sched_req.slo_state = slo
+        req_state.slo_state = slo
 
-            def _bind_slo_state(self, req_id):
-                inproc_core = getattr(self.engine_core, "engine_core", None)
-                if inproc_core is None:
-                    return
-                sched_req = inproc_core.scheduler.requests.get(req_id)
-                req_state = self.output_processor.request_states.get(req_id)
-                if sched_req is not None and req_state is not None:
-                    sched_req._rs = weakref.ref(req_state)
+        assert sched_req.slo_state is req_state.slo_state
 
-        return _FakeLLM()
+    def test_output_processor_update_visible_to_scheduler(self):
+        """Updates via req_state.slo_state are visible via sched_req.slo_state."""
+        from vllm.sslo.slo_state import RequestSLOState, WordRateEstimator
 
-    def test_binds_weakref_for_inproc(self):
-        req_id = "req-1"
-        request = _FakeRequestState()  # reuse as stand-in for Request (just needs _rs attr)
-        request._rs = None
-        rs = _FakeRequestState()
+        class _FakeReq:
+            slo_state = None
 
-        engine = self._make_engine_with_inproc(req_id, request, rs)
-        engine._bind_slo_state(req_id)
+        class _FakeReqState:
+            slo_state = None
 
-        assert request._rs is not None
-        assert request._rs() is rs
+        sched_req = _FakeReq()
+        req_state = _FakeReqState()
+        est = WordRateEstimator(seconds_per_word=1.0)
+        slo = RequestSLOState(estimator=est)
+        sched_req.slo_state = slo
+        req_state.slo_state = slo
 
-    def test_noop_when_no_inproc(self):
-        import weakref, types
+        # Output processor updates via req_state side
+        req_state.slo_state.on_text_delta("Hello world.", 5.0)  # chunk 0
+        req_state.slo_state.on_text_delta("How are you?", 8.0)  # chunk 1
 
-        class _FakeMPEngine:
-            engine_core = types.SimpleNamespace()  # no .engine_core attribute
-            output_processor = types.SimpleNamespace(request_states={})
-
-            def _bind_slo_state(self, req_id):
-                inproc_core = getattr(self.engine_core, "engine_core", None)
-                if inproc_core is None:
-                    return
-                # Would fail if reached
-
-        engine = _FakeMPEngine()
-        engine._bind_slo_state("req-1")  # should not raise
+        # Scheduler reads via sched_req side
+        assert sched_req.slo_state.cumulative_slack == pytest.approx(-1.0)

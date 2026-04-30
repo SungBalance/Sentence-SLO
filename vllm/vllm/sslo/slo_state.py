@@ -39,32 +39,26 @@ class RequestSLOState:
 
     Usage::
 
-        state = RequestSLOState(decoding_start=time.monotonic())
+        state = RequestSLOState()
         # for each decoded text delta:
         state.on_text_delta(delta_text, time.monotonic())
         # at request finish:
         state.on_finish(time.monotonic())
-        # read the latest slack:
+        # read the latest slack (0.0 until chunk 1 completes):
         slack = state.cumulative_slack
+
+    decoding_start is set automatically from the timestamp of the first
+    on_text_delta / on_finish call.
     """
 
-    def __init__(
-        self,
-        estimator: ConsumeEstimator | None = None,
-        decoding_start: float = 0.0,
-    ) -> None:
+    def __init__(self, estimator: ConsumeEstimator | None = None) -> None:
         self._estimator: ConsumeEstimator = (
             estimator if estimator is not None else WordRateEstimator()
         )
-        self._decoding_start = decoding_start
-        # Sum of consume_time for all completed chunks (used as deadline offset
-        # for the *next* chunk).
+        self._decoding_start: float | None = None
         self._cumulative_consume: float = 0.0
-        # Text accumulated since the last chunk boundary.
         self._pending_text: str = ""
-        # Number of chunks flushed so far (chunk 0 slack is fixed at 0.0).
         self._chunk_count: int = 0
-        # Most recent cumulative slack value (0.0 until chunk 1 completes).
         self.cumulative_slack: float = 0.0
 
     # ------------------------------------------------------------------
@@ -72,13 +66,15 @@ class RequestSLOState:
     # ------------------------------------------------------------------
 
     def on_text_delta(self, text: str, now: float) -> None:
-        """Process an incremental text delta and flush if a sentence ends."""
+        if self._decoding_start is None:
+            self._decoding_start = now
         self._pending_text += text
         if self._is_sentence_boundary(self._pending_text):
             self._flush_chunk(now)
 
     def on_finish(self, now: float) -> None:
-        """Flush any remaining pending text as the final chunk."""
+        if self._decoding_start is None:
+            self._decoding_start = now
         if self._pending_text:
             self._flush_chunk(now)
 
@@ -90,6 +86,7 @@ class RequestSLOState:
         """Compute slack for the completed chunk and update state."""
         # Chunk 0 slack is fixed at 0.0; only update from chunk 1 onward.
         if self._chunk_count > 0:
+            assert self._decoding_start is not None
             deadline = self._decoding_start + self._cumulative_consume
             self.cumulative_slack = deadline - now
         # Always accumulate consume time (chunk 0's time feeds chunk 1's deadline).

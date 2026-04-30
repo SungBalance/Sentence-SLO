@@ -3,7 +3,6 @@
 
 import enum
 import time
-import weakref
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -29,7 +28,6 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.sslo.slo_state import RequestSLOState
     from vllm.v1.core.kv_cache_utils import BlockHash
-    from vllm.v1.engine.output_processor import RequestState
 
 
 @dataclass
@@ -176,10 +174,9 @@ class Request:
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
-        # SSLO: weakref to the output-processor's RequestState so that
-        # slo_state property delegates to RequestState.slo_state.
-        # Set by LLMEngine after both Request and RequestState are created.
-        self._rs: "weakref.ref[RequestState] | None" = None
+        # SSLO: shared SLO state; assigned by LLMEngine._bind_slo_state() after both
+        # Request and RequestState are created. No-op when None.
+        self.slo_state: "RequestSLOState | None" = None
 
     @classmethod
     def from_engine_core_request(
@@ -289,27 +286,6 @@ class Request:
         prefill_stats = self.prefill_stats
         self.prefill_stats = None
         return prefill_stats
-
-    @property
-    def slo_state(self) -> "RequestSLOState | None":
-        """SLO state for this request.
-
-        Delegates to RequestState.slo_state via a weakref set by LLMEngine.
-        Returns None (and setter is a no-op) when running in multiprocess or
-        async mode (MPClient / AsyncLLM) where _rs is never bound.
-        """
-        if self._rs is not None:
-            rs = self._rs()
-            if rs is not None:
-                return rs.slo_state
-        return None
-
-    @slo_state.setter
-    def slo_state(self, value: "RequestSLOState | None") -> None:
-        if self._rs is not None:
-            rs = self._rs()
-            if rs is not None:
-                rs.slo_state = value
 
     def __lt__(self, other: "Request") -> bool:
         """
