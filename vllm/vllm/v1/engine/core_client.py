@@ -1490,6 +1490,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     ) -> None:
         await self._send_input(EngineCoreRequestType.ABORT, request_ids, engine)
 
+    async def send_slo_updates_async(self, updates: list[tuple[str, float]]) -> None:
+        if not updates:
+            return
+        by_engine: defaultdict[EngineIdentity, list[tuple[str, float]]] = defaultdict(list)
+        for req_id, slack in updates:
+            if engine := self.reqs_in_flight.get(req_id):
+                by_engine[engine].append((req_id, slack))
+        for engine, eng_updates in by_engine.items():
+            await self._send_input(EngineCoreRequestType.SLO_UPDATE, eng_updates, engine)
+
     async def scale_elastic_ep(self, new_data_parallel_size: int) -> None:
         """Scale elastic EP data parallel size"""
         cur_data_parallel_size = len(self.core_engines)
