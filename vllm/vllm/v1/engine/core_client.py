@@ -300,6 +300,7 @@ class InprocClient(EngineCoreClient):
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
 
+    # SSLO
     def send_slo_updates(self, updates: list[tuple[str, float]]) -> None:
         pass
 
@@ -832,6 +833,7 @@ class SyncMPClient(MPClient):
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
+    # SSLO
     def send_slo_updates(self, updates: list[tuple[str, float]]) -> None:
         if updates:
             self._send_input(EngineCoreRequestType.SLO_UPDATE, updates)
@@ -1071,6 +1073,7 @@ class AsyncMPClient(MPClient):
         if request_ids and not self.resources.engine_dead:
             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
+    # SSLO
     async def send_slo_updates_async(self, updates: list[tuple[str, float]]) -> None:
         if updates:
             await self._send_input(EngineCoreRequestType.SLO_UPDATE, updates)
@@ -1490,6 +1493,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     ) -> None:
         await self._send_input(EngineCoreRequestType.ABORT, request_ids, engine)
 
+    # SSLO
     async def send_slo_updates_async(self, updates: list[tuple[str, float]]) -> None:
         if not updates:
             return

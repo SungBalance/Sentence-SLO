@@ -5,7 +5,9 @@ import pytest
 
 from vllm.sslo.slo_state import (
     ConsumeEstimator,
+    ParagraphChunkDetector,
     RequestSLOState,
+    SentenceChunkDetector,
     WordRateEstimator,
 )
 
@@ -172,19 +174,55 @@ class TestRequestSLOState:
         state.on_text_delta(".", 3.0)
         assert state.cumulative_slack == pytest.approx(0.0)
 
-    def test_is_sentence_boundary(self):
-        assert RequestSLOState._is_sentence_boundary("Hello.") is True
-        assert RequestSLOState._is_sentence_boundary("Hello!") is True
-        assert RequestSLOState._is_sentence_boundary("Hello?") is True
-        assert RequestSLOState._is_sentence_boundary("Hello。") is True
-        assert RequestSLOState._is_sentence_boundary("Hello！") is True
-        assert RequestSLOState._is_sentence_boundary("Hello？") is True
-        assert RequestSLOState._is_sentence_boundary("Hello…") is True
-        assert RequestSLOState._is_sentence_boundary("Hello. ") is True  # trailing space
-        assert RequestSLOState._is_sentence_boundary("Hello") is False
-        assert RequestSLOState._is_sentence_boundary("Hello,") is False
-        assert RequestSLOState._is_sentence_boundary("") is False
-        assert RequestSLOState._is_sentence_boundary("   ") is False
+    def test_sentence_chunk_detector(self):
+        det = SentenceChunkDetector()
+        assert det.find_boundary("Hello.") == 6
+        assert det.find_boundary("Hello!") == 6
+        assert det.find_boundary("Hello?") == 6
+        assert det.find_boundary("Hello。") is not None
+        assert det.find_boundary("Hello. ") == 6  # boundary before trailing space
+        assert det.find_boundary("Hello") is None
+        assert det.find_boundary("Hello,") is None
+        assert det.find_boundary("") is None
+        assert det.find_boundary("   ") is None
+
+    def test_paragraph_chunk_detector(self):
+        det = ParagraphChunkDetector()
+        assert det.find_boundary("Para one.\n\nPara two") == 11
+        assert det.find_boundary("No paragraph") is None
+        assert det.find_boundary("\n\n") == 2
+        assert det.find_boundary("text\n\n") == 6
+        assert det.find_boundary("\n") is None
+
+    def test_multi_boundary_in_single_delta(self):
+        """Two paragraph boundaries in one on_text_delta call produce two flushes."""
+        est = WordRateEstimator(seconds_per_word=1.0)
+        state = RequestSLOState(estimator=est, detector=ParagraphChunkDetector())
+        # "Para.\n\nSecond.\n\nThird" → two boundaries, two flushes at t=1.0
+        # chunk 0: "Para.\n\n" (1 word = 1.0s), decoding_start=1.0
+        # chunk 1: "Second.\n\n" (1 word), deadline=1.0+1.0=2.0, slack=2.0-1.0=+1.0
+        # pending after: "Third"
+        state.on_text_delta("Para.\n\nSecond.\n\nThird", 1.0)
+        assert state.cumulative_slack == pytest.approx(1.0)
+        assert state._pending_text == "Third"
+
+    def test_paragraph_detection(self):
+        """ParagraphChunkDetector flushes at \\n\\n boundaries."""
+        est = WordRateEstimator(seconds_per_word=1.0)
+        state = RequestSLOState(estimator=est, detector=ParagraphChunkDetector())
+        state.on_text_delta("Hello world.\n\n", 5.0)  # chunk 0, 2 words
+        assert state.cumulative_slack == pytest.approx(0.0)
+        assert state._pending_text == ""
+        # chunk 1: paragraph ends at t=8.0; deadline=5.0+2.0=7.0, slack=-1.0
+        state.on_text_delta("Next para.", 7.0)  # accumulating, not flushed yet
+        state.on_finish(8.0)                    # flush at finish
+        assert state.cumulative_slack == pytest.approx(-1.0)
+
+    def test_paragraph_remainder_stays_pending(self):
+        """Text after \\n\\n stays in pending for the next chunk."""
+        state = RequestSLOState(detector=ParagraphChunkDetector())
+        state.on_text_delta("Para one.\n\nStart of two", 1.0)
+        assert state._pending_text == "Start of two"
 
 
 # ---------------------------------------------------------------------------

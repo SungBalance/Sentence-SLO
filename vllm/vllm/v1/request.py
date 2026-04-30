@@ -174,6 +174,7 @@ class Request:
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
+        # SSLO
         # SSLO: shared SLO state; assigned by LLMEngine._bind_slo_state() after both
         # Request and RequestState are created. No-op when None.
         self.slo_state: "RequestSLOState | None" = None

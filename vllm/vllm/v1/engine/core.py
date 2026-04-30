@@ -343,6 +343,7 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+        # SSLO
         from vllm.sslo.slo_state import RequestSLOState
         request.slo_state = RequestSLOState()
         self.scheduler.add_request(request)
@@ -355,6 +356,7 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    # SSLO
     def update_slo_slack(self, updates: list[tuple[str, float]]) -> None:
         for req_id, slack in updates:
             req = self.scheduler.requests.get(req_id)
@@ -1301,6 +1303,7 @@ class EngineCoreProc(EngineCore):
             self._invoke_utility_method(method_name, get_result, output, enqueue_output)
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
             raise RuntimeError("Executor failed.")
+        # SSLO
         elif request_type == EngineCoreRequestType.SLO_UPDATE:
             self.update_slo_slack(request)
         else:

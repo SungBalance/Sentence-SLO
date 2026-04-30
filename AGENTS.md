@@ -8,6 +8,9 @@ These instructions apply to AI-assisted work in this workspace.
 - When working inside `vllm/`, also follow `vllm/AGENTS.md`.
 - `vllm/CLAUDE.md` points Claude Code to the same `vllm/AGENTS.md` instructions.
 - Put experiment code and experiment launch scripts under the repo-root `exp/`.
+- Organize `exp/` as experiment-specific folders. Each experiment folder under
+  `exp/` must include its own `README.md` that briefly explains the experiment,
+  key scripts, and output layout.
 - Store experiment launch `.sh` scripts in the same folder as the Python
   experiment script they execute.
 
@@ -17,6 +20,11 @@ These instructions apply to AI-assisted work in this workspace.
 - Put new SSLO-specific tests under `vllm/tests/sslo/`.
 - Do not recreate or import from the old `vllm.timing` module name; use `vllm.sslo`.
 - If a new SSLO feature needs shared helpers, add them to `vllm/vllm/sslo/` first rather than scattering them across unrelated vLLM modules.
+- In existing vLLM modules, prefix every new SSLO-specific addition (fields,
+  methods, standalone function calls, enum values) with a `# SSLO` line comment
+  immediately above it so that SSLO additions are easy to locate with grep.
+  Do not add this prefix inside `vllm/vllm/sslo/` — that package is entirely
+  SSLO code.
 
 ## Execution And Experiments
 
@@ -127,3 +135,15 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## 5. Agent Loop and Skills
+
+**Use the agent loop. Invoke relevant skills before acting.**
+
+- When writing or modifying code, run in an agent loop: plan → implement → verify → repeat until the success criteria are met.
+- Before any non-trivial action, check whether a skill applies. If there is even a 1% chance a skill is relevant, invoke it before proceeding.
+- Use `superpowers:brainstorming` before designing new features or components.
+- Use `superpowers:writing-plans` before multi-step implementation tasks.
+- Use `superpowers:systematic-debugging` before proposing fixes for bugs or test failures.
+- Use `superpowers:verification-before-completion` before claiming work is done or creating commits/PRs.
+- Use `superpowers:test-driven-development` when implementing features or bugfixes.

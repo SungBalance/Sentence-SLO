@@ -113,6 +113,7 @@ class RequestOutputCollector:
 class OutputProcessorOutput:
     request_outputs: list[RequestOutput | PoolingRequestOutput]
     reqs_to_abort: list[str]
+    # SSLO
     slo_updates: list[tuple[str, float]]
 
 
@@ -189,7 +190,7 @@ class RequestState:
             deque() if stream_input else None
         )
 
-        # SSLO: SLO state for this request.
+        # SSLO
         self.slo_state: RequestSLOState = RequestSLOState()
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
@@ -673,6 +674,7 @@ class OutputProcessor:
                     # LLMEngine: return list of RequestOutputs.
                     request_outputs.append(request_output)
 
+            # SSLO
             slack = req_state.slo_state.take_slack_update()
             if slack is not None:
                 slo_updates.append((req_id, slack))
@@ -702,6 +704,7 @@ class OutputProcessor:
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
+            # SSLO
             slo_updates=slo_updates,
         )
 

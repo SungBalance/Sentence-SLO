@@ -683,6 +683,7 @@ class AsyncLLM(EngineClient):
                                 processed_outputs.reqs_to_abort
                             )
 
+                        # SSLO
                         if processed_outputs.slo_updates:
                             await engine_core.send_slo_updates_async(
                                 processed_outputs.slo_updates

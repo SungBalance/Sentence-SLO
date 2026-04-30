@@ -286,6 +286,7 @@ class LLMEngine:
 
         return req_id
 
+    # SSLO
     def _bind_slo_state(self, req_id: str) -> None:
         """Share RequestState.slo_state with the scheduler's Request object.
 
@@ -328,6 +329,7 @@ class LLMEngine:
         with record_function_or_nullcontext("llm_engine step: abort_requests"):
             self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
 
+        # SSLO
         if processed_outputs.slo_updates:
             self.engine_core.send_slo_updates(processed_outputs.slo_updates)
 

@@ -241,6 +241,7 @@ class EngineCoreRequestType(enum.Enum):
     EXECUTOR_FAILED = b"\x04"
     # Sentinel to wake up input_queue.get() during shutdown.
     WAKEUP = b"\x05"
+    # SSLO
     SLO_UPDATE = b"\x06"
 
 
