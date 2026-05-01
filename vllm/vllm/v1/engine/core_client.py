@@ -301,7 +301,7 @@ class InprocClient(EngineCoreClient):
             self.engine_core.abort_requests(request_ids)
 
     # SSLO
-    def send_slo_updates(self, updates: list[tuple[str, float]]) -> None:
+    def send_slo_updates(self, updates: list[tuple[str, str, float]]) -> None:
         pass
 
     def shutdown(self, timeout: float | None = None) -> None:
@@ -834,7 +834,7 @@ class SyncMPClient(MPClient):
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
     # SSLO
-    def send_slo_updates(self, updates: list[tuple[str, float]]) -> None:
+    def send_slo_updates(self, updates: list[tuple[str, str, float]]) -> None:
         if updates:
             self._send_input(EngineCoreRequestType.SLO_UPDATE, updates)
 
@@ -1074,7 +1074,9 @@ class AsyncMPClient(MPClient):
             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
     # SSLO
-    async def send_slo_updates_async(self, updates: list[tuple[str, float]]) -> None:
+    async def send_slo_updates_async(
+        self, updates: list[tuple[str, str, float]]
+    ) -> None:
         if updates:
             await self._send_input(EngineCoreRequestType.SLO_UPDATE, updates)
 
@@ -1494,13 +1496,18 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         await self._send_input(EngineCoreRequestType.ABORT, request_ids, engine)
 
     # SSLO
-    async def send_slo_updates_async(self, updates: list[tuple[str, float]]) -> None:
+    async def send_slo_updates_async(
+        self, updates: list[tuple[str, str, float]]
+    ) -> None:
         if not updates:
             return
-        by_engine: defaultdict[EngineIdentity, list[tuple[str, float]]] = defaultdict(list)
-        for req_id, slack in updates:
+        by_engine: defaultdict[
+            EngineIdentity, list[tuple[str, str, float]]
+        ] = defaultdict(list)
+        for update in updates:
+            req_id = update[0]
             if engine := self.reqs_in_flight.get(req_id):
-                by_engine[engine].append((req_id, slack))
+                by_engine[engine].append(update)
         for engine, eng_updates in by_engine.items():
             await self._send_input(EngineCoreRequestType.SLO_UPDATE, eng_updates, engine)
 

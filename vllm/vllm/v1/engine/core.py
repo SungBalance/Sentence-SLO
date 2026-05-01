@@ -344,8 +344,8 @@ class EngineCore:
             )
 
         # SSLO
-        from vllm.sslo.slo_state import RequestSLOState
-        request.slo_state = RequestSLOState()
+        from vllm.sslo.config import build_slo_state
+        request.slo_state = build_slo_state(self.vllm_config.sslo_config)
         self.scheduler.add_request(request)
 
     def abort_requests(self, request_ids: list[str]):
@@ -357,11 +357,11 @@ class EngineCore:
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
     # SSLO
-    def update_slo_slack(self, updates: list[tuple[str, float]]) -> None:
-        for req_id, slack in updates:
+    def update_slo_text(self, updates: list[tuple[str, str, float]]) -> None:
+        for req_id, text, ts in updates:
             req = self.scheduler.requests.get(req_id)
             if req is not None and req.slo_state is not None:
-                req.slo_state.cumulative_slack = slack
+                req.slo_state.on_text_delta(text, ts)
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -1305,7 +1305,7 @@ class EngineCoreProc(EngineCore):
             raise RuntimeError("Executor failed.")
         # SSLO
         elif request_type == EngineCoreRequestType.SLO_UPDATE:
-            self.update_slo_slack(request)
+            self.update_slo_text(request)
         else:
             logger.error(
                 "Unrecognized input request type encountered: %s", request_type

@@ -2,8 +2,8 @@
 """Internal-slack benchmark for measure_internal_slack experiment.
 
 Runs vLLM inference and collects per-chunk timing records from RequestSLOState
-(engine-side timestamps), NOT from the async consumer. The SSLO_CHUNK_UNIT env
-var selects the chunk detector before the engine is created.
+(engine-side timestamps), NOT from the async consumer. Engine sslo_params select
+the chunk detector before the engine is created.
 
 Output per run:
   {output_dir}/chunks.jsonl    -- one row per chunk (includes cumulative_slack)
@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -131,9 +130,6 @@ async def main_async(args: argparse.Namespace) -> None:
     from vllm import AsyncLLMEngine, SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
 
-    os.environ["SSLO_CHUNK_UNIT"] = args.chunk_unit
-    os.environ["SSLO_SECONDS_PER_WORD"] = str(args.seconds_per_word)
-
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -150,6 +146,10 @@ async def main_async(args: argparse.Namespace) -> None:
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_log_requests=False,
+        sslo_params={
+            "chunk_unit": args.chunk_unit,
+            "seconds_per_word": args.seconds_per_word,
+        },
     )
     engine = AsyncLLMEngine.from_engine_args(engine_args)
 

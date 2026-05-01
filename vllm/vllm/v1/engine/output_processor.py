@@ -6,11 +6,12 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
-import os as _os
-
-from vllm.sslo.slo_state import ParagraphChunkDetector, RequestSLOState
+# SSLO
+from vllm.sslo.slo_state import RequestSLOState
+# SSLO
+from vllm.sslo.config import build_slo_state
 
 import numpy as np
 import torch
@@ -42,6 +43,9 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+
+if TYPE_CHECKING:
+    from vllm.sslo.config import SsloConfig
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -116,7 +120,7 @@ class OutputProcessorOutput:
     request_outputs: list[RequestOutput | PoolingRequestOutput]
     reqs_to_abort: list[str]
     # SSLO
-    slo_updates: list[tuple[str, float]]
+    slo_updates: list[tuple[str, str, float]]
 
 
 @dataclass
@@ -152,6 +156,8 @@ class RequestState:
         queue: RequestOutputCollector | None,
         log_stats: bool,
         stream_interval: int,
+        # SSLO
+        sslo_config: "SsloConfig | None" = None,
         top_p: float | None = None,
         n: int | None = None,
         temperature: float | None = None,
@@ -193,11 +199,19 @@ class RequestState:
         )
 
         # SSLO
-        _det = ParagraphChunkDetector() if _os.environ.get("SSLO_CHUNK_UNIT") == "paragraph" else None
-        from vllm.sslo.slo_state import WordRateEstimator as _WRE
-        _spw = float(_os.environ.get("SSLO_SECONDS_PER_WORD", "0.28"))
-        self.slo_state: RequestSLOState = RequestSLOState(estimator=_WRE(_spw), detector=_det)
+        from vllm.sslo.config import SsloConfig as _SsloConfig
+        _cfg = sslo_config if sslo_config is not None else _SsloConfig()
+        self.slo_state: RequestSLOState = build_slo_state(_cfg)
+        # SSLO
+        self._slo_pending_text_updates: list[tuple[str, float]] = []
+        # SSLO
         self._slo_text_len: int = 0  # tracks cumulative text length for delta extraction
+
+    # SSLO
+    def take_slo_text_updates(self) -> list[tuple[str, float]]:
+        out = self._slo_pending_text_updates
+        self._slo_pending_text_updates = []
+        return out
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
@@ -229,6 +243,8 @@ class RequestState:
         queue: RequestOutputCollector | None,
         log_stats: bool,
         stream_interval: int,
+        # SSLO
+        sslo_config: "SsloConfig | None" = None,
     ) -> "RequestState":
         if sampling_params := request.sampling_params:
             if not sampling_params.detokenize:
@@ -277,6 +293,7 @@ class RequestState:
             queue=queue,
             log_stats=log_stats,
             stream_interval=stream_interval,
+            sslo_config=sslo_config,
             stream_input=request.resumable,
         )
 
@@ -329,7 +346,10 @@ class RequestState:
             )
 
         output = self._new_completion_output(
-            new_token_ids, finish_reason, stop_reason, routed_experts
+            new_token_ids,
+            finish_reason,
+            stop_reason,
+            routed_experts,
         )
 
         if self.parent_req is None:
@@ -404,6 +424,7 @@ class RequestState:
         # Prepare text and token_ids, based on delta mode
         text = self.detokenizer.get_next_output_text(finished, delta)
         if self.slo_state is not None and (text or finished):
+            # SSLO
             now = time.monotonic()
             if text:
                 # SSLO: extract true incremental delta regardless of output_kind
@@ -414,6 +435,8 @@ class RequestState:
                     self._slo_text_len = len(text)
                 if slo_text:
                     self.slo_state.on_text_delta(slo_text, now)
+                    # SSLO
+                    self._slo_pending_text_updates.append((slo_text, now))
             if finished:
                 self.slo_state.on_finish(now)
         if not delta:
@@ -448,6 +471,8 @@ class OutputProcessor:
         *,
         log_stats: bool,
         stream_interval: int = 1,
+        # SSLO
+        sslo_config: "SsloConfig | None" = None,
         tracing_enabled: bool = False,
     ):
         self.log_stats = log_stats
@@ -458,6 +483,9 @@ class OutputProcessor:
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
+        # SSLO
+        from vllm.sslo.config import SsloConfig as _SsloConfig
+        self.sslo_config = sslo_config if sslo_config is not None else _SsloConfig()
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -557,6 +585,7 @@ class OutputProcessor:
             queue=queue,
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
+            sslo_config=self.sslo_config,
         )
         self.request_states[request_id] = req_state
         if parent_req:
@@ -628,7 +657,7 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
-        slo_updates: list[tuple[str, float]] = []
+        slo_updates: list[tuple[str, str, float]] = []
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -690,9 +719,8 @@ class OutputProcessor:
                     request_outputs.append(request_output)
 
             # SSLO
-            slack = req_state.slo_state.take_slack_update()
-            if slack is not None:
-                slo_updates.append((req_id, slack))
+            for text, ts in req_state.take_slo_text_updates():
+                slo_updates.append((req_id, text, ts))
 
             # Free completed requests.
             if finish_reason is not None:
