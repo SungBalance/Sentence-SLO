@@ -132,6 +132,8 @@ class RequestSLOState:
         self,
         estimator: ConsumeEstimator | None = None,
         detector: ChunkBoundaryDetector | None = None,
+        ema_alpha: float = 0.2,
+        pending_slack_eps_num_tokens: int = 3,
     ) -> None:
         self._estimator: ConsumeEstimator = (
             estimator if estimator is not None else WordRateEstimator()
@@ -146,10 +148,22 @@ class RequestSLOState:
         self.cumulative_slack: float = 0.0
         self._slack_dirty: bool = False
         self._chunk_records: list[SLOChunkRecord] = []
+        self._ema_alpha: float = ema_alpha
+        self._pending_slack_eps_num_tokens: int = pending_slack_eps_num_tokens
+        # EMA / pending fields are populated in Task 3
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def sslo_score(self) -> float:
+        """Scheduling urgency score. Lower = more urgent.
+
+        Currently equals cumulative_slack. Abstracted so future scoring
+        formulas don't require caller changes.
+        """
+        return self.cumulative_slack
 
     def on_text_delta(self, text: str, now: float) -> None:
         if self._decoding_start is None:

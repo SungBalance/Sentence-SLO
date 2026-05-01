@@ -146,3 +146,6 @@
 - Debugging/verification: In `sk-sslo-omni`, re-ran `py_compile` and generated the new quantile-regression outputs for the existing Kokoro sentence-duration CSV.
 - Added: Created repo-root `.gitignore` entries for editor noise, local assistant/tool settings, Python caches/build artifacts, virtual environments, scratch files, experiment output/runtime directories, and local model/data artifacts.
 - Debugging/verification: Verified representative paths with `git check-ignore`, including `.claude/`, nested `exp/.claude/`, `__pycache__/`, `exp/slack_dist/output/`, and experiment log files.
+- Added: Created `vllm/vllm/sslo/config.py` with `SsloConfig` and `build_slo_state()`, plus SSLO config tests.
+- Modified: Added `RequestSLOState.sslo_score`, stored Task 3 constructor parameters, and exported the new SSLO config factory symbols.
+- Debugging/verification: In `sk-sslo`, installed the declared `tblib` test dependency after pytest conftest import failed, then ran SSLO pytest and compile checks successfully.

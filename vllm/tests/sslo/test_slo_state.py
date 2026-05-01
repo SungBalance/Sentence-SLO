@@ -276,3 +276,17 @@ class TestBindSLOState:
 
         # Scheduler reads via sched_req side
         assert sched_req.slo_state.cumulative_slack == pytest.approx(-1.0)
+
+
+class TestSsloScore:
+    def test_initial_zero(self):
+        state = RequestSLOState()
+        assert state.sslo_score == 0.0
+
+    def test_equals_cumulative_slack(self):
+        import time
+        state = RequestSLOState()
+        now = time.monotonic()
+        state.on_text_delta("Hello world. ", now)
+        state.on_text_delta("Next sentence. ", now + 0.1)
+        assert state.sslo_score == state.cumulative_slack
