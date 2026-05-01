@@ -70,6 +70,22 @@ These instructions apply to AI-assisted work in this workspace.
   unavailable in the container, report that clearly and still run syntax checks
   such as `python3 -m compileall` in the container where possible.
 
+## Development Agent Loop
+
+코드 작성 시 개발 agent와 검증 agent를 분리하여 (작성 → 검증) loop을 실행한다.
+
+**Loop 종료 조건:** 검증 agent가 이슈를 하나도 발견하지 않을 때. 3회 초과 시 human escalation.
+
+**검증 기준 (tier):**
+
+| Tier | 예시 | 처리 |
+|------|------|------|
+| **Critical** | 버그·런타임 에러 가능성, 요청하지 않은 기능 추가 | 즉시 수정 |
+| **Important** | 한 곳으로 묶을 수 있는 변경을 여러 곳에 분산, 요청 범위 밖 파일·함수 수정, YAGNI 위반 | 수정 |
+| **Minor** | 네이밍·스타일 등 작은 개선 | 수정 |
+
+개발 agent는 Critical → Important → Minor 순으로 수정 후 재제출한다.
+
 # Work Guideline
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
