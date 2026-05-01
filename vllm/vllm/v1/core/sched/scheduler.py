@@ -1428,6 +1428,12 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    # SSLO (offloading): mark highest-slack request for future CPU offload
+                    if self.sslo_config.offloading:
+                        combined = self.running + self.sslo_pending
+                        if combined:
+                            candidate = max(combined, key=_sslo_score_key)
+                            candidate.sslo_offload_requested = True
                     break
 
                 # KVTransfer: the connector uses this info to determine

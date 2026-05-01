@@ -163,3 +163,6 @@
 - Modified: Added Task 5 SSLO scheduler wiring, including `_sslo_score_key`, SSLO scheduler state initialization, `schedule_sslo()` with pending redistribution ahead of the copied scheduler body, and SSLO cleanup when requests leave running state or are freed.
 - Added: Created `vllm/tests/sslo/test_scheduler_sslo.py` covering SSLO score ordering and pending redistribution cases for no waiting work, eligible pending, and max-consecutive pending fallback.
 - Debugging/verification: In `sk-sslo`, ran scheduler `compileall`, `tests/sslo/` (`47 passed, 16 warnings`), verified `schedule()` still matches `HEAD` byte-for-byte, and confirmed the requested removed-line grep produced no output.
+- Modified: Added Task 6 SSLO offload marking in `scheduler.py` inside `schedule_sslo()` when KV allocation returns no blocks.
+- Added: Appended `TestOffloadMarking` to `vllm/tests/sslo/test_scheduler_sslo.py`.
+- Debugging/verification: In `sk-sslo`, ran `tests/sslo/` (`48 passed, 16 warnings`) and `compileall` for `scheduler.py` successfully.
