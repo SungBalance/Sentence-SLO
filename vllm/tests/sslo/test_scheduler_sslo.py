@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for SSLO scheduler helpers and pending redistribution."""
+
+from types import SimpleNamespace
+
+import pytest
+
+from vllm.sslo.config import SsloConfig
+from vllm.sslo.slo_state import RequestSLOState
+from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
+from vllm.v1.core.sched.scheduler import Scheduler, _sslo_score_key
+
+
+def make_mock_request(request_id="req", slo_state=None):
+    return SimpleNamespace(request_id=request_id, slo_state=slo_state)
+
+
+def make_pending_eligible_state(score=10.0):
+    state = RequestSLOState()
+    state.cumulative_slack = score
+    state._ema_pure_gen_time = 1.0
+    state._ema_per_token_time = 1.0
+    state._pending_slack_eps_num_tokens = 1
+    return state
+
+
+class FakeKVCacheManager:
+
+    def new_step_starts(self):
+        pass
+
+    def take_new_block_ids(self):
+        return []
+
+    def get_num_common_prefix_blocks(self, request_id):
+        return []
+
+
+class FakeEncoderCacheManager:
+
+    def get_freed_mm_hashes(self):
+        return []
+
+
+def make_scheduler(running=None, sslo_pending=None, waiting_len=0, max_pending=5):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.running = list(running or [])
+    scheduler.sslo_pending = list(sslo_pending or [])
+    scheduler.sslo_consecutive_pending = {}
+    scheduler.sslo_config = SsloConfig(enabled=True,
+                                       max_consecutive_pending=max_pending)
+    scheduler.waiting = [object()] * waiting_len
+    scheduler.skipped_waiting = []
+    scheduler.max_num_scheduled_tokens = 0
+    scheduler.max_num_running_reqs = 100
+    scheduler._pause_state = PauseState.UNPAUSED
+    scheduler.max_num_encoder_input_tokens = 0
+    scheduler.kv_cache_manager = FakeKVCacheManager()
+    scheduler.encoder_cache_manager = FakeEncoderCacheManager()
+    scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
+    scheduler.lora_config = None
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.use_v2_model_runner = False
+    scheduler.needs_kv_cache_zeroing = False
+    scheduler.prev_step_scheduled_req_ids = set()
+    scheduler.finished_req_ids = set()
+    scheduler.use_pp = False
+    scheduler.scheduler_config = SimpleNamespace(async_scheduling=False)
+    scheduler._update_after_schedule = lambda output: None
+    return scheduler
+
+
+class TestSsloScoreKey:
+
+    def test_none_slo_state_returns_inf(self):
+        request = make_mock_request(slo_state=None)
+
+        assert _sslo_score_key(request) == float("inf")
+
+    def test_finite_score_returned(self):
+        state = RequestSLOState()
+        state.cumulative_slack = -2.5
+        request = make_mock_request(slo_state=state)
+
+        assert _sslo_score_key(request) == pytest.approx(-2.5)
+
+    def test_sort_order(self):
+        urgent = make_mock_request("urgent", make_pending_eligible_state(-3.0))
+        relaxed = make_mock_request("relaxed", make_pending_eligible_state(4.0))
+        no_state = make_mock_request("none", None)
+
+        requests = sorted([no_state, relaxed, urgent], key=_sslo_score_key)
+
+        assert [request.request_id for request in requests] == [
+            "urgent",
+            "relaxed",
+            "none",
+        ]
+
+
+class TestPendingRedistribution:
+
+    def test_no_waiting_nothing_pended(self):
+        request = make_mock_request(slo_state=make_pending_eligible_state())
+        scheduler = make_scheduler(running=[request], waiting_len=0)
+
+        scheduler.schedule_sslo()
+
+        assert scheduler.running == [request]
+        assert scheduler.sslo_pending == []
+        assert scheduler.sslo_consecutive_pending[request.request_id] == 0
+
+    def test_high_urgency_request_pended(self):
+        request = make_mock_request(slo_state=make_pending_eligible_state())
+        scheduler = make_scheduler(running=[request], waiting_len=1)
+
+        scheduler.schedule_sslo()
+
+        assert scheduler.running == []
+        assert scheduler.sslo_pending == [request]
+        assert scheduler.sslo_consecutive_pending[request.request_id] == 1
+        assert request.slo_state._pending_enter_ts is not None
+
+    def test_max_consecutive_pending_forces_run(self):
+        request = make_mock_request(slo_state=make_pending_eligible_state())
+        request.slo_state.on_pending_enter(0.0)
+        scheduler = make_scheduler(sslo_pending=[request], waiting_len=1,
+                                   max_pending=2)
+        scheduler.sslo_consecutive_pending[request.request_id] = 2
+
+        scheduler.schedule_sslo()
+
+        assert scheduler.running == [request]
+        assert scheduler.sslo_pending == []
+        assert scheduler.sslo_consecutive_pending[request.request_id] == 0
+        assert request.slo_state._pending_enter_ts is None
