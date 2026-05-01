@@ -1004,6 +1004,14 @@ class Scheduler(SchedulerInterface):
         self.running = new_running
         self.sslo_pending = new_pending
 
+        # SSLO (adaptive_batch_size): shadow as local; reduce if any overdue
+        max_num_running_reqs = self.max_num_running_reqs
+        if self.sslo_config.adaptive_batch_size and any(
+            r.slo_state is not None and r.slo_state.sslo_score < 0
+            for r in self.running
+        ):
+            max_num_running_reqs = max(1, max_num_running_reqs - 1)
+
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1224,7 +1232,8 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
+                # SSLO: use local cap
+                if len(self.running) == max_num_running_reqs:
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -1524,7 +1533,8 @@ class Scheduler(SchedulerInterface):
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
         assert token_budget >= 0
-        assert len(self.running) <= self.max_num_running_reqs
+        # SSLO: assert against local cap
+        assert len(self.running) <= max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).

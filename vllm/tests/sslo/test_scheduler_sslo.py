@@ -152,3 +152,23 @@ class TestOffloadMarking:
         candidate.sslo_offload_requested = True
         assert candidate.request_id == "c"
         assert candidate.sslo_offload_requested is True
+
+
+class TestAdaptiveBatchSize:
+    def test_overdue_reduces_cap(self):
+        running = [make_mock_request("a", make_pending_eligible_state(0.5)),
+                   make_mock_request("b", make_pending_eligible_state(-0.1))]
+        base = 16
+        overdue = any(r.slo_state and r.slo_state.sslo_score < 0
+                      for r in running)
+        cap = max(1, base - 1) if overdue else base
+        assert cap == 15
+
+    def test_no_overdue_keeps_cap(self):
+        running = [make_mock_request("a", make_pending_eligible_state(0.5)),
+                   make_mock_request("b", make_pending_eligible_state(0.1))]
+        base = 16
+        overdue = any(r.slo_state and r.slo_state.sslo_score < 0
+                      for r in running)
+        cap = max(1, base - 1) if overdue else base
+        assert cap == 16

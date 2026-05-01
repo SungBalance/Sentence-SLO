@@ -166,3 +166,8 @@
 - Modified: Added Task 6 SSLO offload marking in `scheduler.py` inside `schedule_sslo()` when KV allocation returns no blocks.
 - Added: Appended `TestOffloadMarking` to `vllm/tests/sslo/test_scheduler_sslo.py`.
 - Debugging/verification: In `sk-sslo`, ran `tests/sslo/` (`48 passed, 16 warnings`) and `compileall` for `scheduler.py` successfully.
+- Session date: 2026-05-01
+- Task: Task 7 — adaptive_batch_size in schedule_sslo()
+- Modified: `vllm/vllm/v1/core/sched/scheduler.py` (`schedule_sslo()` only: added local cap, replaced 2 usages)
+- Added: `TestAdaptiveBatchSize` class in `vllm/tests/sslo/test_scheduler_sslo.py`
+- Verification: pytest tail, compileall clean, diff confirms `schedule()` lines 589/883 untouched
