@@ -225,6 +225,77 @@ class TestRequestSLOState:
         assert state._pending_text == "Start of two"
 
 
+class TestEmaTracking:
+    def test_ema_initially_none(self):
+        state = RequestSLOState()
+        assert state._ema_pure_gen_time is None
+        assert state._ema_per_token_time is None
+
+    def test_ema_updates_after_chunk(self):
+        import time
+        state = RequestSLOState(ema_alpha=0.5)
+        t0 = time.monotonic()
+        state.on_text_delta("hello world", t0)
+        state.on_text_delta(". ", t0 + 1.0)
+        # First chunk: pure gen = 1.0, words = 2, per_token ~ 0.5
+        assert state._ema_pure_gen_time == pytest.approx(1.0)
+        assert state._ema_per_token_time == pytest.approx(0.5)
+
+
+class TestPendingCallbacks:
+    def test_pending_subtracted_from_gen_time(self):
+        import time
+        state = RequestSLOState(ema_alpha=1.0)  # alpha=1 -> EMA == latest sample
+        t0 = time.monotonic()
+        # text starts at t0
+        state.on_text_delta("hello world", t0 + 0.0)  # no boundary yet
+        # pending [t0+0.5, t0+0.8] (0.3s)
+        state.on_pending_enter(t0 + 0.5)
+        state.on_pending_exit(t0 + 0.8)
+        # finish at t0+1.0 (boundary at end of text)
+        state.on_text_delta(".", t0 + 1.0)
+        # pure gen_time = 1.0 - 0.3 = 0.7
+        rec = state.chunk_records[0]
+        assert rec["gen_time"] == pytest.approx(0.7)
+        assert rec["pending_time"] == pytest.approx(0.3)
+
+    def test_pending_resets_after_flush(self):
+        import time
+        state = RequestSLOState()
+        t0 = time.monotonic()
+        state.on_pending_enter(t0)
+        state.on_pending_exit(t0 + 0.5)
+        state.on_text_delta("a. ", t0 + 1.0)  # chunk flushes
+        assert state._chunk_pending_time == 0.0
+
+
+class TestIsPendingEligible:
+    def test_false_when_no_ema_yet(self):
+        state = RequestSLOState()
+        state.cumulative_slack = 100.0
+        assert state.is_pending_eligible is False
+
+    def test_true_when_slack_exceeds_threshold(self):
+        import time
+        state = RequestSLOState(ema_alpha=1.0, pending_slack_eps_num_tokens=3)
+        t0 = time.monotonic()
+        state.on_text_delta("hello world", t0)
+        state.on_text_delta(". ", t0 + 1.0)
+        # ema_pure_gen_time = 1.0, ema_per_token_time = 0.5
+        # threshold = 1.0 + 3 * 0.5 = 2.5
+        state.cumulative_slack = 3.0
+        assert state.is_pending_eligible is True
+
+    def test_false_when_slack_below_threshold(self):
+        import time
+        state = RequestSLOState(ema_alpha=1.0, pending_slack_eps_num_tokens=3)
+        t0 = time.monotonic()
+        state.on_text_delta("hello world", t0)
+        state.on_text_delta(". ", t0 + 1.0)
+        state.cumulative_slack = 2.0  # below 2.5 threshold
+        assert state.is_pending_eligible is False
+
+
 # ---------------------------------------------------------------------------
 # LLMEngine._bind_slo_state tests
 # ---------------------------------------------------------------------------

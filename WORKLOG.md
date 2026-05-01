@@ -151,3 +151,6 @@
 - Debugging/verification: In `sk-sslo`, installed the declared `tblib` test dependency after pytest conftest import failed, then ran SSLO pytest and compile checks successfully.
 - Modified: Wired `SsloConfig` through `VllmConfig` and `EngineArgs`, including `sslo_params` construction in `create_engine_config()`.
 - Debugging/verification: Reinstalled the local vLLM checkout editable in `sk-sslo`, ran the requested `VllmConfig().sslo_config` smoke check, and ran compileall for the two touched vLLM files.
+- Modified: Added Task 3 `RequestSLOState` EMA tracking, pending enter/exit callbacks, pure generation/pending chunk record fields, and `is_pending_eligible` threshold logic.
+- Added: Added SSLO state tests for EMA initialization/update, pending-time subtraction/reset, and pending eligibility.
+- Debugging/verification: Confirmed the new tests failed before implementation, then ran `tests/sslo/test_slo_state.py`, all `tests/sslo/`, and `compileall` for `vllm/vllm/sslo/slo_state.py` inside `sk-sslo`; a separate verification pass found no issues.
