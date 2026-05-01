@@ -149,3 +149,5 @@
 - Added: Created `vllm/vllm/sslo/config.py` with `SsloConfig` and `build_slo_state()`, plus SSLO config tests.
 - Modified: Added `RequestSLOState.sslo_score`, stored Task 3 constructor parameters, and exported the new SSLO config factory symbols.
 - Debugging/verification: In `sk-sslo`, installed the declared `tblib` test dependency after pytest conftest import failed, then ran SSLO pytest and compile checks successfully.
+- Modified: Wired `SsloConfig` through `VllmConfig` and `EngineArgs`, including `sslo_params` construction in `create_engine_config()`.
+- Debugging/verification: Reinstalled the local vLLM checkout editable in `sk-sslo`, ran the requested `VllmConfig().sslo_config` smoke check, and ran compileall for the two touched vLLM files.

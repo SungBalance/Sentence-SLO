@@ -8,7 +8,7 @@ import functools
 import json
 import sys
 from collections.abc import Callable
-from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from itertools import permutations
 from types import UnionType
 from typing import (
@@ -98,6 +98,8 @@ from vllm.logger import init_logger, suppress_logging
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.plugins import load_general_plugins
 from vllm.ray.lazy_utils import is_in_ray_actor, is_ray_initialized
+# SSLO
+from vllm.sslo import SsloConfig
 from vllm.transformers_utils.config import (
     is_interleaved,
     maybe_override_with_speculators,
@@ -648,6 +650,8 @@ class EngineArgs:
     mamba_cache_philox_rounds: int = MambaConfig.stochastic_rounding_philox_rounds
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
+    # SSLO
+    sslo_params: dict = field(default_factory=dict)
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str | dict[str, str] = LoadConfig.pt_load_map_location
@@ -2118,6 +2122,9 @@ class EngineArgs:
         if self.gdn_prefill_backend is not None:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
 
+        # SSLO
+        sslo_config = SsloConfig(**self.sslo_params)
+
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -2140,6 +2147,8 @@ class EngineArgs:
             reasoning_config=self.reasoning_config,
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
+            # SSLO
+            sslo_config=sslo_config,
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
