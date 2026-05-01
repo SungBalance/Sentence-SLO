@@ -11,6 +11,7 @@ detectors: SentenceChunkDetector (default), ParagraphChunkDetector.
 """
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from typing import Protocol, runtime_checkable
 
 # Sentence-ending punctuation for sentence boundary detection.
@@ -52,16 +53,31 @@ class ChunkBoundaryDetector(Protocol):
 
 
 class SentenceChunkDetector:
-    """Flushes when the accumulated text ends with a sentence-ending character.
+    """Flushes at the first sentence boundary in the accumulated text.
 
-    Returns the length of the stripped text as the boundary position so that
-    trailing whitespace is carried forward rather than included in the chunk.
+    A sentence boundary is a sentence-ending character (.!?。！？…) followed
+    by whitespace or end of text.  Consecutive sentence-ending chars are
+    consumed together (e.g. "..." or "?!") so the boundary position sits just
+    past all of them.  Mid-token sequences like "3.14" or "Dr.Smith" (no
+    following whitespace) are not treated as boundaries.
     """
 
     def find_boundary(self, text: str) -> int | None:
-        stripped = text.rstrip()
-        if stripped and stripped[-1] in _SENTENCE_END_CHARS:
-            return len(stripped)
+        i = 0
+        n = len(text)
+        while i < n:
+            if text[i] in _SENTENCE_END_CHARS:
+                j = i + 1
+                # Consume consecutive sentence-ending chars ("..." / "?!")
+                while j < n and text[j] in _SENTENCE_END_CHARS:
+                    j += 1
+                # Valid boundary: end of text OR followed by whitespace
+                if j >= n or text[j].isspace():
+                    return j
+                # Not a boundary (e.g. "3.14", "Dr.Smith") — keep scanning
+                i = j
+            else:
+                i += 1
         return None
 
 
@@ -79,6 +95,17 @@ class ParagraphChunkDetector:
         if idx != -1:
             return idx + 2
         return None
+
+
+@dataclass
+class SLOChunkRecord:
+    chunk_idx: int
+    text: str
+    word_count: int
+    decoding_start_ts: float
+    end_time_ts: float
+    cumulative_consume: float   # sum of consume times for chunks 0..idx-1 (deadline offset)
+    cumulative_slack: float     # 0.0 for chunk 0
 
 
 class RequestSLOState:
@@ -118,6 +145,7 @@ class RequestSLOState:
         self._chunk_count: int = 0
         self.cumulative_slack: float = 0.0
         self._slack_dirty: bool = False
+        self._chunk_records: list[SLOChunkRecord] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -156,7 +184,20 @@ class RequestSLOState:
             deadline = self._decoding_start + self._cumulative_consume
             self.cumulative_slack = deadline - now
             self._slack_dirty = True
+        self._chunk_records.append(SLOChunkRecord(
+            chunk_idx=self._chunk_count,
+            text=chunk_text,
+            word_count=len(chunk_text.split()),
+            decoding_start_ts=self._decoding_start,  # type: ignore[arg-type]
+            end_time_ts=now,
+            cumulative_consume=self._cumulative_consume,
+            cumulative_slack=self.cumulative_slack,
+        ))
         # Always accumulate consume time (chunk 0's time feeds chunk 1's deadline).
         self._cumulative_consume += self._estimator(chunk_text)
         self._chunk_count += 1
         self._pending_text = self._pending_text[boundary_pos:]
+
+    @property
+    def chunk_records(self) -> list[dict]:
+        return [asdict(r) for r in self._chunk_records]

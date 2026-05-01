@@ -8,7 +8,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
-from vllm.sslo.slo_state import RequestSLOState
+import os as _os
+
+from vllm.sslo.slo_state import ParagraphChunkDetector, RequestSLOState
 
 import numpy as np
 import torch
@@ -191,7 +193,11 @@ class RequestState:
         )
 
         # SSLO
-        self.slo_state: RequestSLOState = RequestSLOState()
+        _det = ParagraphChunkDetector() if _os.environ.get("SSLO_CHUNK_UNIT") == "paragraph" else None
+        from vllm.sslo.slo_state import WordRateEstimator as _WRE
+        _spw = float(_os.environ.get("SSLO_SECONDS_PER_WORD", "0.28"))
+        self.slo_state: RequestSLOState = RequestSLOState(estimator=_WRE(_spw), detector=_det)
+        self._slo_text_len: int = 0  # tracks cumulative text length for delta extraction
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
@@ -379,6 +385,8 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
+            # SSLO
+            slo_chunk_records=self.slo_state.chunk_records if finished else None,
         )
 
     def _new_completion_output(
@@ -395,12 +403,19 @@ class RequestState:
 
         # Prepare text and token_ids, based on delta mode
         text = self.detokenizer.get_next_output_text(finished, delta)
-        if self.slo_state is not None and text:
+        if self.slo_state is not None and (text or finished):
             now = time.monotonic()
+            if text:
+                # SSLO: extract true incremental delta regardless of output_kind
+                if delta:
+                    slo_text = text
+                else:
+                    slo_text = text[self._slo_text_len:]
+                    self._slo_text_len = len(text)
+                if slo_text:
+                    self.slo_state.on_text_delta(slo_text, now)
             if finished:
                 self.slo_state.on_finish(now)
-            else:
-                self.slo_state.on_text_delta(text, now)
         if not delta:
             token_ids = self.detokenizer.output_token_ids
 

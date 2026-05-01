@@ -860,7 +860,11 @@ class LayerName(OpaqueBase):  # type: ignore[misc]
 if HAS_OPAQUE_TYPE:
     from torch._library.opaque_object import register_opaque_type
 
-    register_opaque_type(LayerName, typ="value", hoist=True)
+    try:
+        register_opaque_type(LayerName, typ="value", hoist=True)
+    except TypeError:
+        # hoist parameter not available in this torch version
+        register_opaque_type(LayerName, typ="value")
 
 # On torch >= 2.11 (with VLLM_USE_LAYERNAME enabled), custom op
 # layer_name parameters use LayerName; otherwise they remain plain str.

@@ -1,0 +1,16 @@
+{
+  "model": "Qwen/Qwen3.5-27B",
+  "model_slug": "Qwen__Qwen3.5-27B",
+  "chunk_unit": "sentence",
+  "batch_size": 32,
+  "dataset_name": "koala",
+  "num_prompts": 256,
+  "num_requests_completed": 180,
+  "total_chunks": 14421,
+  "elapsed_seconds": 693.9735518760281,
+  "seconds_per_word": 0.28,
+  "generation_max_tokens": 8192,
+  "max_model_len": 8192,
+  "tensor_parallel_size": 1,
+  "gpu_memory_utilization": 0.95
+}
