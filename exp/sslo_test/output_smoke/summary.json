@@ -1,0 +1,15 @@
+{
+  "max_num_seqs": 64,
+  "h1_pending_plus_running_exceeds_cap": false,
+  "h1_max_combined": 16,
+  "h1_iterations_above_cap": 0,
+  "h2_ttft_p50_baseline": 0.13086479296907783,
+  "h2_ttft_p50_sslo": 0.1317121610045433,
+  "h2_ttft_p50_pct_change": 0.647514137485171,
+  "h2_ttft_p90_baseline": 0.13108192197978497,
+  "h2_ttft_p90_sslo": 0.1319340099580586,
+  "h2_ttft_cohort": "all_requests_smoke_fallback",
+  "h2_ttft_count_baseline": 16,
+  "h2_ttft_count_sslo": 16,
+  "h2_ttft_p50_improved": false
+}

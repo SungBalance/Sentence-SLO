@@ -1,0 +1,16 @@
+{"request_id": "0", "request_idx": 0, "t_submit": 1098513.678282025, "t_first_token": 1098513.760377439, "ttft": 0.08209541393443942, "t_finish": 1098515.30045823, "num_tokens": 128}
+{"request_id": "1", "request_idx": 1, "t_submit": 1098513.679047112, "t_first_token": 1098513.810238334, "ttft": 0.13119122199714184, "t_finish": 1098515.312267783, "num_tokens": 128}
+{"request_id": "2", "request_idx": 2, "t_submit": 1098513.679137662, "t_first_token": 1098513.810243884, "ttft": 0.13110622204840183, "t_finish": 1098515.312284173, "num_tokens": 128}
+{"request_id": "3", "request_idx": 3, "t_submit": 1098513.679189972, "t_first_token": 1098513.810247594, "ttft": 0.1310576219111681, "t_finish": 1098515.312294743, "num_tokens": 128}
+{"request_id": "4", "request_idx": 4, "t_submit": 1098513.679231632, "t_first_token": 1098513.810251374, "ttft": 0.13101974199526012, "t_finish": 1098515.312306833, "num_tokens": 128}
+{"request_id": "5", "request_idx": 5, "t_submit": 1098513.679276732, "t_first_token": 1098513.810255064, "ttft": 0.13097833190113306, "t_finish": 1098515.312315293, "num_tokens": 128}
+{"request_id": "6", "request_idx": 6, "t_submit": 1098513.679313762, "t_first_token": 1098513.810258554, "ttft": 0.1309447919484228, "t_finish": 1098515.312323263, "num_tokens": 128}
+{"request_id": "7", "request_idx": 7, "t_submit": 1098513.679350902, "t_first_token": 1098513.810262134, "ttft": 0.13091123197227716, "t_finish": 1098515.312330963, "num_tokens": 128}
+{"request_id": "8", "request_idx": 8, "t_submit": 1098513.679385261, "t_first_token": 1098513.810265184, "ttft": 0.13087992300279438, "t_finish": 1098515.312338153, "num_tokens": 128}
+{"request_id": "9", "request_idx": 9, "t_submit": 1098513.679418741, "t_first_token": 1098513.810268404, "ttft": 0.13084966293536127, "t_finish": 1098515.312345933, "num_tokens": 128}
+{"request_id": "10", "request_idx": 10, "t_submit": 1098513.679450081, "t_first_token": 1098513.810271544, "ttft": 0.1308214629534632, "t_finish": 1098515.312353983, "num_tokens": 128}
+{"request_id": "11", "request_idx": 11, "t_submit": 1098513.679485291, "t_first_token": 1098513.810274394, "ttft": 0.13078910298645496, "t_finish": 1098515.312362453, "num_tokens": 128}
+{"request_id": "12", "request_idx": 12, "t_submit": 1098513.679521781, "t_first_token": 1098513.810277464, "ttft": 0.13075568317435682, "t_finish": 1098515.312370483, "num_tokens": 128}
+{"request_id": "13", "request_idx": 13, "t_submit": 1098513.679554991, "t_first_token": 1098513.810280384, "ttft": 0.13072539307177067, "t_finish": 1098515.312377893, "num_tokens": 128}
+{"request_id": "14", "request_idx": 14, "t_submit": 1098513.679587821, "t_first_token": 1098513.810283454, "ttft": 0.13069563289172947, "t_finish": 1098515.312385362, "num_tokens": 128}
+{"request_id": "15", "request_idx": 15, "t_submit": 1098513.679618401, "t_first_token": 1098513.810286424, "ttft": 0.13066802290268242, "t_finish": 1098515.312396222, "num_tokens": 128}

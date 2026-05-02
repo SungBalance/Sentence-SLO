@@ -1,5 +1,11 @@
 # Work Log
 
+## 2026-05-02
+
+- Modified: Added env-var-gated SSLO scheduler iteration stats logging in `vllm/vllm/v1/core/sched/scheduler.py` after pending/running redistribution.
+- Added: Created `exp/sslo_test/` with `run_test.py`, `run_test.sh`, `analyze.py`, and `README.md` for baseline-vs-SSLO TTFT measurement and H1/H2 summary output.
+- Debugging/verification: In `sk-sslo`, reinstalled the editable vLLM checkout, ran `compileall` for `exp/sslo_test/run_test.py` and `exp/sslo_test/analyze.py`, and ran `bash -n exp/sslo_test/run_test.sh`. The 16-request smoke completed with H1 FAIL and H2 FAIL. The full baseline completed; the full SSLO run crashed in `schedule_sslo()` on `assert len(self.running) <= max_num_running_reqs` after logging `max_running_plus_pending=71`, so H1 PASS evidence was captured but H2 could not be measured for the full run.
+
 ## 2026-04-30
 
 - Added: Created `exp/measure_KV_overhead/` experiment for profiling GPU↔CPU KV cache block transfer overhead.
@@ -171,3 +177,11 @@
 - Modified: `vllm/vllm/v1/core/sched/scheduler.py` (`schedule_sslo()` only: added local cap, replaced 2 usages)
 - Added: `TestAdaptiveBatchSize` class in `vllm/tests/sslo/test_scheduler_sslo.py`
 - Verification: pytest tail, compileall clean, diff confirms `schedule()` lines 589/883 untouched
+
+## 2026-05-02 (continued)
+
+- Task: SSLO scheduler E2E test bug fix and full validation
+- Fixed: `schedule_sslo()` redistribution could push `len(self.running) > max_num_seqs` when `max_consecutive_pending` forced pending requests back, causing `InputBatch` `assert new_req_index < self.max_num_reqs` AssertionError mid-run. Added strict cap enforcement: after redistribution, if `len(new_running) > max_num_running_reqs`, the highest-slack overflow is bumped to pending (cap takes priority over starvation prevention). Adaptive cap moved up so cap enforcement uses the reduced limit. Admission gate `==` → `>=` (defensive). End-of-loop assert restored.
+- Modified: `exp/sslo_test/run_test.py` adds GPU cleanup (`del engine`, `gc.collect()`, `torch.cuda.empty_cache()`, `torch.cuda.synchronize()`) in `finally`, and 15s sleep between baseline/SSLO subprocesses to let CUDA driver release memory.
+- Modified: `exp/sslo_test/run_test.sh` lowered `GPU_MEMORY_UTILIZATION` 0.95 → 0.85 to give headroom across the back-to-back subprocess runs.
+- Verification: pytest 50 PASS. Full E2E run on Qwen3-8B / 256 prompts / max_num_seqs=64. **H1 PASS**: max(running+pending)=256, 2008 iterations above cap, max_pending=192. **H2 PASS**: post-cap-arrival cohort TTFT p50 18.35s → 2.45s (-86.66%), p90 27.04s → 4.49s.

@@ -1,0 +1,21 @@
+{
+  "max_num_seqs": 64,
+  "h1_pending_plus_running_exceeds_cap": true,
+  "h1_max_combined": 256,
+  "h1_iterations_above_cap": 2008,
+  "h2_ttft_p50_baseline": 18.35461628297344,
+  "h2_ttft_p50_sslo": 2.447748617036268,
+  "h2_ttft_p50_pct_change": -86.66412536606984,
+  "h2_ttft_p90_baseline": 27.042650059168228,
+  "h2_ttft_p90_sslo": 4.486635813373141,
+  "h2_ttft_cohort": "post_cap_arrivals",
+  "h2_ttft_count_baseline": 192,
+  "h2_ttft_count_sslo": 192,
+  "h2_ttft_p50_improved": true,
+  "run_complete": true,
+  "missing_files": [],
+  "run_status": {
+    "baseline": 0,
+    "sslo": 0
+  }
+}

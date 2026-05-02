@@ -982,8 +982,9 @@ class Scheduler(SchedulerInterface):
         combined.sort(key=_sslo_score_key)
         new_running = []
         new_pending = []
+        prev_pending_ids = {r.request_id for r in self.sslo_pending}
         for req in combined:
-            was_pending = req in self.sslo_pending
+            was_pending = req.request_id in prev_pending_ids
             consec = self.sslo_consecutive_pending.get(req.request_id, 0)
             if consec >= self.sslo_config.max_consecutive_pending:
                 eligible = False
@@ -1001,16 +1002,51 @@ class Scheduler(SchedulerInterface):
                     req.slo_state.on_pending_exit(now)
                 self.sslo_consecutive_pending[req.request_id] = 0
                 new_running.append(req)
-        self.running = new_running
-        self.sslo_pending = new_pending
 
         # SSLO (adaptive_batch_size): shadow as local; reduce if any overdue
         max_num_running_reqs = self.max_num_running_reqs
         if self.sslo_config.adaptive_batch_size and any(
             r.slo_state is not None and r.slo_state.sslo_score < 0
-            for r in self.running
+            for r in new_running
         ):
             max_num_running_reqs = max(1, max_num_running_reqs - 1)
+
+        # SSLO: enforce hard cap on len(self.running). vLLM's InputBatch is
+        # sized to max_num_seqs and asserts new_req_index < max_num_reqs, so
+        # the running list must NEVER exceed the cap. If max_consecutive_pending
+        # forces too many requests back, bump the highest-slack overflow to
+        # pending (cap takes priority over starvation prevention).
+        if len(new_running) > max_num_running_reqs:
+            new_running.sort(key=_sslo_score_key)
+            overflow = new_running[max_num_running_reqs:]
+            new_running = new_running[:max_num_running_reqs]
+            for req in overflow:
+                if req.slo_state is not None:
+                    req.slo_state.on_pending_enter(now)
+                self.sslo_consecutive_pending[req.request_id] = (
+                    self.sslo_consecutive_pending.get(req.request_id, 0) + 1
+                )
+                new_pending.append(req)
+
+        self.running = new_running
+        self.sslo_pending = new_pending
+
+        # SSLO
+        import os as _os
+        sslo_stats_log_path = _os.environ.get("SSLO_STATS_LOG_PATH")
+        if sslo_stats_log_path:
+            import json as _json
+
+            stats_row = {
+                "ts": now,
+                "running": len(self.running),
+                "pending": len(self.sslo_pending),
+                "combined": len(self.running) + len(self.sslo_pending),
+                "waiting": len(self.waiting) + len(self.skipped_waiting),
+            }
+            _os.makedirs(_os.path.dirname(sslo_stats_log_path), exist_ok=True)
+            with open(sslo_stats_log_path, "a") as f:
+                f.write(_json.dumps(stats_row) + "\n")
 
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1232,8 +1268,8 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                # SSLO: use local cap
-                if len(self.running) == max_num_running_reqs:
+                # SSLO: use local cap (strict; redistribution above clamps len(running) to cap)
+                if len(self.running) >= max_num_running_reqs:
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -1533,7 +1569,7 @@ class Scheduler(SchedulerInterface):
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
         assert token_budget >= 0
-        # SSLO: assert against local cap
+        # SSLO: assert against local cap (redistribution clamps to cap above)
         assert len(self.running) <= max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
