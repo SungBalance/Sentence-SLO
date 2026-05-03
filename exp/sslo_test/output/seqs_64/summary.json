@@ -1,0 +1,160 @@
+{
+  "max_num_seqs": 64,
+  "control_case": false,
+  "h2_ttft_p50_baseline": 18.44523024559021,
+  "h2_ttft_p90_baseline": 27.172103786468504,
+  "h2_ttft_cohort": "post_cap_arrivals",
+  "h2_ttft_count_baseline": 192,
+  "h3_slack_neg_ratio_baseline": 0.004309252217997465,
+  "h4_tpot_p50_baseline": 0.01711734729534682,
+  "queue_stall_p50_baseline": 11.815605842974037,
+  "queue_stall_p90_baseline": 27.070360362995416,
+  "ttft": {
+    "baseline_all": {
+      "count": 256,
+      "mean": 13.825293273665011,
+      "p50": 11.88766086101532,
+      "p90": 27.168113231658936,
+      "p99": 27.19982558488846
+    },
+    "baseline_h2": {
+      "count": 192,
+      "mean": 18.32918307557702,
+      "p50": 18.44523024559021,
+      "p90": 27.172103786468504,
+      "p99": 27.199904999732972
+    },
+    "sslo_all": {
+      "count": 256,
+      "mean": 4.064173416234553,
+      "p50": 3.442481517791748,
+      "p90": 9.279516458511353,
+      "p99": 10.894677650928497
+    },
+    "sslo_h2": {
+      "count": 192,
+      "mean": 5.315482817590237,
+      "p50": 4.750098347663879,
+      "p90": 9.644189786911012,
+      "p99": 10.904005801677704
+    },
+    "sslo_adaptive_all": {
+      "count": 256,
+      "mean": 3.5041877441108227,
+      "p50": 3.0205646753311157,
+      "p90": 7.215063214302063,
+      "p99": 7.720701122283936
+    },
+    "sslo_adaptive_h2": {
+      "count": 192,
+      "mean": 4.570877342174451,
+      "p50": 4.526058793067932,
+      "p90": 7.717717170715332,
+      "p99": 7.721073179244995
+    }
+  },
+  "tpot": {
+    "baseline": {
+      "count": 256,
+      "mean": 0.01728319256450325,
+      "p50": 0.01711734729534682,
+      "p90": 0.017830874122963553
+    },
+    "sslo": {
+      "count": 256,
+      "mean": 0.055877037418627,
+      "p50": 0.05811051061830744,
+      "p90": 0.06649138995490916
+    },
+    "sslo_adaptive": {
+      "count": 256,
+      "mean": 0.05833780144989681,
+      "p50": 0.060342405405106964,
+      "p90": 0.06853176028364741
+    }
+  },
+  "queue_stall": {
+    "baseline": {
+      "count": 256,
+      "p50": 11.815605842974037,
+      "p90": 27.070360362995416
+    },
+    "available": true,
+    "sslo": {
+      "count": 256,
+      "p50": 3.398475123103708,
+      "p90": 9.18365002446808
+    },
+    "sslo_adaptive": {
+      "count": 256,
+      "p50": 2.8773576200474054,
+      "p90": 7.122303145006299
+    }
+  },
+  "slack": {
+    "baseline": {
+      "count": 7890,
+      "neg_slack_ratio": 0.004309252217997465,
+      "p5": 2.1766341279726475,
+      "p50": 49.70193807350006,
+      "p95": 101.85858312644996
+    },
+    "sslo": {
+      "count": 7758,
+      "neg_slack_ratio": 0.0041247744263985565,
+      "p5": 2.0688440859550616,
+      "p50": 39.379213897977024,
+      "p95": 80.04468469284474
+    },
+    "sslo_adaptive": {
+      "count": 7733,
+      "neg_slack_ratio": 0.00387947756368809,
+      "p5": 1.9862624887842688,
+      "p50": 36.75885418918915,
+      "p95": 78.00291968993842
+    }
+  },
+  "run_complete": true,
+  "missing_files": [],
+  "run_status": {
+    "baseline": 0,
+    "sslo": 0,
+    "sslo_adaptive": 0
+  },
+  "h1_sslo_pending_plus_running_exceeds_cap": true,
+  "h1_sslo_note": null,
+  "h1_sslo_max_combined": 245,
+  "h1_sslo_iterations_above_cap": 1066,
+  "h1_sslo_max_pending": 181,
+  "h2_ttft_p50_sslo": 4.750098347663879,
+  "h2_ttft_p50_pct_change_sslo": -74.2475518905517,
+  "h2_ttft_p90_sslo": 9.644189786911012,
+  "h2_ttft_cohort_sslo": "post_cap_arrivals",
+  "h2_ttft_count_sslo": 192,
+  "h2_ttft_p50_not_worse_sslo": true,
+  "h3_slack_neg_ratio_sslo": 0.0041247744263985565,
+  "h3_slack_neg_ratio_not_worse_sslo": true,
+  "h4_tpot_p50_sslo": 0.05811051061830744,
+  "h4_tpot_p50_pct_change_sslo": 239.48315481163482,
+  "queue_stall_p50_sslo": 3.398475123103708,
+  "queue_stall_p90_sslo": 9.18365002446808,
+  "queue_stall_p50_pct_change_sslo": -71.23740273441368,
+  "h1_sslo_adaptive_pending_plus_running_exceeds_cap": true,
+  "h1_sslo_adaptive_note": null,
+  "h1_sslo_adaptive_max_combined": 256,
+  "h1_sslo_adaptive_iterations_above_cap": 2072,
+  "h1_sslo_adaptive_max_pending": 224,
+  "h2_ttft_p50_sslo_adaptive": 4.526058793067932,
+  "h2_ttft_p50_pct_change_sslo_adaptive": -75.46217242720513,
+  "h2_ttft_p90_sslo_adaptive": 7.717717170715332,
+  "h2_ttft_cohort_sslo_adaptive": "post_cap_arrivals",
+  "h2_ttft_count_sslo_adaptive": 192,
+  "h2_ttft_p50_not_worse_sslo_adaptive": true,
+  "h3_slack_neg_ratio_sslo_adaptive": 0.00387947756368809,
+  "h3_slack_neg_ratio_not_worse_sslo_adaptive": true,
+  "h4_tpot_p50_sslo_adaptive": 0.060342405405106964,
+  "h4_tpot_p50_pct_change_sslo_adaptive": 252.52194375649805,
+  "queue_stall_p50_sslo_adaptive": 2.8773576200474054,
+  "queue_stall_p90_sslo_adaptive": 7.122303145006299,
+  "queue_stall_p50_pct_change_sslo_adaptive": -75.64781985548053
+}

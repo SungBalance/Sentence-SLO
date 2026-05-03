@@ -250,3 +250,14 @@
   - Queue stall p50: 11.71s → 3.34s → 3.14s
   - TPOT p50: 17.4ms → 58.1ms → 61.0ms
   - Neg slack chunks: 35/7770 → 34/7678 → **31/7656** (sslo+adaptive best)
+
+## 2026-05-03 (3-run aggregate)
+
+- Added: `exp/sslo_test/run_repeat.sh` — runs `run_single.sh` N times into `${output_root}/run_{i}/` for noise estimation.
+- Added: `exp/sslo_test/analysis/aggregate_repeats.py` — reads N per-run summaries, prints mean ± stddev for TTFT/queue_stall/TPOT/neg_slack across baseline / sslo / sslo_adaptive.
+- 3-run aggregate on Qwen3-8B / max_num_seqs=64 / 256 koala prompts:
+  - TTFT p50: baseline 18.634±0.007 → sslo 4.709±0.002 → sslo+adaptive **4.580±0.003**
+  - Queue stall p50: 11.831±0.003 → 3.324±0.003 → **3.139±0.001**
+  - TPOT p50 (ms): 17.28±0.00 → 57.97±0.02 → 60.95±0.05
+  - Neg slack: [34,35,34] → [34,34,34] → **[31,31,31]** (sslo+adaptive 100% reproducible at 31)
+  - Standard deviations are 1-2 orders of magnitude below the inter-mode gaps → diffs not within error term.
