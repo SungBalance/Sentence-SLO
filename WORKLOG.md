@@ -214,3 +214,9 @@
 - Modified: Reverted `RequestSLOState.is_pending_eligible` to a property using stale `cumulative_slack`, and updated scheduler/test call sites to property access while preserving the scheduler realtime-slack early-return check.
 - Added: No new files.
 - Debugging/verification: In `sk-sslo`, confirmed no remaining `is_pending_eligible(now)` call sites in the requested files; `python3 -m pytest tests/sslo/ -v 2>&1 | tail -20` passed (`52 passed, 16 warnings`).
+
+## 2026-05-03
+
+- Modified: Refactored SSLO chunk-generation timing from private EMA fields into `ChunkGenerationEstimator`, wired scheduler redistribution through the estimator, and configured `exp/sslo_test/run_test.py` to use p99 with window 100.
+- Added: Added EMA and percentile chunk-generation estimators plus SSLO config fields/tests for estimator selection.
+- Debugging/verification: In `sk-sslo`, `python3 -m pytest tests/sslo/ -v 2>&1 | tail -40` passed (`63 passed, 16 warnings`) and `compileall` passed. The `max_num_seqs=64` sweep completed: H1 PASS, H2 PASS, H3 FAIL; TTFT p50 18.51s -> 1.85s, negative-slack chunks baseline 33/7890 vs SSLO 50/7654.

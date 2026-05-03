@@ -11,6 +11,7 @@ detectors: SentenceChunkDetector (default), ParagraphChunkDetector.
 """
 from __future__ import annotations
 
+import collections
 from dataclasses import asdict, dataclass
 from typing import Protocol, runtime_checkable
 
@@ -36,6 +37,119 @@ class WordRateEstimator:
     def __call__(self, text: str) -> float:
         word_count = len(text.split())
         return word_count * self.seconds_per_word
+
+
+@runtime_checkable
+class ChunkGenerationEstimator(Protocol):
+    def update(self, pure_gen_time: float, word_count: int) -> None:
+        ...
+
+    @property
+    def gen_time(self) -> float | None:
+        ...
+
+    @property
+    def per_token_time(self) -> float | None:
+        ...
+
+    @property
+    def chunk_word_count(self) -> float | None:
+        ...
+
+    @property
+    def n_samples(self) -> int:
+        """Number of valid samples observed so far."""
+        ...
+
+
+class EmaChunkGenerationEstimator:
+    def __init__(self, alpha: float = 0.2) -> None:
+        self._alpha = alpha
+        self._gen_time: float | None = None
+        self._per_token_time: float | None = None
+        self._chunk_word_count: float | None = None
+        self._n_samples: int = 0
+
+    def update(self, pure_gen_time: float, word_count: int) -> None:
+        if word_count <= 0 or pure_gen_time <= 0:
+            return
+        per_token = pure_gen_time / word_count
+        a = self._alpha
+        if self._gen_time is None:
+            self._gen_time = pure_gen_time
+            self._per_token_time = per_token
+            self._chunk_word_count = float(word_count)
+        else:
+            self._gen_time = a * pure_gen_time + (1 - a) * self._gen_time
+            self._per_token_time = a * per_token + (1 - a) * self._per_token_time
+            self._chunk_word_count = a * word_count + (1 - a) * self._chunk_word_count
+        self._n_samples += 1
+
+    @property
+    def gen_time(self) -> float | None:
+        return self._gen_time
+
+    @property
+    def per_token_time(self) -> float | None:
+        return self._per_token_time
+
+    @property
+    def chunk_word_count(self) -> float | None:
+        return self._chunk_word_count
+
+    @property
+    def n_samples(self) -> int:
+        return self._n_samples
+
+
+class PercentileChunkGenerationEstimator:
+    def __init__(self, percentile: float = 99.0, window_size: int = 100) -> None:
+        if not (0 < percentile <= 100):
+            raise ValueError(f"percentile must be in (0, 100], got {percentile}")
+        if window_size <= 0:
+            raise ValueError(f"window_size must be > 0, got {window_size}")
+        self._percentile = percentile
+        self._gen_times: collections.deque[float] = collections.deque(
+            maxlen=window_size)
+        self._per_token_times: collections.deque[float] = collections.deque(
+            maxlen=window_size)
+        self._word_counts: collections.deque[float] = collections.deque(
+            maxlen=window_size)
+        self._n_samples: int = 0
+
+    def update(self, pure_gen_time: float, word_count: int) -> None:
+        if word_count <= 0 or pure_gen_time <= 0:
+            return
+        self._gen_times.append(pure_gen_time)
+        self._per_token_times.append(pure_gen_time / word_count)
+        self._word_counts.append(float(word_count))
+        self._n_samples += 1
+
+    def _pct(self, samples: "collections.deque[float]") -> float | None:
+        if not samples:
+            return None
+        ordered = sorted(samples)
+        rank = self._percentile / 100.0 * (len(ordered) - 1)
+        lower = int(rank)
+        upper = min(lower + 1, len(ordered) - 1)
+        frac = rank - lower
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * frac
+
+    @property
+    def gen_time(self) -> float | None:
+        return self._pct(self._gen_times)
+
+    @property
+    def per_token_time(self) -> float | None:
+        return self._pct(self._per_token_times)
+
+    @property
+    def chunk_word_count(self) -> float | None:
+        return self._pct(self._word_counts)
+
+    @property
+    def n_samples(self) -> int:
+        return self._n_samples
 
 
 @runtime_checkable
@@ -142,12 +256,40 @@ class RequestSLOState:
     the granularity at which chunks are flushed.
     """
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in {
+            "_ema_pure_gen_time",
+            "_ema_per_token_time",
+            "_ema_chunk_word_count",
+        }:
+            estimator = self.__dict__.get("_chunk_gen_estimator")
+            if isinstance(estimator, EmaChunkGenerationEstimator):
+                if name == "_ema_pure_gen_time":
+                    estimator._gen_time = value  # type: ignore[assignment]
+                elif name == "_ema_per_token_time":
+                    estimator._per_token_time = value  # type: ignore[assignment]
+                else:
+                    estimator._chunk_word_count = value  # type: ignore[assignment]
+                if (estimator._chunk_word_count is None
+                        and estimator._gen_time is not None
+                        and estimator._per_token_time is not None
+                        and estimator._per_token_time > 0):
+                    estimator._chunk_word_count = (
+                        estimator._gen_time / estimator._per_token_time
+                    )
+            return
+        super().__setattr__(name, value)
+
     def __init__(
         self,
         estimator: ConsumeEstimator | None = None,
         detector: ChunkBoundaryDetector | None = None,
         ema_alpha: float = 0.2,
         pending_slack_eps_num_tokens: int = 3,
+        chunk_gen_estimator: ChunkGenerationEstimator | None = None,
+        pending_warmup_chunks: int = 5,
+        pending_enter_factor: float = 2.5,
+        pending_exit_factor: float = 2.0,
     ) -> None:
         self._estimator: ConsumeEstimator = (
             estimator if estimator is not None else WordRateEstimator()
@@ -162,10 +304,15 @@ class RequestSLOState:
         self.cumulative_slack: float = 0.0
         self._slack_dirty: bool = False
         self._chunk_records: list[SLOChunkRecord] = []
-        self._ema_alpha: float = ema_alpha
         self._pending_slack_eps_num_tokens: int = pending_slack_eps_num_tokens
-        self._ema_pure_gen_time: float | None = None
-        self._ema_per_token_time: float | None = None
+        self._pending_warmup_chunks: int = pending_warmup_chunks
+        self._pending_enter_factor: float = pending_enter_factor
+        self._pending_exit_factor: float = pending_exit_factor
+        self._chunk_gen_estimator = (
+            chunk_gen_estimator
+            if chunk_gen_estimator is not None
+            else EmaChunkGenerationEstimator(alpha=ema_alpha)
+        )
         self._last_chunk_end_ts: float | None = None
         self._pending_enter_ts: float | None = None
         self._chunk_pending_time: float = 0.0
@@ -185,6 +332,10 @@ class RequestSLOState:
         formulas don't require caller changes.
         """
         return self.cumulative_slack
+
+    @property
+    def chunk_gen_estimator(self) -> ChunkGenerationEstimator:
+        return self._chunk_gen_estimator
 
     def on_text_delta(self, text: str, now: float) -> None:
         if self._decoding_start is None:
@@ -215,23 +366,67 @@ class RequestSLOState:
             self._pending_enter_ts = None
             self._cur_consecutive_pending = 0
 
-    @property
-    def is_pending_eligible(self) -> bool:
-        """True if cumulative_slack (at last chunk flush) > EMA + eps × per_token.
+    def _realtime_slack(self, now: float) -> float | None:
+        """Slack to next chunk's deadline using current wall clock.
 
-        Uses cumulative_slack (stale) for entry deliberately: it's the slack against
-        the LAST chunk's deadline. Realtime slack against the NEXT chunk's deadline
-        would be (cumulative_slack + consume_i), which is MORE permissive — but the
-        early-return check in the scheduler will catch decay using realtime slack.
-        Hysteresis: hard to enter, easy to leave.
+        deadline_next = decoding_start + cumulative_consume (sum of consume
+        times of all flushed chunks). Returns None if decoding has not begun.
         """
-        if self._ema_pure_gen_time is None or self._ema_per_token_time is None:
+        if self._decoding_start is None:
+            return None
+        return self._decoding_start + self._cumulative_consume - now
+
+    def _predicted_finish_time(self) -> float | None:
+        """Estimated time to finish the in-progress chunk, in seconds."""
+        per_token = self._chunk_gen_estimator.per_token_time
+        word_count_est = self._chunk_gen_estimator.chunk_word_count
+        if per_token is None or word_count_est is None:
+            return None
+        remaining = max(0.0, word_count_est - self.current_chunk_word_count)
+        return remaining * per_token
+
+    def should_enter_pending(self, now: float) -> bool:
+        """True if a currently-running request should move to pending.
+
+        Conditions (all required):
+        - estimator has at least pending_warmup_chunks samples
+        - realtime_slack > pending_enter_factor × estimator.gen_time
+        """
+        estimator = self._chunk_gen_estimator
+        if estimator.n_samples < self._pending_warmup_chunks:
             return False
-        threshold = (
-            self._ema_pure_gen_time
-            + self._pending_slack_eps_num_tokens * self._ema_per_token_time
-        )
-        return self.cumulative_slack > threshold
+        gen_time = estimator.gen_time
+        if gen_time is None:
+            return False
+        slack = self._realtime_slack(now)
+        if slack is None:
+            return False
+        return slack > self._pending_enter_factor * gen_time
+
+    def should_exit_pending(self, now: float) -> bool:
+        """True if a currently-pending request should move back to running.
+
+        Conditions (any one):
+        - estimator no longer has data (shouldn't normally happen)
+        - realtime_slack ≤ pending_exit_factor × estimator.gen_time
+        - realtime_slack + 1 token margin ≤ predicted time to finish current chunk
+        """
+        estimator = self._chunk_gen_estimator
+        gen_time = estimator.gen_time
+        per_token = estimator.per_token_time
+        if gen_time is None or per_token is None:
+            return True
+        slack = self._realtime_slack(now)
+        if slack is None:
+            return True
+        # Hysteresis: low-bar exit
+        if slack <= self._pending_exit_factor * gen_time:
+            return True
+        # Predicted-finish guard: current chunk's remaining time exceeds slack
+        finish = self._predicted_finish_time()
+        if finish is not None and slack + per_token <= finish:
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -253,8 +448,8 @@ class RequestSLOState:
             total_pending_time_s=sum(r.pending_time for r in self._chunk_records),
             num_pending_intervals=self._num_pending_intervals,
             max_consecutive_pending=self._max_consecutive_pending,
-            final_ema_gen_time_s=self._ema_pure_gen_time,
-            final_ema_per_word_time_s=self._ema_per_token_time,
+            final_ema_gen_time_s=self._chunk_gen_estimator.gen_time,
+            final_ema_per_word_time_s=self._chunk_gen_estimator.per_token_time,
         )
 
     def _flush_chunk(self, now: float, boundary_pos: int) -> None:
@@ -274,8 +469,7 @@ class RequestSLOState:
         )
         assert chunk_start is not None
         pure_gen_time = max(0.0, (now - chunk_start) - self._chunk_pending_time)
-        if word_count > 0 and pure_gen_time > 0:
-            self._update_ema(pure_gen_time, word_count)
+        self._chunk_gen_estimator.update(pure_gen_time, word_count)
         self._chunk_records.append(SLOChunkRecord(
             chunk_idx=self._chunk_count,
             text=chunk_text,
@@ -294,19 +488,10 @@ class RequestSLOState:
         self._last_chunk_end_ts = now
         self._chunk_pending_time = 0.0
 
-    def _update_ema(self, pure_gen_time: float, word_count: int) -> None:
-        per_token_time = pure_gen_time / word_count
-        alpha = self._ema_alpha
-        if self._ema_pure_gen_time is None:
-            self._ema_pure_gen_time = pure_gen_time
-            self._ema_per_token_time = per_token_time
-        else:
-            self._ema_pure_gen_time = (
-                alpha * pure_gen_time + (1 - alpha) * self._ema_pure_gen_time
-            )
-            self._ema_per_token_time = (
-                alpha * per_token_time + (1 - alpha) * self._ema_per_token_time
-            )
+    @property
+    def current_chunk_word_count(self) -> int:
+        """Words generated for the in-progress (un-flushed) chunk."""
+        return len(self._pending_text.split())
 
     @property
     def chunk_records(self) -> list[dict]:

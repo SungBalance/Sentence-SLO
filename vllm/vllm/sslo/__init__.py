@@ -2,10 +2,20 @@
 """SSLO (Sentence-level SLO) package for vLLM."""
 
 from vllm.sslo.config import SsloConfig, build_slo_state
-from vllm.sslo.slo_state import ConsumeEstimator, RequestSLOState, WordRateEstimator
+from vllm.sslo.slo_state import (
+    ChunkGenerationEstimator,
+    ConsumeEstimator,
+    EmaChunkGenerationEstimator,
+    PercentileChunkGenerationEstimator,
+    RequestSLOState,
+    WordRateEstimator,
+)
 
 __all__ = [
+    "ChunkGenerationEstimator",
     "ConsumeEstimator",
+    "EmaChunkGenerationEstimator",
+    "PercentileChunkGenerationEstimator",
     "RequestSLOState",
     "SsloConfig",
     "WordRateEstimator",

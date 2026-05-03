@@ -17,14 +17,16 @@ def make_mock_request(request_id="req", slo_state=None):
     return SimpleNamespace(request_id=request_id, slo_state=slo_state)
 
 
-def make_pending_eligible_state(score=10.0):
+def make_pending_eligible_state(score=10.0, n_samples=5):
     state = RequestSLOState()
     state.cumulative_slack = score
     state._decoding_start = time.monotonic()
     state._cumulative_consume = 10.0
-    state._ema_pure_gen_time = 1.0
-    state._ema_per_token_time = 1.0
     state._pending_slack_eps_num_tokens = 1
+    # Populate the chunk_gen_estimator with samples so warmup guard passes
+    # and EMA settles at gen_time=1.0, per_token_time=1.0, word_count=1.0.
+    for _ in range(n_samples):
+        state.chunk_gen_estimator.update(pure_gen_time=1.0, word_count=1)
     return state
 
 

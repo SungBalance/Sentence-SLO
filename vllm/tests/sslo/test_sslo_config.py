@@ -3,7 +3,11 @@
 import pytest
 
 from vllm.sslo.config import SsloConfig, build_slo_state
-from vllm.sslo.slo_state import RequestSLOState
+from vllm.sslo.slo_state import (
+    EmaChunkGenerationEstimator,
+    PercentileChunkGenerationEstimator,
+    RequestSLOState,
+)
 
 
 class TestSsloConfig:
@@ -18,6 +22,8 @@ class TestSsloConfig:
         assert cfg.max_consecutive_pending == 5
         assert cfg.ema_alpha == 0.2
         assert cfg.pending_slack_eps_num_tokens == 5
+        assert cfg.chunk_gen_estimator == "ema"
+        assert cfg.chunk_gen_p99_window == 100
 
     def test_invalid_chunk_unit_raises(self):
         with pytest.raises(ValueError, match="chunk_unit"):
@@ -26,6 +32,10 @@ class TestSsloConfig:
     def test_invalid_estimator_type_raises(self):
         with pytest.raises(ValueError, match="estimator_type"):
             SsloConfig(estimator_type="tts")
+
+    def test_invalid_chunk_gen_estimator_raises(self):
+        with pytest.raises(ValueError, match="chunk_gen_estimator"):
+            SsloConfig(chunk_gen_estimator="mean")
 
 
 class TestBuildSloState:
@@ -44,7 +54,15 @@ class TestBuildSloState:
 
     def test_ema_alpha_propagated(self):
         state = build_slo_state(SsloConfig(ema_alpha=0.5))
-        assert state._ema_alpha == 0.5
+        assert isinstance(state.chunk_gen_estimator, EmaChunkGenerationEstimator)
+        assert state.chunk_gen_estimator._alpha == 0.5
+
+    def test_p99_estimator_propagated(self):
+        state = build_slo_state(SsloConfig(chunk_gen_estimator="p99"))
+        assert isinstance(
+            state.chunk_gen_estimator,
+            PercentileChunkGenerationEstimator,
+        )
 
     def test_eps_num_tokens_propagated(self):
         state = build_slo_state(SsloConfig(pending_slack_eps_num_tokens=10))

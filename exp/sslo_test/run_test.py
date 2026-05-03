@@ -163,6 +163,8 @@ async def run_one(args: argparse.Namespace) -> None:
             "enabled": True,
             "chunk_unit": args.chunk_unit,
             "seconds_per_word": args.seconds_per_word,
+            "chunk_gen_estimator": "p99",
+            "chunk_gen_p99_window": 100,
         }
     else:
         sslo_params = {"enabled": False}

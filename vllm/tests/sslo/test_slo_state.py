@@ -4,8 +4,11 @@
 import pytest
 
 from vllm.sslo.slo_state import (
+    ChunkGenerationEstimator,
     ConsumeEstimator,
+    EmaChunkGenerationEstimator,
     ParagraphChunkDetector,
+    PercentileChunkGenerationEstimator,
     RequestSLOState,
     SentenceChunkDetector,
     WordRateEstimator,
@@ -43,6 +46,79 @@ class TestWordRateEstimator:
     def test_implements_protocol(self):
         est = WordRateEstimator()
         assert isinstance(est, ConsumeEstimator)
+
+
+class TestChunkGenerationEstimators:
+    def test_ema_none_before_any_data(self):
+        est = EmaChunkGenerationEstimator()
+        assert est.gen_time is None
+        assert est.per_token_time is None
+        assert est.chunk_word_count is None
+        assert isinstance(est, ChunkGenerationEstimator)
+
+    def test_ema_first_sample_init(self):
+        est = EmaChunkGenerationEstimator(alpha=0.5)
+        est.update(2.0, 4)
+        assert est.gen_time == pytest.approx(2.0)
+        assert est.per_token_time == pytest.approx(0.5)
+        assert est.chunk_word_count == pytest.approx(4.0)
+
+    def test_ema_basic_update(self):
+        est = EmaChunkGenerationEstimator(alpha=0.5)
+        est.update(2.0, 4)
+        est.update(4.0, 4)
+        assert est.gen_time == pytest.approx(3.0)
+        assert est.per_token_time == pytest.approx(0.75)
+        assert est.chunk_word_count == pytest.approx(4.0)
+
+    def test_ema_invalid_inputs_ignored(self):
+        est = EmaChunkGenerationEstimator()
+        est.update(0.0, 4)
+        est.update(2.0, 0)
+        assert est.gen_time is None
+        assert est.per_token_time is None
+        assert est.chunk_word_count is None
+
+    def test_percentile_none_before_any_data(self):
+        est = PercentileChunkGenerationEstimator()
+        assert est.gen_time is None
+        assert est.per_token_time is None
+        assert est.chunk_word_count is None
+        assert isinstance(est, ChunkGenerationEstimator)
+
+    def test_percentile_first_sample_init(self):
+        est = PercentileChunkGenerationEstimator(percentile=99.0)
+        est.update(2.0, 4)
+        assert est.gen_time == pytest.approx(2.0)
+        assert est.per_token_time == pytest.approx(0.5)
+        assert est.chunk_word_count == pytest.approx(4.0)
+
+    def test_percentile_basic_update(self):
+        est = PercentileChunkGenerationEstimator(percentile=50.0)
+        est.update(2.0, 4)
+        est.update(4.0, 4)
+        est.update(6.0, 2)
+        assert est.gen_time == pytest.approx(4.0)
+        assert est.per_token_time == pytest.approx(1.0)
+        assert est.chunk_word_count == pytest.approx(4.0)
+
+    def test_percentile_window_eviction(self):
+        est = PercentileChunkGenerationEstimator(percentile=99.0, window_size=3)
+        est.update(1.0, 1)
+        est.update(2.0, 2)
+        est.update(100.0, 100)
+        est.update(3.0, 3)
+        assert est.gen_time == pytest.approx(98.06)
+        assert est.per_token_time == pytest.approx(1.0)
+        assert est.chunk_word_count == pytest.approx(98.06)
+
+    def test_percentile_invalid_inputs_ignored(self):
+        est = PercentileChunkGenerationEstimator()
+        est.update(0.0, 4)
+        est.update(2.0, 0)
+        assert est.gen_time is None
+        assert est.per_token_time is None
+        assert est.chunk_word_count is None
 
 
 # ---------------------------------------------------------------------------
@@ -228,8 +304,8 @@ class TestRequestSLOState:
 class TestEmaTracking:
     def test_ema_initially_none(self):
         state = RequestSLOState()
-        assert state._ema_pure_gen_time is None
-        assert state._ema_per_token_time is None
+        assert state.chunk_gen_estimator.gen_time is None
+        assert state.chunk_gen_estimator.per_token_time is None
 
     def test_ema_updates_after_chunk(self):
         import time
@@ -238,8 +314,8 @@ class TestEmaTracking:
         state.on_text_delta("hello world", t0)
         state.on_text_delta(". ", t0 + 1.0)
         # First chunk: pure gen = 1.0, words = 2, per_token ~ 0.5
-        assert state._ema_pure_gen_time == pytest.approx(1.0)
-        assert state._ema_per_token_time == pytest.approx(0.5)
+        assert state.chunk_gen_estimator.gen_time == pytest.approx(1.0)
+        assert state.chunk_gen_estimator.per_token_time == pytest.approx(0.5)
 
 
 class TestPendingCallbacks:
@@ -269,31 +345,77 @@ class TestPendingCallbacks:
         assert state._chunk_pending_time == 0.0
 
 
-class TestIsPendingEligible:
-    def test_false_when_no_ema_yet(self):
+class TestShouldEnterPending:
+    def test_false_when_no_estimator_data(self):
+        state = RequestSLOState(pending_warmup_chunks=0)
+        # decoding hasn't started → realtime_slack is None
+        assert state.should_enter_pending(now=0.0) is False
+
+    def test_false_when_warmup_not_satisfied(self):
+        state = RequestSLOState(pending_warmup_chunks=5)
+        for _ in range(2):
+            state.chunk_gen_estimator.update(pure_gen_time=0.1, word_count=2)
+        state._decoding_start = 100.0
+        state._cumulative_consume = 5.0
+        assert state.should_enter_pending(now=100.5) is False
+
+    def test_true_when_realtime_slack_above_enter_factor(self):
+        state = RequestSLOState(
+            pending_warmup_chunks=2, pending_enter_factor=2.5
+        )
+        for _ in range(3):
+            state.chunk_gen_estimator.update(pure_gen_time=1.0, word_count=2)
+        state._decoding_start = 100.0
+        state._cumulative_consume = 10.0
+        # realtime_slack = 5.0, gen_time=1.0, threshold=2.5 → enter
+        assert state.should_enter_pending(now=105.0) is True
+
+    def test_false_when_realtime_slack_below_enter_factor(self):
+        state = RequestSLOState(
+            pending_warmup_chunks=2, pending_enter_factor=2.5
+        )
+        for _ in range(3):
+            state.chunk_gen_estimator.update(pure_gen_time=1.0, word_count=2)
+        state._decoding_start = 100.0
+        state._cumulative_consume = 10.0
+        # realtime_slack = 1.0; threshold = 2.5
+        assert state.should_enter_pending(now=109.0) is False
+
+
+class TestShouldExitPending:
+    def test_true_when_no_estimator_data(self):
         state = RequestSLOState()
-        state.cumulative_slack = 100.0
-        assert state.is_pending_eligible is False
+        assert state.should_exit_pending(now=0.0) is True
 
-    def test_true_when_cumulative_slack_exceeds_threshold(self):
-        import time
-        state = RequestSLOState(ema_alpha=1.0, pending_slack_eps_num_tokens=3)
-        t0 = time.monotonic()
-        state.on_text_delta("hello world", t0)
-        state.on_text_delta(". ", t0 + 1.0)
-        # ema_pure_gen_time = 1.0, ema_per_token_time = 0.5
-        # threshold = 1.0 + 3 * 0.5 = 2.5
-        state.cumulative_slack = 3.0
-        assert state.is_pending_eligible is True
+    def test_true_when_realtime_slack_below_exit_factor(self):
+        state = RequestSLOState(pending_exit_factor=2.0)
+        for _ in range(3):
+            state.chunk_gen_estimator.update(pure_gen_time=1.0, word_count=2)
+        state._decoding_start = 100.0
+        state._cumulative_consume = 10.0
+        # realtime_slack = 1.5; threshold = 2.0 → exit
+        assert state.should_exit_pending(now=108.5) is True
 
-    def test_false_when_cumulative_slack_below_threshold(self):
-        import time
-        state = RequestSLOState(ema_alpha=1.0, pending_slack_eps_num_tokens=3)
-        t0 = time.monotonic()
-        state.on_text_delta("hello world", t0)
-        state.on_text_delta(". ", t0 + 1.0)
-        state.cumulative_slack = 2.0
-        assert state.is_pending_eligible is False
+    def test_false_when_realtime_slack_above_exit_factor(self):
+        state = RequestSLOState(pending_exit_factor=2.0)
+        for _ in range(3):
+            state.chunk_gen_estimator.update(pure_gen_time=1.0, word_count=2)
+        state._decoding_start = 100.0
+        state._cumulative_consume = 10.0
+        # realtime_slack = 5.0 > 2.0 → stay pending; predicted_finish = 0
+        assert state.should_exit_pending(now=105.0) is False
+
+    def test_predicted_finish_guard_forces_exit(self):
+        # gen_time=1.0, per_token=0.1, word_count=10. Set exit factor very low
+        # so the predicted-finish guard is the deciding rule.
+        state = RequestSLOState(pending_exit_factor=0.1)
+        for _ in range(5):
+            state.chunk_gen_estimator.update(pure_gen_time=1.0, word_count=10)
+        state._decoding_start = 100.0
+        state._cumulative_consume = 10.0
+        # realtime_slack = 0.5; predicted_finish = 10 * 0.1 = 1.0
+        # 0.5 + 0.1 <= 1.0 → exit
+        assert state.should_exit_pending(now=109.5) is True
 
 
 # ---------------------------------------------------------------------------
