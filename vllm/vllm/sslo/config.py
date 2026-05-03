@@ -19,7 +19,6 @@ class SsloConfig:
     adaptive_batch_size: bool = False
     max_consecutive_pending: int = 5
     ema_alpha: float = 0.2
-    pending_slack_eps_num_tokens: int = 5
     chunk_gen_estimator: str = "ema"
     chunk_gen_p99_window: int = 100
     pending_warmup_chunks: int = 5
@@ -65,7 +64,6 @@ def build_slo_state(config: SsloConfig) -> "RequestSLOState":
         estimator=estimator,
         detector=detector,
         ema_alpha=config.ema_alpha,
-        pending_slack_eps_num_tokens=config.pending_slack_eps_num_tokens,
         chunk_gen_estimator=cge,
         pending_warmup_chunks=config.pending_warmup_chunks,
     )

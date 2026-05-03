@@ -256,36 +256,11 @@ class RequestSLOState:
     the granularity at which chunks are flushed.
     """
 
-    def __setattr__(self, name: str, value: object) -> None:
-        if name in {
-            "_ema_pure_gen_time",
-            "_ema_per_token_time",
-            "_ema_chunk_word_count",
-        }:
-            estimator = self.__dict__.get("_chunk_gen_estimator")
-            if isinstance(estimator, EmaChunkGenerationEstimator):
-                if name == "_ema_pure_gen_time":
-                    estimator._gen_time = value  # type: ignore[assignment]
-                elif name == "_ema_per_token_time":
-                    estimator._per_token_time = value  # type: ignore[assignment]
-                else:
-                    estimator._chunk_word_count = value  # type: ignore[assignment]
-                if (estimator._chunk_word_count is None
-                        and estimator._gen_time is not None
-                        and estimator._per_token_time is not None
-                        and estimator._per_token_time > 0):
-                    estimator._chunk_word_count = (
-                        estimator._gen_time / estimator._per_token_time
-                    )
-            return
-        super().__setattr__(name, value)
-
     def __init__(
         self,
         estimator: ConsumeEstimator | None = None,
         detector: ChunkBoundaryDetector | None = None,
         ema_alpha: float = 0.2,
-        pending_slack_eps_num_tokens: int = 3,
         chunk_gen_estimator: ChunkGenerationEstimator | None = None,
         pending_warmup_chunks: int = 5,
         pending_enter_factor: float = 2.5,
@@ -304,7 +279,6 @@ class RequestSLOState:
         self.cumulative_slack: float = 0.0
         self._slack_dirty: bool = False
         self._chunk_records: list[SLOChunkRecord] = []
-        self._pending_slack_eps_num_tokens: int = pending_slack_eps_num_tokens
         self._pending_warmup_chunks: int = pending_warmup_chunks
         self._pending_enter_factor: float = pending_enter_factor
         self._pending_exit_factor: float = pending_exit_factor

@@ -21,7 +21,6 @@ class TestSsloConfig:
         assert cfg.adaptive_batch_size is False
         assert cfg.max_consecutive_pending == 5
         assert cfg.ema_alpha == 0.2
-        assert cfg.pending_slack_eps_num_tokens == 5
         assert cfg.chunk_gen_estimator == "ema"
         assert cfg.chunk_gen_p99_window == 100
 
@@ -64,6 +63,3 @@ class TestBuildSloState:
             PercentileChunkGenerationEstimator,
         )
 
-    def test_eps_num_tokens_propagated(self):
-        state = build_slo_state(SsloConfig(pending_slack_eps_num_tokens=10))
-        assert state._pending_slack_eps_num_tokens == 10
