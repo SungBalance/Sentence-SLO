@@ -17,6 +17,9 @@ from lm_datasets import load_prompts
 
 
 DEFAULT_OUTPUT_DIR = "exp/sslo_test/output"
+GPU_READY_FREE_MEMORY_MIB = 92160
+GPU_READY_TIMEOUT_S = 60.0
+GPU_READY_BASE_SLEEP_S = 5.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +60,45 @@ def output_token_count(request_output: Any) -> int:
     return sum(len(output.token_ids or []) for output in request_output.outputs or [])
 
 
+def record_value(record: Any, key: str) -> Any:
+    if isinstance(record, dict):
+        return record.get(key)
+    return getattr(record, key, None)
+
+
+def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
+    records = getattr(request_output, "slo_chunk_records", None)
+    if not records:
+        return []
+    normalized = []
+    for record in records:
+        normalized.append({
+            "chunk_idx": record_value(record, "chunk_idx"),
+            "cumulative_slack": record_value(record, "cumulative_slack"),
+            "gen_time": record_value(record, "gen_time"),
+            "pending_time": record_value(record, "pending_time"),
+            "word_count": record_value(record, "word_count"),
+        })
+    return normalized
+
+
+def request_chunk_rows(
+    request_id: str,
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "request_id": request_id,
+            "chunk_idx": record.get("chunk_idx"),
+            "cumulative_slack": record.get("cumulative_slack"),
+            "gen_time": record.get("gen_time"),
+            "pending_time": record.get("pending_time"),
+            "word_count": record.get("word_count"),
+        }
+        for record in records
+    ]
+
+
 async def collect_request(
     engine: Any,
     request_idx: int,
@@ -75,6 +117,21 @@ async def collect_request(
 
     t_finish = time.monotonic()
     num_tokens = output_token_count(last_output) if last_output is not None else 0
+    metrics = getattr(last_output, 'metrics', None) if last_output is not None else None
+    queue_stall = None
+    first_token_ts = None
+    if metrics is not None:
+        queued = getattr(metrics, 'queued_ts', None)
+        scheduled = getattr(metrics, 'scheduled_ts', None)
+        first_token_ts = getattr(metrics, 'first_token_ts', None)
+        if queued and scheduled and scheduled >= queued:
+            queue_stall = scheduled - queued
+    slo_chunk_records = (
+        extract_chunk_records(last_output) if last_output is not None else []
+    )
+    tpot = None
+    if t_first_token is not None:
+        tpot = (t_finish - t_first_token) / max(1, num_tokens - 1)
     return {
         "request_id": request_id,
         "request_idx": request_idx,
@@ -83,6 +140,11 @@ async def collect_request(
         "ttft": (t_first_token - t_submit) if t_first_token is not None else None,
         "t_finish": t_finish,
         "num_tokens": num_tokens,
+        "num_output_tokens": num_tokens,
+        "tpot": tpot,
+        "queue_stall": queue_stall,
+        "decoding_start_ts": first_token_ts,
+        "slo_chunk_records": slo_chunk_records,
     }
 
 
@@ -129,9 +191,21 @@ async def run_one(args: argparse.Namespace) -> None:
         rows = await asyncio.gather(*tasks)
         elapsed = time.monotonic() - t0
         write_jsonl(output_dir / f"{args.run_kind}_ttft.jsonl", rows)
+        chunk_rows = [
+            chunk_row
+            for row in rows
+            for chunk_row in request_chunk_rows(
+                str(row["request_id"]), row.get("slo_chunk_records") or []
+            )
+        ]
+        write_jsonl(output_dir / f"{args.run_kind}_chunks.jsonl", chunk_rows)
         print(
             f"{args.run_kind}: completed {len(rows)} requests in {elapsed:.1f}s; "
             f"wrote {output_dir / f'{args.run_kind}_ttft.jsonl'}"
+        )
+        print(
+            f"{args.run_kind}: wrote {len(chunk_rows)} chunks to "
+            f"{output_dir / f'{args.run_kind}_chunks.jsonl'}"
         )
     finally:
         engine.shutdown()
@@ -145,6 +219,7 @@ async def run_one(args: argparse.Namespace) -> None:
                 torch.cuda.synchronize()
         except Exception:
             pass
+        time.sleep(2)
 
 
 def child_command(args: argparse.Namespace, run_kind: str) -> list[str]:
@@ -181,6 +256,7 @@ def child_command(args: argparse.Namespace, run_kind: str) -> list[str]:
 def run_child(args: argparse.Namespace, run_kind: str) -> int:
     output_dir = Path(args.output_dir)
     env = os.environ.copy()
+    env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     env.pop("SSLO_STATS_LOG_PATH", None)
     if run_kind == "sslo":
         env["SSLO_STATS_LOG_PATH"] = str(output_dir / "sslo_stats.jsonl")
@@ -188,12 +264,56 @@ def run_child(args: argparse.Namespace, run_kind: str) -> int:
     return subprocess.run(child_command(args, run_kind), check=False, env=env).returncode
 
 
+def wait_for_gpu_memory_ready() -> None:
+    print(
+        "Waiting for GPU cleanup: "
+        f"sleep {GPU_READY_BASE_SLEEP_S:.0f}s, then require "
+        f">{GPU_READY_FREE_MEMORY_MIB} MiB free on GPU 0..."
+    )
+    time.sleep(GPU_READY_BASE_SLEEP_S)
+    deadline = time.monotonic() + GPU_READY_TIMEOUT_S
+    last_error: str | None = None
+    last_free_mib: int | None = None
+    while time.monotonic() < deadline:
+        try:
+            output = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.free",
+                    "--format=csv,noheader,nounits",
+                    "-i",
+                    "0",
+                ],
+                text=True,
+                stderr=subprocess.STDOUT,
+            ).strip()
+            last_free_mib = int(output.splitlines()[0].strip())
+            if last_free_mib > GPU_READY_FREE_MEMORY_MIB:
+                print(f"GPU cleanup ready: free_memory={last_free_mib} MiB")
+                return
+            print(
+                "GPU cleanup pending: "
+                f"free_memory={last_free_mib} MiB "
+                f"(need >{GPU_READY_FREE_MEMORY_MIB} MiB)"
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            print(f"GPU cleanup poll failed: {last_error}")
+        time.sleep(2)
+    print(
+        "WARNING: GPU cleanup wait timed out; proceeding anyway. "
+        f"last_free_memory={last_free_mib} last_error={last_error}"
+    )
+
+
 def run_both(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     for filename in (
         "baseline_ttft.jsonl",
+        "baseline_chunks.jsonl",
         "sslo_ttft.jsonl",
+        "sslo_chunks.jsonl",
         "sslo_stats.jsonl",
         "summary.json",
         "run_status.json",
@@ -203,12 +323,10 @@ def run_both(args: argparse.Namespace) -> None:
             path.unlink()
 
     statuses = {"baseline": run_child(args, "baseline")}
+    wait_for_gpu_memory_ready()
     if statuses["baseline"] == 0:
-        # Wait for GPU memory to be fully released by the baseline subprocess
-        # before starting the SSLO subprocess (CUDA driver cleanup can lag).
-        print("Waiting 15s for GPU cleanup between subprocesses...")
-        time.sleep(15)
         statuses["sslo"] = run_child(args, "sslo")
+        wait_for_gpu_memory_ready()
     else:
         statuses["sslo"] = None
     (output_dir / "run_status.json").write_text(json.dumps(statuses, indent=2) + "\n")

@@ -1,5 +1,12 @@
 # Work Log
 
+## 2026-05-02 (session 2)
+
+- Modified: `vllm/vllm/sslo/slo_state.py` — added `SsloRequestStats` dataclass (8 fields), added `_num_pending_intervals`, `_cur_consecutive_pending`, `_max_consecutive_pending` tracking to `RequestSLOState.__init__`, updated `on_pending_enter/exit` to count intervals and track consecutive, added `compute_stats()` method.
+- Modified: `vllm/vllm/outputs.py` — added `sslo_metrics: "SsloRequestStats | None" = None` kwarg and `self.sslo_metrics` assignment to `RequestOutput`.
+- Modified: `vllm/vllm/v1/engine/output_processor.py` — wired `sslo_metrics=self.slo_state.compute_stats() if finished else None` in `_new_request_output`.
+- Verification: All three files passed `python3 -m compileall` in `sk-sslo-vllm`.
+
 ## 2026-05-02
 
 - Modified: Added env-var-gated SSLO scheduler iteration stats logging in `vllm/vllm/v1/core/sched/scheduler.py` after pending/running redistribution.
@@ -185,3 +192,25 @@
 - Modified: `exp/sslo_test/run_test.py` adds GPU cleanup (`del engine`, `gc.collect()`, `torch.cuda.empty_cache()`, `torch.cuda.synchronize()`) in `finally`, and 15s sleep between baseline/SSLO subprocesses to let CUDA driver release memory.
 - Modified: `exp/sslo_test/run_test.sh` lowered `GPU_MEMORY_UTILIZATION` 0.95 → 0.85 to give headroom across the back-to-back subprocess runs.
 - Verification: pytest 50 PASS. Full E2E run on Qwen3-8B / 256 prompts / max_num_seqs=64. **H1 PASS**: max(running+pending)=256, 2008 iterations above cap, max_pending=192. **H2 PASS**: post-cap-arrival cohort TTFT p50 18.35s → 2.45s (-86.66%), p90 27.04s → 4.49s.
+- Modified: Added queue stall extraction from `RequestOutput.metrics` in `exp/sslo_test/run_test.py`, added queue stall p50/p90 summary columns and absent-metrics warning in `exp/sslo_test/analyze.py`, added SSLO scheduler early-return when slack is at or below EMA generation time, and changed `pending_slack_eps_num_tokens` default/docs/tests from 3 to 5.
+- Added: Added `TestPendingEarlyReturn` coverage for slack below/above EMA eligibility decisions.
+- Debugging/verification: `RequestOutput` class-level probe in `sk-sslo` did not expose dataclass fields or `metrics`; pytest `tests/sslo/` passed (`52 passed, 16 warnings`). Full sweep completed and wrote `exp/sslo_test/output/sweep_summary.json`; queue stall metrics were unavailable (`n/a` columns). H3 still failed for seqs 32, 64, and 128 with residual neg-slack-ratio diffs of +0.0014874, +0.0004916, and +0.0001316 respectively.
+
+## 2026-05-02 (continued)
+
+- Modified: Updated `exp/sslo_test/run_test.py` queue stall extraction to use `metrics.arrival_time` and guarded `metrics.scheduled_ts > 0`; updated `schedule_sslo()` early return to use real-time slack against `now`; replaced stale cumulative-slack early-return tests with `TestRealtimeSlackEarlyReturn`.
+- Added: No new files.
+- Debugging/verification: Confirmed `arrival_time` and `scheduled_ts` in `vllm/v1/metrics/stats.py`; `python3 -m pytest tests/sslo/ -v` passed (`52 passed, 16 warnings`); scheduler `compileall` passed. Benchmark sweep for `max_num_seqs=64` completed. H3 verdict: FAIL, SSLO neg_slack_ratio 0.004479713298348906 vs baseline 0.004182509505703422. Queue stall available with baseline p50/p90 -1776583702.4933395/-1776583687.3193479 and SSLO p50/p90 -1776583712.4382787/-1776583709.8867314. TPOT p50 changed 0.017062328668145388 -> 0.06119234455086896 (+258.6400528382292%). TTFT H2 p50 changed 18.376535241375677 -> 2.458701277966611 (-86.62043064336348%).
+
+## 2026-05-02 (continued)
+
+- Modified: Updated `exp/sslo_test/run_test.py` queue stall extraction to use monotonic `metrics.queued_ts` and `metrics.scheduled_ts`, and added `decoding_start_ts` from `metrics.first_token_ts` to TTFT rows.
+- Modified: Changed `RequestSLOState.is_pending_eligible` from a property to `is_pending_eligible(now)` using realtime slack, updated `schedule_sslo()` to call it with `now`, and updated SSLO tests for the method contract.
+- Added: No new files.
+- Debugging/verification: Per-file `py_compile` passed in `sk-sslo`; `python3 -m pytest tests/sslo/ -v` passed (`52 passed, 16 warnings`). The requested `max_num_seqs=64` sweep completed with H3 FAIL: baseline neg_slack_ratio 0.004182509505703422 vs SSLO 0.006238064926798218. Queue stall is now sane positive seconds: baseline p50/p90 11.704976434004493/26.834332884056494, SSLO p50/p90 1.3076576631283388/2.806667191442102. TPOT p50 changed 0.017063264845307267 -> 0.062441564169156485 (+265.9414815115476%). H2 TTFT p50 changed 18.352578241028823 -> 1.7862871129764244 (-90.26683286938388%).
+
+## 2026-05-02 (continued)
+
+- Modified: Reverted `RequestSLOState.is_pending_eligible` to a property using stale `cumulative_slack`, and updated scheduler/test call sites to property access while preserving the scheduler realtime-slack early-return check.
+- Added: No new files.
+- Debugging/verification: In `sk-sslo`, confirmed no remaining `is_pending_eligible(now)` call sites in the requested files; `python3 -m pytest tests/sslo/ -v 2>&1 | tail -20` passed (`52 passed, 16 warnings`).

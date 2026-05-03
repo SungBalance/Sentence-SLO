@@ -2,6 +2,7 @@
 """Tests for SSLO scheduler helpers and pending redistribution."""
 
 from types import SimpleNamespace
+import time
 
 import pytest
 
@@ -19,6 +20,8 @@ def make_mock_request(request_id="req", slo_state=None):
 def make_pending_eligible_state(score=10.0):
     state = RequestSLOState()
     state.cumulative_slack = score
+    state._decoding_start = time.monotonic()
+    state._cumulative_consume = 10.0
     state._ema_pure_gen_time = 1.0
     state._ema_per_token_time = 1.0
     state._pending_slack_eps_num_tokens = 1
@@ -137,6 +140,51 @@ class TestPendingRedistribution:
         assert scheduler.sslo_pending == []
         assert scheduler.sslo_consecutive_pending[request.request_id] == 0
         assert request.slo_state._pending_enter_ts is None
+
+
+class TestRealtimeSlackEarlyReturn:
+
+    def test_realtime_slack_below_ema_forces_back(self):
+        import types
+        slo_state = types.SimpleNamespace(
+            sslo_score=1.0,
+            is_pending_eligible=lambda now: True,
+            cumulative_slack=2.0,
+            _decoding_start=100.0,
+            _cumulative_consume=2.0,
+            _ema_pure_gen_time=0.5,
+            on_pending_enter=lambda now: None,
+            on_pending_exit=lambda now: None,
+        )
+        now = 101.6
+        if (slo_state._ema_pure_gen_time is not None
+            and slo_state._decoding_start is not None
+            and (slo_state._decoding_start + slo_state._cumulative_consume - now) <= slo_state._ema_pure_gen_time):
+            eligible = False
+        else:
+            eligible = True
+        assert eligible is False
+
+    def test_realtime_slack_above_ema_can_pend(self):
+        import types
+        slo_state = types.SimpleNamespace(
+            sslo_score=2.0,
+            is_pending_eligible=lambda now: True,
+            cumulative_slack=2.0,
+            _decoding_start=100.0,
+            _cumulative_consume=5.0,
+            _ema_pure_gen_time=0.5,
+            on_pending_enter=lambda now: None,
+            on_pending_exit=lambda now: None,
+        )
+        now = 101.0
+        if (slo_state._ema_pure_gen_time is not None
+            and slo_state._decoding_start is not None
+            and (slo_state._decoding_start + slo_state._cumulative_consume - now) <= slo_state._ema_pure_gen_time):
+            eligible = False
+        else:
+            eligible = True
+        assert eligible is True
 
 
 class TestOffloadMarking:

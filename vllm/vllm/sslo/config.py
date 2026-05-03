@@ -18,7 +18,7 @@ class SsloConfig:
     adaptive_batch_size: bool = False
     max_consecutive_pending: int = 5
     ema_alpha: float = 0.2
-    pending_slack_eps_num_tokens: int = 3
+    pending_slack_eps_num_tokens: int = 5
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:

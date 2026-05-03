@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "node \"/home/cheezestick/.claude/*\""
+    ]
+  }
+}

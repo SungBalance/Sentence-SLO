@@ -7,7 +7,8 @@
       "Bash(mv *)",
       "Bash(mkdir *)",
       "Bash(touch *)",
-      "Bash(chmod *)"
+      "Bash(chmod *)",
+      "Bash(awk *)"
     ]
   }
 }

@@ -123,6 +123,8 @@ class RequestOutput:
         kv_transfer_params: dict[str, Any] | None = None,
         # SSLO
         slo_chunk_records: "list[dict] | None" = None,
+        # SSLO
+        sslo_metrics: "SsloRequestStats | None" = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -145,6 +147,8 @@ class RequestOutput:
         self.kv_transfer_params = kv_transfer_params
         # SSLO
         self.slo_chunk_records = slo_chunk_records
+        # SSLO
+        self.sslo_metrics = sslo_metrics
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""

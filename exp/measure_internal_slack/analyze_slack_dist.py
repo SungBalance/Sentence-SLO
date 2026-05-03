@@ -5,12 +5,13 @@ Reads data by traversing the folder structure:
   {data_dir}/{model_slug}/{dataset_slug}/batch_{N}/{chunk_unit}/chunks.jsonl
 
 Charts:
-  1. slack_by_batch_size  – mean slack vs all batch sizes, lines = model × chunk_type
-  2. slack_by_chunk_index – mean slack vs chunk_idx (1–30), 2×2 subplots for 4 batch sizes
-  3. slack_by_chunk_type  – mean slack vs 4 batch sizes, subplots per model, lines = chunk_type
-  4. slack_by_model       – mean slack vs 4 batch sizes, subplots per chunk_type, lines = model
+  1. slack_by_batch_size    – mean slack vs all batch sizes, lines = model × chunk_type
+  2. slack_by_chunk_index   – mean slack vs chunk_idx, 2×2 subplots for 4 batch sizes
+  3. slack_by_chunk_type    – mean slack vs 4 batch sizes, subplots per model, lines = chunk_type
+  4. slack_by_model         – mean slack vs 4 batch sizes, subplots per chunk_type, lines = model
+  5. slack_distribution     – violin plot of slack distribution per condition (all batch sizes)
 
-Publication-quality styling. Smooth trend lines, no fill.
+Seaborn-based styling. Smooth trend lines, no fill.
 Chunk index 0 excluded (cumulative slack is always 0 by design).
 """
 from __future__ import annotations
@@ -27,14 +28,15 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
+import seaborn as sns
 
 # ---------------------------------------------------------------------------
 # Global constants
 # ---------------------------------------------------------------------------
 
 FOCUS_BATCH_SIZES = [16, 64, 128, 256]
-CHUNK_IDX_MAX = 30        # chart 2 X-axis cap (~75 % request coverage)
 MA_WINDOW = 5             # moving-average window for chunk-index smoothing
+MIN_N_CHUNK_IDX = 16      # chart 2: drop chunk_idx bins with fewer than this many samples
 
 # Wong colorblind-safe palette
 BLUE      = "#0072B2"
@@ -56,35 +58,32 @@ LABEL_MAP = {
 # ---------------------------------------------------------------------------
 
 def apply_paper_style() -> None:
-    plt.rcParams.update({
-        "font.family":        "sans-serif",
-        "font.sans-serif":    ["Helvetica", "Arial", "DejaVu Sans"],
-        "font.size":          9,
-        "axes.labelsize":     10,
-        "axes.titlesize":     10,
-        "axes.titleweight":   "bold",
-        "xtick.labelsize":    8.5,
-        "ytick.labelsize":    8.5,
-        "legend.fontsize":    8.5,
-        "legend.frameon":     True,
-        "legend.framealpha":  0.92,
-        "legend.edgecolor":   "#cccccc",
-        "legend.handlelength": 2.2,
-        "axes.linewidth":     0.7,
-        "axes.axisbelow":     True,
-        "axes.spines.top":    False,
-        "axes.spines.right":  False,
-        "grid.linewidth":     0.4,
-        "grid.color":         "#d0d0d0",
-        "lines.linewidth":    1.6,
-        "lines.markersize":   4.5,
-        "xtick.major.width":  0.7,
-        "ytick.major.width":  0.7,
-        "xtick.major.size":   3.5,
-        "ytick.major.size":   3.5,
-        "figure.constrained_layout.use": False,
-        "savefig.dpi":        300,
-    })
+    sns.set_theme(
+        style="ticks",
+        font_scale=0.9,
+        rc={
+            "font.family":          "sans-serif",
+            "font.sans-serif":      ["Helvetica", "Arial", "DejaVu Sans"],
+            "axes.titleweight":     "bold",
+            "axes.linewidth":       0.7,
+            "axes.axisbelow":       True,
+            "axes.spines.top":      False,
+            "axes.spines.right":    False,
+            "grid.linewidth":       0.4,
+            "grid.color":           "#d0d0d0",
+            "lines.linewidth":      1.6,
+            "lines.markersize":     4.5,
+            "xtick.major.width":    0.7,
+            "ytick.major.width":    0.7,
+            "xtick.major.size":     3.5,
+            "ytick.major.size":     3.5,
+            "legend.frameon":       True,
+            "legend.framealpha":    0.92,
+            "legend.edgecolor":     "#cccccc",
+            "legend.handlelength":  2.2,
+            "savefig.dpi":          300,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +165,18 @@ def ma_smooth(y: np.ndarray, w: int = MA_WINDOW) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid")[: len(y)]
 
 
+def iqr_filter(g: pd.DataFrame, col: str = "slack", mult: float = 1.5) -> pd.DataFrame:
+    """Drop rows outside [Q1 - mult*IQR, Q3 + mult*IQR] for one chunk_idx group."""
+    vals = g[col].values
+    if len(vals) < 4:
+        return g
+    q1, q3 = np.percentile(vals, 25), np.percentile(vals, 75)
+    iqr = q3 - q1
+    if iqr == 0:
+        return g
+    return g[(vals >= q1 - mult * iqr) & (vals <= q3 + mult * iqr)]
+
+
 # ---------------------------------------------------------------------------
 # Shared drawing helpers
 # ---------------------------------------------------------------------------
@@ -234,12 +245,11 @@ def plot_by_batch_size(df: pd.DataFrame, output_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def plot_by_chunk_index(df: pd.DataFrame, output_path: Path) -> None:
-    df = df[df["chunk_idx"] <= CHUNK_IDX_MAX]
     combos = sorted(set(zip(df["model"], df["chunk_type"])))
     focus = [bs for bs in FOCUS_BATCH_SIZES if bs in df["batch_size"].unique()]
     letters = "abcd"
 
-    fig, axes = plt.subplots(2, 2, figsize=(7.0, 5.5), sharey=True, sharex=True)
+    fig, axes = plt.subplots(2, 2, figsize=(9.0, 7.0), sharey=False, sharex=False)
     axes_flat = axes.flatten()
 
     for ax_i, bs in enumerate(focus):
@@ -250,7 +260,17 @@ def plot_by_chunk_index(df: pd.DataFrame, output_path: Path) -> None:
             grp = sub_df[(sub_df["model"] == model) & (sub_df["chunk_type"] == ct)]
             if grp.empty:
                 continue
-            means = grp.groupby("chunk_idx")["slack"].mean().sort_index()
+
+            # IQR outlier removal per chunk_idx, then drop low-n bins
+            parts = [iqr_filter(kg) for _, kg in grp.groupby("chunk_idx")]
+            filtered = pd.concat(parts) if parts else grp.iloc[:0]
+            counts = filtered.groupby("chunk_idx")["slack"].count()
+            valid_idx = counts[counts >= MIN_N_CHUNK_IDX].index
+            filtered = filtered[filtered["chunk_idx"].isin(valid_idx)]
+            if filtered.empty:
+                continue
+
+            means = filtered.groupby("chunk_idx")["slack"].mean().sort_index()
             x = means.index.values
             y = ma_smooth(means.values)
             ax.plot(x, y,
@@ -268,7 +288,6 @@ def plot_by_chunk_index(df: pd.DataFrame, output_path: Path) -> None:
         ax.set_ylabel("Mean Cumulative Slack (s)")
     for ax in axes[1, :]:
         ax.set_xlabel("Chunk Index")
-    axes_flat[0].set_xlim(1, CHUNK_IDX_MAX)
 
     handles, labels = axes_flat[0].get_legend_handles_labels()
     fig.legend(handles, labels,
@@ -363,6 +382,57 @@ def plot_by_model(df: pd.DataFrame, output_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Chart 5: violin distribution per condition
+# ---------------------------------------------------------------------------
+
+def plot_slack_distribution(df: pd.DataFrame, output_path: Path) -> None:
+    model_list  = sorted(df["model"].unique())
+    chunk_types = sorted(df["chunk_type"].unique())
+    all_bs      = sorted(df["batch_size"].unique())
+    letters = "abcd"
+
+    fig, axes = plt.subplots(
+        len(model_list), len(chunk_types),
+        figsize=(12.0, 7.0), sharey=False,
+    )
+
+    for ri, model in enumerate(model_list):
+        for ci, ct in enumerate(chunk_types):
+            ax = axes[ri][ci]
+            sub = df[(df["model"] == model) & (df["chunk_type"] == ct)].copy()
+            sub["batch_size"] = sub["batch_size"].astype(str)
+
+            # clip display range to 1st–99th percentile to prevent tail distortion
+            lo = sub["slack"].quantile(0.01)
+            hi = sub["slack"].quantile(0.99)
+
+            sns.violinplot(
+                data=sub, x="batch_size", y="slack",
+                order=[str(b) for b in all_bs],
+                color=MODEL_COLOR.get(model, "#333"),
+                inner="quartile",
+                cut=0,
+                linewidth=0.8,
+                ax=ax,
+            )
+
+            ax.axhline(0, color="#555", linewidth=0.8, linestyle="--", zorder=3)
+            ax.set_ylim(lo * 1.1 if lo < 0 else lo * 0.5, hi * 1.1)
+            ax.set_title(f"{model} / {ct}")
+            ax.set_xlabel("Batch Size" if ri == len(model_list) - 1 else "")
+            ax.set_ylabel("Cumulative Slack (s)" if ci == 0 else "")
+            ax.tick_params(axis="x", labelsize=7.5)
+            ax.grid(axis="y", alpha=0.5)
+            sns.despine(ax=ax)
+            letter = letters[ri * len(chunk_types) + ci]
+            _panel_label(ax, letter)
+
+    fig.suptitle("Cumulative Slack Distribution by Condition",
+                 fontsize=11, fontweight="bold")
+    _save(fig, output_path)
+
+
+# ---------------------------------------------------------------------------
 # Summary CSV
 # ---------------------------------------------------------------------------
 
@@ -429,10 +499,11 @@ def main() -> None:
           f"{df['batch_size'].nunique()} batch sizes.")
 
     print("Plotting...")
-    plot_by_batch_size(df,  output_dir / "slack_by_batch_size.png")
-    plot_by_chunk_index(df, output_dir / "slack_by_chunk_index.png")
-    plot_by_chunk_type(df,  output_dir / "slack_by_chunk_type.png")
-    plot_by_model(df,       output_dir / "slack_by_model.png")
+    plot_by_batch_size(df,      output_dir / "slack_by_batch_size.png")
+    plot_by_chunk_index(df,     output_dir / "slack_by_chunk_index.png")
+    plot_by_chunk_type(df,      output_dir / "slack_by_chunk_type.png")
+    plot_by_model(df,           output_dir / "slack_by_model.png")
+    plot_slack_distribution(df, output_dir / "slack_distribution.png")
 
     summary = build_summary(df)
     write_csv(output_dir / "summary.csv", summary, SUMMARY_COLS)

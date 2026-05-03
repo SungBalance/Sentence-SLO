@@ -407,6 +407,8 @@ class RequestState:
             metrics=self.stats,
             # SSLO
             slo_chunk_records=self.slo_state.chunk_records if finished else None,
+            # SSLO
+            sslo_metrics=self.slo_state.compute_stats() if finished else None,
         )
 
     def _new_completion_output(

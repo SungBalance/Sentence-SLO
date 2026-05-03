@@ -98,6 +98,18 @@ class ParagraphChunkDetector:
 
 
 @dataclass
+class SsloRequestStats:
+    final_cumulative_slack: float
+    min_cumulative_slack: float
+    neg_slack_chunk_count: int
+    total_pending_time_s: float
+    num_pending_intervals: int
+    max_consecutive_pending: int
+    final_ema_gen_time_s: float | None
+    final_ema_per_word_time_s: float | None
+
+
+@dataclass
 class SLOChunkRecord:
     chunk_idx: int
     text: str
@@ -157,6 +169,9 @@ class RequestSLOState:
         self._last_chunk_end_ts: float | None = None
         self._pending_enter_ts: float | None = None
         self._chunk_pending_time: float = 0.0
+        self._num_pending_intervals: int = 0
+        self._cur_consecutive_pending: int = 0
+        self._max_consecutive_pending: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -188,16 +203,28 @@ class RequestSLOState:
         """Mark the start of a pending interval."""
         if self._pending_enter_ts is None:
             self._pending_enter_ts = now
+            self._num_pending_intervals += 1
+            self._cur_consecutive_pending += 1
+            if self._cur_consecutive_pending > self._max_consecutive_pending:
+                self._max_consecutive_pending = self._cur_consecutive_pending
 
     def on_pending_exit(self, now: float) -> None:
         """Accumulate pending duration into the current chunk."""
         if self._pending_enter_ts is not None:
             self._chunk_pending_time += now - self._pending_enter_ts
             self._pending_enter_ts = None
+            self._cur_consecutive_pending = 0
 
     @property
     def is_pending_eligible(self) -> bool:
-        """True if slack exceeds EMA gen time plus token slack margin."""
+        """True if cumulative_slack (at last chunk flush) > EMA + eps × per_token.
+
+        Uses cumulative_slack (stale) for entry deliberately: it's the slack against
+        the LAST chunk's deadline. Realtime slack against the NEXT chunk's deadline
+        would be (cumulative_slack + consume_i), which is MORE permissive — but the
+        early-return check in the scheduler will catch decay using realtime slack.
+        Hysteresis: hard to enter, easy to leave.
+        """
         if self._ema_pure_gen_time is None or self._ema_per_token_time is None:
             return False
         threshold = (
@@ -216,6 +243,19 @@ class RequestSLOState:
             self._slack_dirty = False
             return self.cumulative_slack
         return None
+
+    def compute_stats(self) -> SsloRequestStats:
+        slacks = [r.cumulative_slack for r in self._chunk_records]
+        return SsloRequestStats(
+            final_cumulative_slack=slacks[-1] if slacks else 0.0,
+            min_cumulative_slack=min(slacks) if slacks else 0.0,
+            neg_slack_chunk_count=sum(1 for s in slacks if s < 0),
+            total_pending_time_s=sum(r.pending_time for r in self._chunk_records),
+            num_pending_intervals=self._num_pending_intervals,
+            max_consecutive_pending=self._max_consecutive_pending,
+            final_ema_gen_time_s=self._ema_pure_gen_time,
+            final_ema_per_word_time_s=self._ema_per_token_time,
+        )
 
     def _flush_chunk(self, now: float, boundary_pos: int) -> None:
         """Compute slack for the completed chunk and update state."""

@@ -275,7 +275,7 @@ class TestIsPendingEligible:
         state.cumulative_slack = 100.0
         assert state.is_pending_eligible is False
 
-    def test_true_when_slack_exceeds_threshold(self):
+    def test_true_when_cumulative_slack_exceeds_threshold(self):
         import time
         state = RequestSLOState(ema_alpha=1.0, pending_slack_eps_num_tokens=3)
         t0 = time.monotonic()
@@ -286,13 +286,13 @@ class TestIsPendingEligible:
         state.cumulative_slack = 3.0
         assert state.is_pending_eligible is True
 
-    def test_false_when_slack_below_threshold(self):
+    def test_false_when_cumulative_slack_below_threshold(self):
         import time
         state = RequestSLOState(ema_alpha=1.0, pending_slack_eps_num_tokens=3)
         t0 = time.monotonic()
         state.on_text_delta("hello world", t0)
         state.on_text_delta(". ", t0 + 1.0)
-        state.cumulative_slack = 2.0  # below 2.5 threshold
+        state.cumulative_slack = 2.0
         assert state.is_pending_eligible is False
 
 

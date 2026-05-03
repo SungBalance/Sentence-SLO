@@ -73,7 +73,7 @@ class TestSsloConfig:
         assert cfg.adaptive_batch_size is False
         assert cfg.max_consecutive_pending == 5
         assert cfg.ema_alpha == 0.2
-        assert cfg.pending_slack_eps_num_tokens == 3
+        assert cfg.pending_slack_eps_num_tokens == 5
 
     def test_invalid_chunk_unit_raises(self):
         with pytest.raises(ValueError, match="chunk_unit"):
@@ -141,7 +141,7 @@ class SsloConfig:
     adaptive_batch_size: bool = False
     max_consecutive_pending: int = 5
     ema_alpha: float = 0.2
-    pending_slack_eps_num_tokens: int = 3
+    pending_slack_eps_num_tokens: int = 5
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
@@ -200,7 +200,7 @@ In `RequestSLOState.__init__`, accept these new params (full EMA + pending logic
         estimator: ConsumeEstimator | None = None,
         detector: ChunkBoundaryDetector | None = None,
         ema_alpha: float = 0.2,
-        pending_slack_eps_num_tokens: int = 3,
+        pending_slack_eps_num_tokens: int = 5,
     ) -> None:
         ...
         self._ema_alpha: float = ema_alpha
@@ -425,7 +425,7 @@ class TestIsPendingEligible:
 
     def test_true_when_slack_exceeds_threshold(self):
         import time
-        state = RequestSLOState(ema_alpha=1.0, pending_slack_eps_num_tokens=3)
+        state = RequestSLOState(ema_alpha=1.0, pending_slack_eps_num_tokens=5)
         t0 = time.monotonic()
         state.on_text_delta("hello world. ", t0 + 1.0)
         # ema_pure_gen_time = 1.0, ema_per_token_time = 0.5
@@ -435,7 +435,7 @@ class TestIsPendingEligible:
 
     def test_false_when_slack_below_threshold(self):
         import time
-        state = RequestSLOState(ema_alpha=1.0, pending_slack_eps_num_tokens=3)
+        state = RequestSLOState(ema_alpha=1.0, pending_slack_eps_num_tokens=5)
         t0 = time.monotonic()
         state.on_text_delta("hello world. ", t0 + 1.0)
         state.cumulative_slack = 2.0  # below 2.5 threshold
@@ -479,7 +479,7 @@ Replace the existing field initialization block:
         estimator: ConsumeEstimator | None = None,
         detector: ChunkBoundaryDetector | None = None,
         ema_alpha: float = 0.2,
-        pending_slack_eps_num_tokens: int = 3,
+        pending_slack_eps_num_tokens: int = 5,
     ) -> None:
         self._estimator: ConsumeEstimator = estimator or WordRateEstimator()
         self._detector: ChunkBoundaryDetector = detector or SentenceChunkDetector()

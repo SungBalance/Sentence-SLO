@@ -986,12 +986,36 @@ class Scheduler(SchedulerInterface):
         for req in combined:
             was_pending = req.request_id in prev_pending_ids
             consec = self.sslo_consecutive_pending.get(req.request_id, 0)
+            slo_state = req.slo_state
+            # SSLO: hysteresis on real-time slack to next chunk's deadline.
+            # Enter pending when realtime_slack > 2.5 × EMA gen time.
+            # Exit pending when realtime_slack ≤ 2.0 × EMA gen time.
+            # In the band (2.0×, 2.5×], stay in current state to prevent oscillation.
+            realtime_slack = None
+            ema = None
+            if (slo_state is not None
+                    and slo_state._ema_pure_gen_time is not None
+                    and slo_state._decoding_start is not None):
+                realtime_slack = (
+                    slo_state._decoding_start + slo_state._cumulative_consume - now
+                )
+                ema = slo_state._ema_pure_gen_time
+
+            # SSLO: force back if at max_consecutive_pending (starvation prevention)
             if consec >= self.sslo_config.max_consecutive_pending:
                 eligible = False
-            elif req.slo_state is not None and req.slo_state.is_pending_eligible and len(self.waiting) > 0:
-                eligible = True
-            else:
+            # SSLO: missing slack signal — never pend
+            elif realtime_slack is None or len(self.waiting) == 0:
                 eligible = False
+            # SSLO: exit if realtime slack drops to ≤ 2.0 × EMA
+            elif was_pending and realtime_slack <= 2.0 * ema:
+                eligible = False
+            # SSLO: enter if realtime slack > 2.5 × EMA
+            elif (not was_pending) and realtime_slack > 2.5 * ema:
+                eligible = True
+            # SSLO: in hysteresis band (2.0×, 2.5×], maintain current state
+            else:
+                eligible = was_pending
             if eligible:
                 if not was_pending and req.slo_state is not None:
                     req.slo_state.on_pending_enter(now)
