@@ -272,3 +272,26 @@
 - `run_repeat.sh` accepts `request_rate` (positional 7) and `base_seed` (8); each run uses `seed = base_seed + i` so the N runs sample different arrival patterns at the same rate.
 - Within one config, all 3 modes (baseline / sslo / sslo_adaptive) share the same seed → identical arrival schedule, apples-to-apples comparison.
 - Smoke verified at rate=4 reqs/s (16 prompts, max_num_seqs=8): all three modes show identical decoding_start_ts spread (~2.3s span, same seed) → arrival timing reproducible.
+
+## 2026-05-03 (systemic metrics)
+
+- Modified: Extended `exp/sslo_test/analyze.py` summaries with TTFT and queue-stall p99/max, SLO compliance, negative-slack magnitude, running/combined scheduler occupancy, pending duration/intervals, and inter-chunk delay metrics.
+- Modified: `exp/sslo_test/run_test.py` now carries chunk `end_time_ts` and per-request `sslo_metrics` pending fields (`total_pending_time_s`, `num_pending_intervals`, `max_consecutive_pending`) into JSONL rows.
+- Modified: `aggregate_repeats.py` and `aggregate_sweep.py` print the new metrics and recompute raw-file-derived fallback fields for old summaries.
+- Debugging/verification: In containers, compileall passed for changed experiment Python files; `python3 -m pytest vllm/tests/sslo/ -x -q` passed (`65 passed, 16 warnings`). GPU smoke at `/tmp/sslo_metric_smoke` completed and summary keys were non-null for SSLO. Re-aggregated sweep output now includes new TTFT/queue-stall tails plus SLO compliance, slack magnitude, running/combined, pending, and inter-chunk sections.
+
+## 2026-05-03 (systemic metrics)
+
+Added 7 new metric categories to exp/sslo_test/ for systemic-effect analysis (in addition to existing TTFT p50/p90, TPOT p50, queue_stall p50, neg_slack_ratio):
+
+1. **TTFT/queue_stall p99 + max** — tail behaviour, not just median.
+2. **Per-request SLO compliance rate** — `slo_compliance_rate_{mode}`: fraction of 256 requests where ALL chunks made deadline. Direct policy-evaluation metric (vs the chunk-level ratio which conflates short and long requests).
+3. **Neg slack magnitude p50/p90/p99/max** — "how late were the late chunks", not just count.
+4. **`len(running)` time-series mean/p50/p99** (from `${mode}_stats.jsonl`) — actual cap utilization.
+5. **Effective batch (running + pending) mean/p50/p99** — total in-flight (KV-occupying) requests.
+6. **Per-request pending duration p50/p90/p99 + interval count p50/p90** — extracted from `RequestOutput.sslo_metrics` (already exposed by `RequestSLOState.compute_stats()`); now captured in `run_test.py` per-request rows.
+7. **Inter-chunk delay p50/p90/p99/max** — gap between consecutive chunk `end_time_ts` per request, useful for streaming smoothness (TTS / human reading rate).
+
+`analyze.py` writes all these to `summary.json`; `aggregate_repeats.py` and `aggregate_sweep.py` extend their METRICS tuples to print per-mode mean ± stddev.
+
+Existing 36-cell sweep re-aggregated successfully — all metrics populate from existing chunks/stats jsonl except #6 (which needs a fresh run since `total_pending_time_s` is per-request and was added to row schema in this change).

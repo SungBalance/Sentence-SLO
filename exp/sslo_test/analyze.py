@@ -19,6 +19,34 @@ SSLO_TTFT = "sslo_ttft.jsonl"
 SSLO_CHUNKS = "sslo_chunks.jsonl"
 SSLO_STATS = "sslo_stats.jsonl"
 SSLO_VARIANTS = ("sslo", "sslo_adaptive")
+EXTRA_METRIC_PREFIXES = (
+    "h2_ttft_p99",
+    "h2_ttft_max",
+    "queue_stall_p99",
+    "queue_stall_max",
+    "slo_compliance_rate",
+    "slo_compliance_count",
+    "slo_total_requests",
+    "neg_slack_mag_p50",
+    "neg_slack_mag_p90",
+    "neg_slack_mag_p99",
+    "neg_slack_mag_max",
+    "running_mean",
+    "running_p50",
+    "running_p99",
+    "combined_mean",
+    "combined_p50",
+    "combined_p99",
+    "pending_time_p50",
+    "pending_time_p90",
+    "pending_time_p99",
+    "pending_intervals_p50",
+    "pending_intervals_p90",
+    "inter_chunk_delay_p50",
+    "inter_chunk_delay_p90",
+    "inter_chunk_delay_p99",
+    "inter_chunk_delay_max",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +99,7 @@ def latency_stats(rows: list[dict[str, Any]], key: str) -> dict[str, float | int
         "p50": percentile(values, 50),
         "p90": percentile(values, 90),
         "p99": percentile(values, 99),
+        "max": max(values, default=None),
     }
 
 
@@ -90,6 +119,8 @@ def queue_stall_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | Non
         "count": len(values),
         "p50": percentile(values, 50),
         "p90": percentile(values, 90),
+        "p99": percentile(values, 99),
+        "max": max(values, default=None),
     }
 
 
@@ -103,6 +134,96 @@ def slack_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
         "p50": percentile(values, 50),
         "p95": percentile(values, 95),
     }
+
+
+def distribution_stats(
+    values: list[float],
+    percentiles: tuple[int, ...],
+    *,
+    include_mean: bool = False,
+    include_max: bool = False,
+) -> dict[str, float | int | None]:
+    stats: dict[str, float | int | None] = {"count": len(values)}
+    if include_mean:
+        stats["mean"] = statistics.fmean(values) if values else None
+    for pct in percentiles:
+        stats[f"p{pct}"] = percentile(values, pct)
+    if include_max:
+        stats["max"] = max(values, default=None)
+    return stats
+
+
+def request_compliance_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    request_has_chunk: dict[str, bool] = {}
+    request_has_neg_slack: dict[str, bool] = {}
+    for row in rows:
+        request_id = row.get("request_id")
+        if request_id is None:
+            continue
+        request_id = str(request_id)
+        request_has_chunk[request_id] = True
+        slack = row.get("cumulative_slack")
+        if slack is not None and float(slack) < 0:
+            request_has_neg_slack[request_id] = True
+
+    total = len(request_has_chunk)
+    compliant = sum(
+        1
+        for request_id in request_has_chunk
+        if not request_has_neg_slack.get(request_id, False)
+    )
+    return {
+        "rate": (compliant / total) if total else None,
+        "count": compliant,
+        "total_requests": total,
+    }
+
+
+def neg_slack_magnitude_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    values = [
+        -float(row["cumulative_slack"])
+        for row in rows
+        if row.get("cumulative_slack") is not None
+        and float(row["cumulative_slack"]) < 0
+    ]
+    return distribution_stats(values, (50, 90, 99), include_max=True)
+
+
+def scheduler_queue_stats(rows: list[dict[str, Any]], key: str) -> dict[str, float | int | None]:
+    values = numeric_values(rows, key)
+    return distribution_stats(values, (50, 99), include_mean=True)
+
+
+def pending_request_stats(rows: list[dict[str, Any]]) -> dict[str, dict[str, float | int | None]]:
+    return {
+        "time": distribution_stats(
+            numeric_values(rows, "total_pending_time_s"), (50, 90, 99)
+        ),
+        "intervals": distribution_stats(
+            numeric_values(rows, "num_pending_intervals"), (50, 90)
+        ),
+    }
+
+
+def inter_chunk_delay_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    by_request: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        request_id = row.get("request_id")
+        if request_id is None:
+            continue
+        if row.get("chunk_idx") is None or row.get("end_time_ts") is None:
+            continue
+        by_request.setdefault(str(request_id), []).append(row)
+
+    delays: list[float] = []
+    for request_rows in by_request.values():
+        ordered = sorted(request_rows, key=lambda row: int(row["chunk_idx"]))
+        for prev, cur in zip(ordered, ordered[1:]):
+            cur_end = float(cur["end_time_ts"])
+            prev_end = float(prev["end_time_ts"])
+            if cur_end >= prev_end:
+                delays.append(cur_end - prev_end)
+    return distribution_stats(delays, (50, 90, 99), include_max=True)
 
 
 def h2_rows(
@@ -148,7 +269,7 @@ def format_bool(value: bool | None) -> str:
 
 
 def print_stats(label: str, metric: str, stats: dict[str, float | int | None]) -> None:
-    keys = [key for key in ("count", "mean", "p5", "p50", "p90", "p95", "p99")
+    keys = [key for key in ("count", "mean", "p5", "p50", "p90", "p95", "p99", "max")
             if key in stats]
     rendered = " ".join(f"{key}={format_value(stats[key])}" for key in keys)
     print(f"{label} {metric}: {rendered}")
@@ -178,26 +299,128 @@ def expected_files(run_status: dict[str, Any]) -> tuple[str, ...]:
     return tuple(files)
 
 
+def extra_metric_fields(output_dir: Path, max_num_seqs: int) -> dict[str, Any]:
+    baseline_rows = read_jsonl(output_dir / BASELINE_TTFT)
+    baseline_chunks = read_jsonl(output_dir / BASELINE_CHUNKS)
+    variant_rows = {
+        variant: read_jsonl(output_dir / variant_file(variant, "ttft"))
+        for variant in SSLO_VARIANTS
+    }
+    chunks_by_mode = {
+        "baseline": baseline_chunks,
+        **{
+            variant: read_jsonl(output_dir / variant_file(variant, "chunks"))
+            for variant in SSLO_VARIANTS
+        },
+    }
+    stats_by_mode = {
+        variant: read_jsonl(output_dir / variant_file(variant, "stats"))
+        for variant in SSLO_VARIANTS
+    }
+    rows_by_mode = {
+        "baseline": baseline_rows,
+        **variant_rows,
+    }
+
+    fields: dict[str, Any] = {}
+    for mode, rows in rows_by_mode.items():
+        mode_present = (
+            (output_dir / BASELINE_TTFT).exists()
+            if mode == "baseline"
+            else any(
+                (output_dir / variant_file(mode, suffix)).exists()
+                for suffix in ("ttft", "chunks", "stats")
+            )
+        )
+        if not mode_present:
+            for prefix in EXTRA_METRIC_PREFIXES:
+                fields[f"{prefix}_{mode}"] = None
+            continue
+        if mode == "baseline":
+            _cohort, h2_mode_rows, _variant_rows = h2_rows(
+                baseline_rows, variant_rows["sslo"], max_num_seqs
+            )
+        else:
+            _cohort, _baseline_h2_rows, h2_mode_rows = h2_rows(
+                baseline_rows, rows, max_num_seqs
+            )
+        h2_ttft = latency_stats(h2_mode_rows, "ttft")
+        queue_stall = queue_stall_stats(rows)
+        chunks = chunks_by_mode[mode]
+        compliance = request_compliance_stats(chunks)
+        neg_slack_mag = neg_slack_magnitude_stats(chunks)
+        pending = pending_request_stats(rows)
+        inter_chunk = inter_chunk_delay_stats(chunks)
+
+        fields[f"h2_ttft_p99_{mode}"] = h2_ttft["p99"]
+        fields[f"h2_ttft_max_{mode}"] = h2_ttft["max"]
+        fields[f"queue_stall_p99_{mode}"] = queue_stall["p99"]
+        fields[f"queue_stall_max_{mode}"] = queue_stall["max"]
+        fields[f"slo_compliance_rate_{mode}"] = compliance["rate"]
+        fields[f"slo_compliance_count_{mode}"] = compliance["count"]
+        fields[f"slo_total_requests_{mode}"] = compliance["total_requests"]
+        fields[f"neg_slack_mag_p50_{mode}"] = neg_slack_mag["p50"]
+        fields[f"neg_slack_mag_p90_{mode}"] = neg_slack_mag["p90"]
+        fields[f"neg_slack_mag_p99_{mode}"] = neg_slack_mag["p99"]
+        fields[f"neg_slack_mag_max_{mode}"] = neg_slack_mag["max"]
+        fields[f"pending_time_p50_{mode}"] = pending["time"]["p50"]
+        fields[f"pending_time_p90_{mode}"] = pending["time"]["p90"]
+        fields[f"pending_time_p99_{mode}"] = pending["time"]["p99"]
+        fields[f"pending_intervals_p50_{mode}"] = pending["intervals"]["p50"]
+        fields[f"pending_intervals_p90_{mode}"] = pending["intervals"]["p90"]
+        fields[f"inter_chunk_delay_p50_{mode}"] = inter_chunk["p50"]
+        fields[f"inter_chunk_delay_p90_{mode}"] = inter_chunk["p90"]
+        fields[f"inter_chunk_delay_p99_{mode}"] = inter_chunk["p99"]
+        fields[f"inter_chunk_delay_max_{mode}"] = inter_chunk["max"]
+
+        if mode == "baseline":
+            running = {"mean": None, "p50": None, "p99": None}
+            combined = {"mean": None, "p50": None, "p99": None}
+        else:
+            running = scheduler_queue_stats(stats_by_mode[mode], "running")
+            combined = scheduler_queue_stats(stats_by_mode[mode], "combined")
+        fields[f"running_mean_{mode}"] = running["mean"]
+        fields[f"running_p50_{mode}"] = running["p50"]
+        fields[f"running_p99_{mode}"] = running["p99"]
+        fields[f"combined_mean_{mode}"] = combined["mean"]
+        fields[f"combined_p50_{mode}"] = combined["p50"]
+        fields[f"combined_p99_{mode}"] = combined["p99"]
+
+    return fields
+
+
+def clear_mode_fields(summary: dict[str, Any], mode: str) -> None:
+    for prefix in EXTRA_METRIC_PREFIXES:
+        summary[f"{prefix}_{mode}"] = None
+
+
 def h1_stats(
     rows: list[dict[str, Any]],
     max_num_seqs: int,
 ) -> dict[str, int | bool]:
+    def int_field(row: dict[str, Any], key: str, default: int = 0) -> int:
+        value = row.get(key)
+        if value is None:
+            return default
+        return int(value)
+
+    def combined_field(row: dict[str, Any]) -> int:
+        value = row.get("combined")
+        if value is not None:
+            return int(value)
+        return int_field(row, "running") + int_field(row, "pending")
+
     combined_values = [
-        int(row.get("combined", int(row.get("running", 0)) + int(row.get("pending", 0))))
+        combined_field(row)
         for row in rows
     ]
-    pending_values = [int(row.get("pending", 0)) for row in rows]
+    pending_values = [int_field(row, "pending") for row in rows]
     iterations_above_cap = sum(
         1
         for row in rows
-        if int(
-            row.get(
-                "combined",
-                int(row.get("running", 0)) + int(row.get("pending", 0)),
-            )
-        ) > max_num_seqs
-        and int(row.get("pending", 0)) > 0
-        and int(row.get("running", 0)) <= max_num_seqs
+        if combined_field(row) > max_num_seqs
+        and int_field(row, "pending") > 0
+        and int_field(row, "running") <= max_num_seqs
     )
     return {
         "pending_plus_running_exceeds_cap": iterations_above_cap > 0,
@@ -232,6 +455,10 @@ def analyze(output_dir: Path, max_num_seqs: int) -> dict[str, Any]:
     baseline_tpot = tpot_stats(baseline_rows)
     baseline_queue_stall = queue_stall_stats(baseline_rows)
     baseline_slack = slack_stats(baseline_chunks)
+    baseline_compliance = request_compliance_stats(baseline_chunks)
+    baseline_neg_slack_mag = neg_slack_magnitude_stats(baseline_chunks)
+    baseline_pending = pending_request_stats(baseline_rows)
+    baseline_inter_chunk = inter_chunk_delay_stats(baseline_chunks)
 
     variant_rows = {
         variant: read_jsonl(output_dir / variant_file(variant, "ttft"))
@@ -266,6 +493,30 @@ def analyze(output_dir: Path, max_num_seqs: int) -> dict[str, Any]:
     }
     variant_slack = {
         variant: slack_stats(rows)
+        for variant, rows in variant_chunks.items()
+    }
+    variant_compliance = {
+        variant: request_compliance_stats(rows)
+        for variant, rows in variant_chunks.items()
+    }
+    variant_neg_slack_mag = {
+        variant: neg_slack_magnitude_stats(rows)
+        for variant, rows in variant_chunks.items()
+    }
+    variant_running = {
+        variant: scheduler_queue_stats(rows, "running")
+        for variant, rows in variant_stats_rows.items()
+    }
+    variant_combined = {
+        variant: scheduler_queue_stats(rows, "combined")
+        for variant, rows in variant_stats_rows.items()
+    }
+    variant_pending = {
+        variant: pending_request_stats(rows)
+        for variant, rows in variant_rows.items()
+    }
+    variant_inter_chunk = {
+        variant: inter_chunk_delay_stats(rows)
         for variant, rows in variant_chunks.items()
     }
     variant_h1 = {
@@ -319,12 +570,38 @@ def analyze(output_dir: Path, max_num_seqs: int) -> dict[str, Any]:
         "control_case": is_control,
         "h2_ttft_p50_baseline": baseline_h2_ttft["p50"],
         "h2_ttft_p90_baseline": baseline_h2_ttft["p90"],
+        "h2_ttft_p99_baseline": baseline_h2_ttft["p99"],
+        "h2_ttft_max_baseline": baseline_h2_ttft["max"],
         "h2_ttft_cohort": h2_cohort,
         "h2_ttft_count_baseline": baseline_h2_ttft["count"],
         "h3_slack_neg_ratio_baseline": baseline_slack["neg_slack_ratio"],
         "h4_tpot_p50_baseline": baseline_tpot["p50"],
         "queue_stall_p50_baseline": baseline_queue_stall["p50"],
         "queue_stall_p90_baseline": baseline_queue_stall["p90"],
+        "queue_stall_p99_baseline": baseline_queue_stall["p99"],
+        "queue_stall_max_baseline": baseline_queue_stall["max"],
+        "slo_compliance_rate_baseline": baseline_compliance["rate"],
+        "slo_compliance_count_baseline": baseline_compliance["count"],
+        "slo_total_requests_baseline": baseline_compliance["total_requests"],
+        "neg_slack_mag_p50_baseline": baseline_neg_slack_mag["p50"],
+        "neg_slack_mag_p90_baseline": baseline_neg_slack_mag["p90"],
+        "neg_slack_mag_p99_baseline": baseline_neg_slack_mag["p99"],
+        "neg_slack_mag_max_baseline": baseline_neg_slack_mag["max"],
+        "running_mean_baseline": None,
+        "running_p50_baseline": None,
+        "running_p99_baseline": None,
+        "combined_mean_baseline": None,
+        "combined_p50_baseline": None,
+        "combined_p99_baseline": None,
+        "pending_time_p50_baseline": baseline_pending["time"]["p50"],
+        "pending_time_p90_baseline": baseline_pending["time"]["p90"],
+        "pending_time_p99_baseline": baseline_pending["time"]["p99"],
+        "pending_intervals_p50_baseline": baseline_pending["intervals"]["p50"],
+        "pending_intervals_p90_baseline": baseline_pending["intervals"]["p90"],
+        "inter_chunk_delay_p50_baseline": baseline_inter_chunk["p50"],
+        "inter_chunk_delay_p90_baseline": baseline_inter_chunk["p90"],
+        "inter_chunk_delay_p99_baseline": baseline_inter_chunk["p99"],
+        "inter_chunk_delay_max_baseline": baseline_inter_chunk["max"],
         "ttft": {
             "baseline_all": baseline_all_ttft,
             "baseline_h2": baseline_h2_ttft,
@@ -339,6 +616,24 @@ def analyze(output_dir: Path, max_num_seqs: int) -> dict[str, Any]:
         "slack": {
             "baseline": baseline_slack,
         },
+        "slo_compliance": {
+            "baseline": baseline_compliance,
+        },
+        "neg_slack_magnitude": {
+            "baseline": baseline_neg_slack_mag,
+        },
+        "running": {
+            "baseline": {"mean": None, "p50": None, "p99": None},
+        },
+        "combined": {
+            "baseline": {"mean": None, "p50": None, "p99": None},
+        },
+        "pending": {
+            "baseline": baseline_pending,
+        },
+        "inter_chunk_delay": {
+            "baseline": baseline_inter_chunk,
+        },
         "run_complete": run_complete,
         "missing_files": missing_files,
         "run_status": run_status,
@@ -349,6 +644,12 @@ def analyze(output_dir: Path, max_num_seqs: int) -> dict[str, Any]:
         tpot = variant_tpot[variant]
         queue_stall = variant_queue_stall[variant]
         slack = variant_slack[variant]
+        compliance = variant_compliance[variant]
+        neg_slack_mag = variant_neg_slack_mag[variant]
+        running = variant_running[variant]
+        combined = variant_combined[variant]
+        pending = variant_pending[variant]
+        inter_chunk = variant_inter_chunk[variant]
         h1_pass = (
             h1["pending_plus_running_exceeds_cap"] if variant_present[variant] else None
         )
@@ -374,6 +675,8 @@ def analyze(output_dir: Path, max_num_seqs: int) -> dict[str, Any]:
         summary[f"h2_ttft_p50_{variant}"] = h2["variant"]["p50"]
         summary[f"h2_ttft_p50_pct_change_{variant}"] = h2["p50_change"]
         summary[f"h2_ttft_p90_{variant}"] = h2["variant"]["p90"]
+        summary[f"h2_ttft_p99_{variant}"] = h2["variant"]["p99"]
+        summary[f"h2_ttft_max_{variant}"] = h2["variant"]["max"]
         summary[f"h2_ttft_cohort_{variant}"] = h2["cohort"]
         summary[f"h2_ttft_count_{variant}"] = h2["variant"]["count"]
         summary[f"h2_ttft_p50_not_worse_{variant}"] = h2["pass"]
@@ -385,14 +688,46 @@ def analyze(output_dir: Path, max_num_seqs: int) -> dict[str, Any]:
         )
         summary[f"queue_stall_p50_{variant}"] = queue_stall["p50"]
         summary[f"queue_stall_p90_{variant}"] = queue_stall["p90"]
+        summary[f"queue_stall_p99_{variant}"] = queue_stall["p99"]
+        summary[f"queue_stall_max_{variant}"] = queue_stall["max"]
         summary[f"queue_stall_p50_pct_change_{variant}"] = pct_change(
             queue_stall["p50"], baseline_queue_stall["p50"]
         )
+        summary[f"slo_compliance_rate_{variant}"] = compliance["rate"]
+        summary[f"slo_compliance_count_{variant}"] = compliance["count"]
+        summary[f"slo_total_requests_{variant}"] = compliance["total_requests"]
+        summary[f"neg_slack_mag_p50_{variant}"] = neg_slack_mag["p50"]
+        summary[f"neg_slack_mag_p90_{variant}"] = neg_slack_mag["p90"]
+        summary[f"neg_slack_mag_p99_{variant}"] = neg_slack_mag["p99"]
+        summary[f"neg_slack_mag_max_{variant}"] = neg_slack_mag["max"]
+        summary[f"running_mean_{variant}"] = running["mean"]
+        summary[f"running_p50_{variant}"] = running["p50"]
+        summary[f"running_p99_{variant}"] = running["p99"]
+        summary[f"combined_mean_{variant}"] = combined["mean"]
+        summary[f"combined_p50_{variant}"] = combined["p50"]
+        summary[f"combined_p99_{variant}"] = combined["p99"]
+        summary[f"pending_time_p50_{variant}"] = pending["time"]["p50"]
+        summary[f"pending_time_p90_{variant}"] = pending["time"]["p90"]
+        summary[f"pending_time_p99_{variant}"] = pending["time"]["p99"]
+        summary[f"pending_intervals_p50_{variant}"] = pending["intervals"]["p50"]
+        summary[f"pending_intervals_p90_{variant}"] = pending["intervals"]["p90"]
+        summary[f"inter_chunk_delay_p50_{variant}"] = inter_chunk["p50"]
+        summary[f"inter_chunk_delay_p90_{variant}"] = inter_chunk["p90"]
+        summary[f"inter_chunk_delay_p99_{variant}"] = inter_chunk["p99"]
+        summary[f"inter_chunk_delay_max_{variant}"] = inter_chunk["max"]
         summary["ttft"][f"{variant}_all"] = variant_all_ttft[variant]
         summary["ttft"][f"{variant}_h2"] = h2["variant"]
         summary["tpot"][variant] = tpot
         summary["queue_stall"][variant] = queue_stall
         summary["slack"][variant] = slack
+        summary["slo_compliance"][variant] = compliance
+        summary["neg_slack_magnitude"][variant] = neg_slack_mag
+        summary["running"][variant] = running
+        summary["combined"][variant] = combined
+        summary["pending"][variant] = pending
+        summary["inter_chunk_delay"][variant] = inter_chunk
+        if not variant_present[variant]:
+            clear_mode_fields(summary, variant)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")

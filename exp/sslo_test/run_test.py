@@ -80,6 +80,13 @@ def record_value(record: Any, key: str) -> Any:
     return getattr(record, key, None)
 
 
+def positive_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    value = float(value)
+    return value if value > 0 else None
+
+
 def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
     records = getattr(request_output, "slo_chunk_records", None)
     if not records:
@@ -92,6 +99,7 @@ def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
             "gen_time": record_value(record, "gen_time"),
             "pending_time": record_value(record, "pending_time"),
             "word_count": record_value(record, "word_count"),
+            "end_time_ts": record_value(record, "end_time_ts"),
         })
     return normalized
 
@@ -108,6 +116,7 @@ def request_chunk_rows(
             "gen_time": record.get("gen_time"),
             "pending_time": record.get("pending_time"),
             "word_count": record.get("word_count"),
+            "end_time_ts": record.get("end_time_ts"),
         }
         for record in records
     ]
@@ -147,6 +156,9 @@ async def collect_request(
             "queue_stall": None,
             "num_output_tokens": 0,
             "slo_chunk_records": [],
+            "total_pending_time_s": None,
+            "num_pending_intervals": 0,
+            "max_consecutive_pending": 0,
         }
 
     metrics = getattr(last_output, "metrics", None)
@@ -155,19 +167,30 @@ async def collect_request(
         ttft = None
 
     num_gen = getattr(metrics, "num_generation_tokens", 0) if metrics else 0
-    first_ts = getattr(metrics, "first_token_ts", 0.0) if metrics else 0.0
-    last_ts = getattr(metrics, "last_token_ts", 0.0) if metrics else 0.0
+    num_gen = int(num_gen or 0)
+    first_ts = positive_number(getattr(metrics, "first_token_ts", None)) if metrics else None
+    last_ts = positive_number(getattr(metrics, "last_token_ts", None)) if metrics else None
     tpot = None
-    if metrics and num_gen > 1 and last_ts > first_ts > 0:
+    if metrics and num_gen > 1 and last_ts is not None and first_ts is not None:
         tpot = (last_ts - first_ts) / (num_gen - 1)
 
-    queued = getattr(metrics, "queued_ts", 0.0) if metrics else 0.0
-    scheduled = getattr(metrics, "scheduled_ts", 0.0) if metrics else 0.0
+    queued = positive_number(getattr(metrics, "queued_ts", None)) if metrics else None
+    scheduled = positive_number(getattr(metrics, "scheduled_ts", None)) if metrics else None
     queue_stall = (
         scheduled - queued if (queued and scheduled and scheduled >= queued) else None
     )
 
     slo_chunk_records = extract_chunk_records(last_output)
+    sslo_metrics = getattr(last_output, "sslo_metrics", None)
+    total_pending_time_s = (
+        getattr(sslo_metrics, "total_pending_time_s", None) if sslo_metrics else None
+    )
+    num_pending_intervals = (
+        getattr(sslo_metrics, "num_pending_intervals", 0) if sslo_metrics else 0
+    )
+    max_consecutive_pending = (
+        getattr(sslo_metrics, "max_consecutive_pending", 0) if sslo_metrics else 0
+    )
 
     return {
         "request_id": request_id,
@@ -176,8 +199,11 @@ async def collect_request(
         "ttft": ttft,
         "tpot": tpot,
         "queue_stall": queue_stall,
-        "decoding_start_ts": first_ts if first_ts > 0 else None,
+        "decoding_start_ts": first_ts,
         "slo_chunk_records": slo_chunk_records,
+        "total_pending_time_s": total_pending_time_s,
+        "num_pending_intervals": num_pending_intervals,
+        "max_consecutive_pending": max_consecutive_pending,
     }
 
 
