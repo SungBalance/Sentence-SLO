@@ -1,14 +1,16 @@
 # SSLO Scheduler End-to-End Sweep
 
-This experiment compares baseline vLLM scheduling against SSLO scheduling for
+This experiment compares baseline vLLM scheduling against SSLO and adaptive
+SSLO scheduling for
 `Qwen/Qwen3-8B` on the Koala prompt workload. The launcher sweeps
-`max_num_seqs` over `32 64 128 256`; each config runs baseline and SSLO
-back-to-back in separate subprocesses.
+`max_num_seqs` over `32 64 128 256`; each config runs baseline, SSLO, and
+adaptive SSLO back-to-back in separate subprocesses.
 
 ## Scripts
 
-- `run_test.py`: parent runner that launches one config's baseline and SSLO
-  subprocesses, waits for GPU memory cleanup, then writes a per-config summary.
+- `run_test.py`: parent runner that launches one config's baseline, SSLO, and
+  adaptive SSLO subprocesses, waits for GPU memory cleanup, then writes a
+  per-config summary.
 - `run_single.sh <max_num_seqs> <model> [num_prompts=256] [generation_max_tokens=512] [output_root=exp/sslo_test/output]`:
   thin wrapper around `run_test.py` for one config.
 - `run_sweep.sh`: edits constants at the top, then loops `run_single.sh` over a
@@ -23,7 +25,7 @@ Inside the `sk-sslo` container, from `/workspace/mlsys`:
 Single config:
 
 ```bash
-bash exp/sslo_test/run_single.sh 64 "Qwen/Qwen3-8B"
+bash exp/sslo_test/run_single.sh 64 "Qwen/Qwen3-8B" 256 512 exp/sslo_test/output
 ```
 
 Full sweep (uses the values listed in `run_sweep.sh`):
@@ -52,12 +54,16 @@ Each config writes under `exp/sslo_test/output/seqs_{N}/`:
   queue stall, token count, decoding start timestamp, and compact
   `slo_chunk_records`.
 - `sslo_ttft.jsonl`: matching per-request SSLO rows.
+- `sslo_adaptive_ttft.jsonl`: matching per-request adaptive SSLO rows.
 - `baseline_chunks.jsonl`: one baseline chunk row per completed chunk:
   `{request_id, chunk_idx, cumulative_slack, gen_time, pending_time, word_count}`.
 - `sslo_chunks.jsonl`: matching SSLO chunk rows.
+- `sslo_adaptive_chunks.jsonl`: matching adaptive SSLO chunk rows.
 - `sslo_stats.jsonl`: scheduler iteration stats from `SSLO_STATS_LOG_PATH`.
+- `sslo_adaptive_stats.jsonl`: adaptive SSLO scheduler iteration stats from
+  `SSLO_STATS_LOG_PATH`.
 - `summary.json`: machine-readable H1/H2/H3/H4 results for that config.
-- `run_status.json`: baseline and SSLO subprocess exit codes.
+- `run_status.json`: baseline, SSLO, and adaptive SSLO subprocess exit codes.
 
 The sweep also writes `exp/sslo_test/output/sweep_summary.json` and prints a
 side-by-side table.
@@ -73,10 +79,12 @@ side-by-side table.
 
 ## Pass Criteria
 
-- H1: `pending + running > max_num_seqs` at some SSLO scheduler iteration.
-- H2-TTFT: SSLO p50 TTFT is no worse than baseline p50 TTFT for the
+- H1: `pending + running > max_num_seqs` at some scheduler iteration for each
+  SSLO variant.
+- H2-TTFT: each SSLO variant's p50 TTFT is no worse than baseline p50 TTFT for the
   post-cap-arrival cohort, `request_idx >= max_num_seqs`.
-- H3-Slack: SSLO `neg_slack_ratio` is no worse than baseline across all chunks.
+- H3-Slack: each SSLO variant's `neg_slack_ratio` is no worse than baseline
+  across all chunks.
 - H4-TPOT: informational only; reported side-by-side.
 
 When `max_num_seqs=256` and `num_prompts=256`, the run is a control case with no

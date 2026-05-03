@@ -1014,7 +1014,7 @@ class Scheduler(SchedulerInterface):
             r.slo_state is not None and r.slo_state.sslo_score < 0
             for r in new_running
         ):
-            max_num_running_reqs = max(1, max_num_running_reqs/2)
+            max_num_running_reqs = max(1, max_num_running_reqs // 2)
 
         # SSLO: enforce hard cap on len(self.running). vLLM's InputBatch is
         # sized to max_num_seqs and asserts new_req_index < max_num_reqs, so

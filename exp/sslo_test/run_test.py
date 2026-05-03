@@ -6,8 +6,10 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -24,7 +26,11 @@ GPU_READY_BASE_SLEEP_S = 5.0
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-kind", choices=["both", "baseline", "sslo"], default="both")
+    parser.add_argument(
+        "--run-kind",
+        choices=["all", "baseline", "sslo", "sslo_adaptive"],
+        default="all",
+    )
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--dataset-name", default="koala")
     parser.add_argument("--num-prompts", type=int, default=256)
@@ -168,6 +174,15 @@ async def run_one(args: argparse.Namespace) -> None:
             "chunk_gen_estimator": "p99",
             "chunk_gen_p99_window": 100,
         }
+    elif args.run_kind == "sslo_adaptive":
+        sslo_params = {
+            "enabled": True,
+            "adaptive_batch_size": True,
+            "chunk_unit": args.chunk_unit,
+            "seconds_per_word": args.seconds_per_word,
+            "chunk_gen_estimator": "p99",
+            "chunk_gen_p99_window": 100,
+        }
     else:
         sslo_params = {"enabled": False}
 
@@ -262,17 +277,51 @@ def run_child(args: argparse.Namespace, run_kind: str) -> int:
     env = os.environ.copy()
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     env.pop("SSLO_STATS_LOG_PATH", None)
-    if run_kind == "sslo":
-        env["SSLO_STATS_LOG_PATH"] = str(output_dir / "sslo_stats.jsonl")
+    if run_kind in ("sslo", "sslo_adaptive"):
+        env["SSLO_STATS_LOG_PATH"] = str(output_dir / f"{run_kind}_stats.jsonl")
     print(f"Starting {run_kind} subprocess...")
-    return subprocess.run(child_command(args, run_kind), check=False, env=env).returncode
+    with tempfile.TemporaryFile(mode="w+t") as output_file:
+        proc = subprocess.Popen(
+            child_command(args, run_kind),
+            env=env,
+            stdout=output_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        returncode = 1
+        try:
+            returncode = proc.wait()
+        finally:
+            if returncode != 0:
+                terminate_process_group(proc.pid)
+        output_file.seek(0)
+        output = output_file.read()
+        if output:
+            print(output, end="")
+        return returncode
+
+
+def terminate_process_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    time.sleep(1)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def wait_for_gpu_memory_ready() -> None:
+    # Poll the physical GPU index that CUDA_VISIBLE_DEVICES selects (default "0").
+    # If the env var contains multiple devices, just check the first.
+    gpu_index = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0].strip() or "0"
     print(
         "Waiting for GPU cleanup: "
         f"sleep {GPU_READY_BASE_SLEEP_S:.0f}s, then require "
-        f">{GPU_READY_FREE_MEMORY_MIB} MiB free on GPU 0..."
+        f">{GPU_READY_FREE_MEMORY_MIB} MiB free on GPU {gpu_index}..."
     )
     time.sleep(GPU_READY_BASE_SLEEP_S)
     deadline = time.monotonic() + GPU_READY_TIMEOUT_S
@@ -286,7 +335,7 @@ def wait_for_gpu_memory_ready() -> None:
                     "--query-gpu=memory.free",
                     "--format=csv,noheader,nounits",
                     "-i",
-                    "0",
+                    gpu_index,
                 ],
                 text=True,
                 stderr=subprocess.STDOUT,
@@ -310,29 +359,34 @@ def wait_for_gpu_memory_ready() -> None:
     )
 
 
-def run_both(args: argparse.Namespace) -> None:
+def run_all(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    for filename in (
+    for fname in (
         "baseline_ttft.jsonl",
         "baseline_chunks.jsonl",
         "sslo_ttft.jsonl",
         "sslo_chunks.jsonl",
         "sslo_stats.jsonl",
+        "sslo_adaptive_ttft.jsonl",
+        "sslo_adaptive_chunks.jsonl",
+        "sslo_adaptive_stats.jsonl",
         "summary.json",
         "run_status.json",
     ):
-        path = output_dir / filename
+        path = output_dir / fname
         if path.exists():
             path.unlink()
 
-    statuses = {"baseline": run_child(args, "baseline")}
-    wait_for_gpu_memory_ready()
-    if statuses["baseline"] == 0:
-        statuses["sslo"] = run_child(args, "sslo")
-        wait_for_gpu_memory_ready()
-    else:
-        statuses["sslo"] = None
+    statuses: dict[str, int | None] = {}
+    for mode in ("baseline", "sslo", "sslo_adaptive"):
+        if mode != "baseline":
+            wait_for_gpu_memory_ready()
+        statuses[mode] = run_child(args, mode)
+        if statuses[mode] != 0:
+            for remaining in ("sslo", "sslo_adaptive"):
+                statuses.setdefault(remaining, None)
+            break
     (output_dir / "run_status.json").write_text(json.dumps(statuses, indent=2) + "\n")
 
     subprocess.run(
@@ -353,8 +407,8 @@ def run_both(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.run_kind == "both":
-        run_both(args)
+    if args.run_kind == "all":
+        run_all(args)
     else:
         asyncio.run(run_one(args))
 

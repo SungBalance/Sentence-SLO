@@ -237,3 +237,16 @@
   - 64: TTFT 18.2→4.7s (-74%), neg slack 33→32 (-1); **H1/H2/H3 ALL PASS**
   - 128: TTFT 11.5→2.9s (-74%), neg slack 40→40 (0 absolute); H3 ratio FAIL because SSLO produced fewer total chunks
   - 256 (control): SSLO ≈ baseline (no waiting-queue pressure)
+
+## 2026-05-03 (later)
+
+- Added: `sslo_adaptive` run mode in `exp/sslo_test/run_test.py` (sets `adaptive_batch_size=True`); `--run-kind` choices now `[all, baseline, sslo, sslo_adaptive]` and `run_all` runs all three sequentially with GPU cleanup between.
+- Added: `analyze.py` 3-way comparison (separate metrics per SSLO variant).
+- Modified: `run_single.sh` reordered positional args to match script section order (vLLM → Common → SSLO); pinned to GPU 1 via `CUDA_VISIBLE_DEVICES=1` to avoid contention with other containers.
+- Modified: `run_test.py` `wait_for_gpu_memory_ready` polls the GPU index from `CUDA_VISIBLE_DEVICES`.
+- Fixed: scheduler `adaptive_batch_size` branch had `max_num_running_reqs / 2` (float) which broke list slicing in the cap-overflow path. Changed to `// 2`.
+- Verification: pytest 68 PASS (in `sk-sslo`). Smoke + full max_num_seqs=64 / 256 prompts on Qwen3-8B (`sk-sslo-vllm`):
+  - TTFT p50: baseline 18.92s → sslo 4.79s → sslo+adaptive 4.59s
+  - Queue stall p50: 11.71s → 3.34s → 3.14s
+  - TPOT p50: 17.4ms → 58.1ms → 61.0ms
+  - Neg slack chunks: 35/7770 → 34/7678 → **31/7656** (sslo+adaptive best)
