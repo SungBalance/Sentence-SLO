@@ -261,3 +261,14 @@
   - TPOT p50 (ms): 17.28±0.00 → 57.97±0.02 → 60.95±0.05
   - Neg slack: [34,35,34] → [34,34,34] → **[31,31,31]** (sslo+adaptive 100% reproducible at 31)
   - Standard deviations are 1-2 orders of magnitude below the inter-mode gaps → diffs not within error term.
+
+## 2026-05-03 (Poisson arrival)
+
+- Added `--request-rate` (reqs/sec, Poisson arrivals) and `--request-rate-seed` to `run_test.py`.
+  - 0 (default) submits all prompts at t=0 (current behavior).
+  - Positive value samples inter-arrival gaps from `Exp(rate)`.
+  - Each prompt's task `await asyncio.sleep(arrival_offset)` before calling `engine.generate()`.
+- `run_single.sh` accepts `request_rate` and `request_rate_seed` as positional args 6 and 7.
+- `run_repeat.sh` accepts `request_rate` (positional 7) and `base_seed` (8); each run uses `seed = base_seed + i` so the N runs sample different arrival patterns at the same rate.
+- Within one config, all 3 modes (baseline / sslo / sslo_adaptive) share the same seed → identical arrival schedule, apples-to-apples comparison.
+- Smoke verified at rate=4 reqs/s (16 prompts, max_num_seqs=8): all three modes show identical decoding_start_ts spread (~2.3s span, same seed) → arrival timing reproducible.

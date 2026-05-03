@@ -42,6 +42,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-unit", choices=["sentence", "paragraph"], default="sentence")
     parser.add_argument("--seconds-per-word", type=float, default=0.28)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--request-rate",
+        type=float,
+        default=0.0,
+        help="Poisson arrival rate in reqs/sec. 0 (default) submits all prompts at once.",
+    )
+    parser.add_argument(
+        "--request-rate-seed",
+        type=int,
+        default=42,
+        help="Seed for the Poisson inter-arrival sampler (reproducibility).",
+    )
     return parser.parse_args()
 
 
@@ -99,6 +111,19 @@ def request_chunk_rows(
         }
         for record in records
     ]
+
+
+async def collect_request_with_delay(
+    engine: Any,
+    request_idx: int,
+    prompt: str,
+    sampling_params: Any,
+    arrival_offset_s: float,
+) -> dict[str, Any]:
+    """Sleep until the prompt's scheduled arrival, then collect."""
+    if arrival_offset_s > 0:
+        await asyncio.sleep(arrival_offset_s)
+    return await collect_request(engine, request_idx, prompt, sampling_params)
 
 
 async def collect_request(
@@ -201,10 +226,27 @@ async def run_one(args: argparse.Namespace) -> None:
         temperature=0.0,
     )
 
+    # Generate Poisson inter-arrival offsets relative to t0.
+    import random as _random
+    rate = args.request_rate
+    rng = _random.Random(args.request_rate_seed)
+    arrival_offsets: list[float] = []
+    cur = 0.0
+    for _ in prompts:
+        arrival_offsets.append(cur)
+        if rate > 0:
+            cur += rng.expovariate(rate)
+    if rate > 0:
+        print(
+            f"{args.run_kind}: Poisson arrivals at {rate} req/s, "
+            f"last_offset={arrival_offsets[-1]:.2f}s, seed={args.request_rate_seed}"
+        )
+
     try:
         t0 = time.monotonic()
         tasks = [
-            asyncio.create_task(collect_request(engine, i, prompt, sampling_params))
+            asyncio.create_task(collect_request_with_delay(
+                engine, i, prompt, sampling_params, arrival_offsets[i]))
             for i, prompt in enumerate(prompts)
         ]
         rows = await asyncio.gather(*tasks)
@@ -269,6 +311,10 @@ def child_command(args: argparse.Namespace, run_kind: str) -> list[str]:
         str(args.seconds_per_word),
         "--output-dir",
         args.output_dir,
+        "--request-rate",
+        str(args.request_rate),
+        "--request-rate-seed",
+        str(args.request_rate_seed),
     ]
 
 
