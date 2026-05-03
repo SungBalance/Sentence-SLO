@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-import json
 from collections import Counter
+from pathlib import Path
+import sys
 
-def load(path):
-    with open(path) as f:
-        return [json.loads(l) for l in f]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from jsonl_utils import read_jsonl
 
-base_chunks = load("/workspace/mlsys/exp/sslo_test/output/seqs_64/baseline_chunks.jsonl")
-sslo_chunks = load("/workspace/mlsys/exp/sslo_test/output/seqs_64/sslo_chunks.jsonl")
-base_ttft = load("/workspace/mlsys/exp/sslo_test/output/seqs_64/baseline_ttft.jsonl")
-sslo_ttft = load("/workspace/mlsys/exp/sslo_test/output/seqs_64/sslo_ttft.jsonl")
+
+OUTPUT_ROOT = Path("/workspace/mlsys/exp/sslo_test/output")
+CONFIG_DIR = OUTPUT_ROOT / "seqs_64"
+BASELINE_CHUNKS = "baseline_chunks.jsonl"
+SSLO_CHUNKS = "sslo_chunks.jsonl"
+BASELINE_TTFT = "baseline_ttft.jsonl"
+SSLO_TTFT = "sslo_ttft.jsonl"
+
+base_chunks = read_jsonl(CONFIG_DIR / BASELINE_CHUNKS)
+sslo_chunks = read_jsonl(CONFIG_DIR / SSLO_CHUNKS)
+base_ttft = read_jsonl(CONFIG_DIR / BASELINE_TTFT)
+sslo_ttft = read_jsonl(CONFIG_DIR / SSLO_TTFT)
 
 
 def analyze(label, chunks, ttft):
@@ -56,10 +64,12 @@ def analyze(label, chunks, ttft):
             print(f"  Position fraction (idx/max_idx): p25={positions[len(positions)//4]:.2f} p50={positions[len(positions)//2]:.2f} p75={positions[3*len(positions)//4]:.2f}")
 
     # cutoff at max_tokens
-    cutoff_at_max = sum(1 for r in ttft if r["num_tokens"] == 512)
+    cutoff_at_max = sum(1 for r in ttft if r["num_output_tokens"] == 512)
     print(f"Reqs at max_tokens (512): {cutoff_at_max}/{len(ttft)}")
     if cutoff_at_max and neg:
-        cutoff_ids = {str(r["request_id"]) for r in ttft if r["num_tokens"] == 512}
+        cutoff_ids = {
+            str(r["request_id"]) for r in ttft if r["num_output_tokens"] == 512
+        }
         neg_in_cutoff = sum(1 for c in neg if c["request_id"] in cutoff_ids)
         print(f"  neg chunks in cutoff reqs: {neg_in_cutoff}/{len(neg)} ({neg_in_cutoff/len(neg)*100:.0f}%)")
 

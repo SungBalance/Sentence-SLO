@@ -220,3 +220,20 @@
 - Modified: Refactored SSLO chunk-generation timing from private EMA fields into `ChunkGenerationEstimator`, wired scheduler redistribution through the estimator, and configured `exp/sslo_test/run_test.py` to use p99 with window 100.
 - Added: Added EMA and percentile chunk-generation estimators plus SSLO config fields/tests for estimator selection.
 - Debugging/verification: In `sk-sslo`, `python3 -m pytest tests/sslo/ -v 2>&1 | tail -40` passed (`63 passed, 16 warnings`) and `compileall` passed. The `max_num_seqs=64` sweep completed: H1 PASS, H2 PASS, H3 FAIL; TTFT p50 18.51s -> 1.85s, negative-slack chunks baseline 33/7890 vs SSLO 50/7654.
+
+## 2026-05-03 (continued)
+
+- Modified: Refactored `exp/sslo_test/run_test.py` per-request collection to use engine-internal `RequestOutput.metrics` for TTFT, TPOT, queue stall, token count, and decoding start; removed client-side wall-clock timing fields. Updated `exp/sslo_test/analyze.py`, `exp/sslo_test/analysis/analyze_negslack.py`, `exp/sslo_test/README.md`, and `exp/sslo_test/run_test.sh`.
+- Added: Shared `exp/sslo_test/jsonl_utils.py` JSONL reader and `exp/sslo_test/analysis/README.md` documenting final-output `slo_chunk_records` and `sslo_metrics` (`SsloRequestStats`) flow.
+- Debugging/verification: In `sk-sslo`, compileall passed for changed experiment Python files; `python3 -m pytest tests/sslo/ 2>&1 | tail -5` passed (`68 passed, 16 warnings`). Smoke baseline run wrote `/tmp/sslo_smoke/baseline_ttft.jsonl` with populated engine metrics (`ttft=0.0661`, `tpot=0.01213`, `queue_stall=0.000009` for request 0). Full sweep completed for max_num_seqs 32/64/128/256 with `run_complete=true`; neg-slack chunk deltas were +4, -1, +0, +0 respectively.
+
+## 2026-05-03 (continued)
+
+- Refactored: pending in/out decision encapsulated inside `RequestSLOState.should_enter_pending(now)` / `should_exit_pending(now)`. Scheduler now only handles system-level guards (max_consec, waiting-empty, cap enforcement) and delegates per-request slack/EMA logic to the state object. Hysteresis factors (`pending_enter_factor=2.5`, `pending_exit_factor=2.0`) and warmup (`pending_warmup_chunks=5`) configurable via `SsloConfig`.
+- Added: `ChunkGenerationEstimator` Protocol with `EmaChunkGenerationEstimator` and `PercentileChunkGenerationEstimator` (p99). Selectable via `SsloConfig.chunk_gen_estimator` ("ema"/"p99"). Estimator exposes `n_samples` for warmup checks.
+- Modified: `exp/sslo_test/run_test.py` now reads engine-internal metrics (`output.metrics.first_token_latency` for TTFT, derived from `last_token_ts - first_token_ts` for TPOT) instead of client wall-clock measurements. Removed `t_submit`/`t_first_token`/`t_finish` fields. Added `exp/sslo_test/jsonl_utils.py` shared helper. Added `exp/sslo_test/analysis/` folder for ad-hoc post-hoc scripts.
+- Verification: pytest 68 PASS. Full sweep (`max_num_seqs ∈ {32,64,128,256}`) on Qwen3-8B / 256 koala prompts:
+  - 32: TTFT 28.6→11.9s (-58%), neg slack 25→29 (+4); H3 FAIL
+  - 64: TTFT 18.2→4.7s (-74%), neg slack 33→32 (-1); **H1/H2/H3 ALL PASS**
+  - 128: TTFT 11.5→2.9s (-74%), neg slack 40→40 (0 absolute); H3 ratio FAIL because SSLO produced fewer total chunks
+  - 256 (control): SSLO ≈ baseline (no waiting-queue pressure)

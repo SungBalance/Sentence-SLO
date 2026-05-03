@@ -1,0 +1,107 @@
+{
+  "max_num_seqs": 128,
+  "control_case": false,
+  "h1_pending_plus_running_exceeds_cap": true,
+  "h1_note": null,
+  "h1_max_combined": 256,
+  "h1_iterations_above_cap": 954,
+  "h2_ttft_p50_baseline": 11.464776396751404,
+  "h2_ttft_p50_sslo": 2.949127197265625,
+  "h2_ttft_p50_pct_change": -74.27662699028937,
+  "h2_ttft_p90_baseline": 11.538919138908387,
+  "h2_ttft_p90_sslo": 4.071693181991577,
+  "h2_ttft_cohort": "post_cap_arrivals",
+  "h2_ttft_count_baseline": 128,
+  "h2_ttft_count_sslo": 128,
+  "h2_ttft_p50_not_worse": true,
+  "h3_slack_neg_ratio_baseline": 0.005153975003221235,
+  "h3_slack_neg_ratio_sslo": 0.005360493165371214,
+  "h3_slack_neg_ratio_not_worse": false,
+  "h4_tpot_p50_baseline": 0.020497656943333026,
+  "h4_tpot_p50_sslo": 0.03676064293070672,
+  "h4_tpot_p50_pct_change": 79.34070724441177,
+  "queue_stall_p50_baseline": 5.685712050530128,
+  "queue_stall_p50_sslo": 1.0863826875574887,
+  "queue_stall_p90_baseline": 11.425176593009382,
+  "queue_stall_p90_sslo": 3.578603047411889,
+  "queue_stall_p50_pct_change": -80.89275929025995,
+  "ttft": {
+    "baseline_all": {
+      "count": 256,
+      "mean": 5.975166803225875,
+      "p50": 5.78826904296875,
+      "p90": 11.523707628250122,
+      "p99": 11.559750318527222
+    },
+    "sslo_all": {
+      "count": 256,
+      "mean": 1.739821307361126,
+      "p50": 1.1854969263076782,
+      "p90": 3.675643801689148,
+      "p99": 4.202285861968994
+    },
+    "baseline_h2": {
+      "count": 128,
+      "mean": 11.39550300873816,
+      "p50": 11.464776396751404,
+      "p90": 11.538919138908387,
+      "p99": 11.56018539428711
+    },
+    "sslo_h2": {
+      "count": 128,
+      "mean": 2.9248899091035128,
+      "p50": 2.949127197265625,
+      "p90": 4.071693181991577,
+      "p99": 4.26504673242569
+    }
+  },
+  "tpot": {
+    "baseline": {
+      "count": 256,
+      "mean": 0.020540886068526398,
+      "p50": 0.020497656943333026,
+      "p90": 0.02132285117315686
+    },
+    "sslo": {
+      "count": 256,
+      "mean": 0.035830540693587584,
+      "p50": 0.03676064293070672,
+      "p90": 0.04080011469192972
+    }
+  },
+  "queue_stall": {
+    "baseline": {
+      "count": 256,
+      "p50": 5.685712050530128,
+      "p90": 11.425176593009382
+    },
+    "sslo": {
+      "count": 256,
+      "p50": 1.0863826875574887,
+      "p90": 3.578603047411889
+    },
+    "available": true
+  },
+  "slack": {
+    "baseline": {
+      "count": 7761,
+      "neg_slack_ratio": 0.005153975003221235,
+      "p5": 1.8887285490054637,
+      "p50": 47.57426554709673,
+      "p95": 100.53205507411622
+    },
+    "sslo": {
+      "count": 7462,
+      "neg_slack_ratio": 0.005360493165371214,
+      "p5": 1.7022643661126495,
+      "p50": 43.85353210999165,
+      "p95": 90.68062487768475
+    }
+  },
+  "run_complete": true,
+  "missing_files": [],
+  "run_status": {
+    "baseline": 0,
+    "sslo": 0
+  }
+}

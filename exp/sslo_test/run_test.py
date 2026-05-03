@@ -56,10 +56,6 @@ def load_workload(dataset_name: str, num_prompts: int) -> list[str]:
     return repeated[:num_prompts]
 
 
-def output_token_count(request_output: Any) -> int:
-    return sum(len(output.token_ids or []) for output in request_output.outputs or [])
-
-
 def record_value(record: Any, key: str) -> Any:
     if isinstance(record, dict):
         return record.get(key)
@@ -106,44 +102,50 @@ async def collect_request(
     sampling_params: Any,
 ) -> dict[str, Any]:
     request_id = str(request_idx)
-    t_submit = time.monotonic()
-    t_first_token: float | None = None
     last_output = None
 
     async for output in engine.generate(prompt, sampling_params, request_id=request_id):
         last_output = output
-        if t_first_token is None and output_token_count(output) > 0:
-            t_first_token = time.monotonic()
 
-    t_finish = time.monotonic()
-    num_tokens = output_token_count(last_output) if last_output is not None else 0
-    metrics = getattr(last_output, 'metrics', None) if last_output is not None else None
-    queue_stall = None
-    first_token_ts = None
-    if metrics is not None:
-        queued = getattr(metrics, 'queued_ts', None)
-        scheduled = getattr(metrics, 'scheduled_ts', None)
-        first_token_ts = getattr(metrics, 'first_token_ts', None)
-        if queued and scheduled and scheduled >= queued:
-            queue_stall = scheduled - queued
-    slo_chunk_records = (
-        extract_chunk_records(last_output) if last_output is not None else []
-    )
+    if last_output is None:
+        return {
+            "request_id": request_id,
+            "request_idx": request_idx,
+            "ttft": None,
+            "tpot": None,
+            "queue_stall": None,
+            "num_output_tokens": 0,
+            "slo_chunk_records": [],
+        }
+
+    metrics = getattr(last_output, "metrics", None)
+    ttft = getattr(metrics, "first_token_latency", None) if metrics else None
+    if ttft == 0.0:
+        ttft = None
+
+    num_gen = getattr(metrics, "num_generation_tokens", 0) if metrics else 0
+    first_ts = getattr(metrics, "first_token_ts", 0.0) if metrics else 0.0
+    last_ts = getattr(metrics, "last_token_ts", 0.0) if metrics else 0.0
     tpot = None
-    if t_first_token is not None:
-        tpot = (t_finish - t_first_token) / max(1, num_tokens - 1)
+    if metrics and num_gen > 1 and last_ts > first_ts > 0:
+        tpot = (last_ts - first_ts) / (num_gen - 1)
+
+    queued = getattr(metrics, "queued_ts", 0.0) if metrics else 0.0
+    scheduled = getattr(metrics, "scheduled_ts", 0.0) if metrics else 0.0
+    queue_stall = (
+        scheduled - queued if (queued and scheduled and scheduled >= queued) else None
+    )
+
+    slo_chunk_records = extract_chunk_records(last_output)
+
     return {
         "request_id": request_id,
         "request_idx": request_idx,
-        "t_submit": t_submit,
-        "t_first_token": t_first_token,
-        "ttft": (t_first_token - t_submit) if t_first_token is not None else None,
-        "t_finish": t_finish,
-        "num_tokens": num_tokens,
-        "num_output_tokens": num_tokens,
+        "num_output_tokens": num_gen,
+        "ttft": ttft,
         "tpot": tpot,
         "queue_stall": queue_stall,
-        "decoding_start_ts": first_token_ts,
+        "decoding_start_ts": first_ts if first_ts > 0 else None,
         "slo_chunk_records": slo_chunk_records,
     }
 

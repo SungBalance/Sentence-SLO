@@ -45,8 +45,9 @@ python3 exp/sslo_test/run_test.py \
 
 Each config writes under `exp/sslo_test/output/seqs_{N}/`:
 
-- `baseline_ttft.jsonl`: per-request baseline rows with TTFT, TPOT, token count,
-  timestamps, and compact `slo_chunk_records`.
+- `baseline_ttft.jsonl`: per-request baseline rows with engine TTFT, TPOT,
+  queue stall, token count, decoding start timestamp, and compact
+  `slo_chunk_records`.
 - `sslo_ttft.jsonl`: matching per-request SSLO rows.
 - `baseline_chunks.jsonl`: one baseline chunk row per completed chunk:
   `{request_id, chunk_idx, cumulative_slack, gen_time, pending_time, word_count}`.
@@ -60,8 +61,10 @@ side-by-side table.
 
 ## Metrics
 
-- TTFT: `t_first_token - t_submit`.
-- TPOT: `(t_finish - t_first_token) / max(1, num_output_tokens - 1)`.
+- TTFT: `output.metrics.first_token_latency` from the vLLM engine.
+- TPOT: `(last_token_ts - first_token_ts) / (num_generation_tokens - 1)` from
+  `output.metrics` when at least two generation tokens are available.
+- Queue stall: `output.metrics.scheduled_ts - output.metrics.queued_ts`.
 - Chunk slack: `cumulative_slack` from `output.slo_chunk_records`.
 - `neg_slack_ratio`: `count(cumulative_slack < 0) / total_chunks`.
 

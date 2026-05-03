@@ -6,10 +6,11 @@
 
 **Architecture:**
 - A new `SsloConfig` dataclass (`vllm/vllm/sslo/config.py`) is added to `VllmConfig` and flows through `EngineArgs.sslo_params` → `create_engine_config()` → `OutputProcessor` and `EngineCore`.
-- `RequestSLOState` gains: `sslo_score` property, EMA gen-time tracking, `on_pending_enter/exit` callbacks, `is_pending_eligible` property.
-- **Both client (OutputProcessor) and engine (EngineCore) hold a full `RequestSLOState`** built by the same `build_slo_state(sslo_config)` factory. The IPC payload changes from "computed `cumulative_slack`" to raw "`(text_delta, timestamp)`" — both sides compute slack independently from the same materials.
+- `RequestSLOState` owns the per-request pending decision via two methods: `should_enter_pending(now)` and `should_exit_pending(now)`. Hysteresis (configurable enter/exit factors with default 2.5×/2.0× of estimated chunk gen time), warmup guard (no pending until `pending_warmup_chunks` samples are collected), and a predicted-finish-time exit guard are all encapsulated here.
+- Chunk-generation prediction is a pluggable `ChunkGenerationEstimator` Protocol with two implementations: `EmaChunkGenerationEstimator` (exponential moving average) and `PercentileChunkGenerationEstimator` (sliding-window p99). Selectable via `SsloConfig.chunk_gen_estimator`.
+- **Both client (OutputProcessor) and engine (EngineCore) hold a full `RequestSLOState`** built by the same `build_slo_state(sslo_config)` factory. The IPC payload is raw `(text_delta, timestamp)` — both sides compute slack independently from the same materials.
 - The engine-side `slo_state` additionally receives `on_pending_enter` / `on_pending_exit` callbacks from the scheduler so its EMA tracks **pure** gen-time excluding pending intervals.
-- SSLO scheduling lives entirely in a new `Scheduler.schedule_sslo()` (copy of `schedule()` with SSLO additions); `schedule()` is untouched. `Scheduler.__init__` patches `self.schedule = self.schedule_sslo` when `sslo_config.enabled=True`.
+- SSLO scheduling lives entirely in a new `Scheduler.schedule_sslo()` (copy of `schedule()` with SSLO additions); `schedule()` is untouched. `Scheduler.__init__` patches `self.schedule = self.schedule_sslo` when `sslo_config.enabled=True`. The scheduler-side decision logic is minimal — it delegates per-request choices to `slo_state.should_{enter,exit}_pending(now)` and only adds system-level guards (max_consecutive_pending, waiting-queue-empty short-circuit, max_num_seqs cap enforcement post-redistribution).
 - `self.sslo_pending: list[Request]` holds high-slack requests whose KV blocks remain on GPU but who do not consume compute budget. No recompute on resume.
 
 **Tech Stack:** Python 3 dataclasses, Pydantic (VllmConfig), vLLM v1 scheduler (`vllm/vllm/v1/core/sched/scheduler.py`), pytest (unit tests in `vllm/tests/sslo/`).

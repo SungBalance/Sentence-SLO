@@ -8,16 +8,23 @@ import statistics
 from pathlib import Path
 from typing import Any
 
+from jsonl_utils import read_jsonl
 
 MAX_NUM_SEQS = 64
+DEFAULT_OUTPUT_DIR = "exp/sslo_test/output"
 SWEEP_OUTPUT = "sweep_summary.json"
+BASELINE_TTFT = "baseline_ttft.jsonl"
+BASELINE_CHUNKS = "baseline_chunks.jsonl"
+SSLO_TTFT = "sslo_ttft.jsonl"
+SSLO_CHUNKS = "sslo_chunks.jsonl"
+SSLO_STATS = "sslo_stats.jsonl"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output-dir",
-        default="exp/sslo_test/output",
+        default=DEFAULT_OUTPUT_DIR,
         help="Directory containing per-run JSONL files for one config.",
     )
     parser.add_argument("--max-num-seqs", type=int, default=MAX_NUM_SEQS)
@@ -26,18 +33,6 @@ def parse_args() -> argparse.Namespace:
         help="Aggregate output/seqs_*/summary.json files under this directory.",
     )
     return parser.parse_args()
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -163,20 +158,20 @@ def control_case(max_num_seqs: int, baseline_rows: list[dict[str, Any]]) -> bool
 
 
 def analyze(output_dir: Path, max_num_seqs: int) -> dict[str, Any]:
-    baseline_rows = read_jsonl(output_dir / "baseline_ttft.jsonl")
-    sslo_rows = read_jsonl(output_dir / "sslo_ttft.jsonl")
-    baseline_chunks = read_jsonl(output_dir / "baseline_chunks.jsonl")
-    sslo_chunks = read_jsonl(output_dir / "sslo_chunks.jsonl")
-    stats_rows = read_jsonl(output_dir / "sslo_stats.jsonl")
+    baseline_rows = read_jsonl(output_dir / BASELINE_TTFT)
+    sslo_rows = read_jsonl(output_dir / SSLO_TTFT)
+    baseline_chunks = read_jsonl(output_dir / BASELINE_CHUNKS)
+    sslo_chunks = read_jsonl(output_dir / SSLO_CHUNKS)
+    stats_rows = read_jsonl(output_dir / SSLO_STATS)
     run_status = read_json(output_dir / "run_status.json")
     missing_files = [
         name
         for name in (
-            "baseline_ttft.jsonl",
-            "baseline_chunks.jsonl",
-            "sslo_ttft.jsonl",
-            "sslo_chunks.jsonl",
-            "sslo_stats.jsonl",
+            BASELINE_TTFT,
+            BASELINE_CHUNKS,
+            SSLO_TTFT,
+            SSLO_CHUNKS,
+            SSLO_STATS,
         )
         if not (output_dir / name).exists()
     ]
