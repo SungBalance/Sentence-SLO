@@ -9,36 +9,39 @@ back-to-back in separate subprocesses.
 
 - `run_test.py`: parent runner that launches one config's baseline and SSLO
   subprocesses, waits for GPU memory cleanup, then writes a per-config summary.
-- `run_test.sh`: no-argument full sweep launcher with the model, workload, cache,
-  and GPU memory constants.
+- `run_single.sh <max_num_seqs> <model> [num_prompts=256] [generation_max_tokens=512] [output_root=exp/sslo_test/output]`:
+  thin wrapper around `run_test.py` for one config.
+- `run_sweep.sh`: edits constants at the top, then loops `run_single.sh` over a
+  list of `max_num_seqs` values and finally calls `analyze.py --sweep-root`.
 - `analyze.py`: reads per-request latency rows, chunk slack rows, and scheduler
   stats; writes per-config `summary.json` or top-level `sweep_summary.json`.
 
 ## Run
 
-Run from the repository root inside the `sk-sslo` container:
+Inside the `sk-sslo` container, from `/workspace/mlsys`:
+
+Single config:
 
 ```bash
-HF_HOME=/cache HF_HUB_CACHE=/cache/hub FLASHINFER_DISABLE_VERSION_CHECK=1 \
-bash exp/sslo_test/run_test.sh
+bash exp/sslo_test/run_single.sh 64 "Qwen/Qwen3-8B"
 ```
 
-The requested host-side invocation is:
+Full sweep (uses the values listed in `run_sweep.sh`):
 
 ```bash
-docker exec sk-sslo bash -lc \
-  'cd /workspace/mlsys && timeout 3000 bash exp/sslo_test/run_test.sh 2>&1 | tail -80'
+bash exp/sslo_test/run_sweep.sh
 ```
 
-For a smaller harness check, call `run_test.py` directly with reduced constants:
+Host-side invocation:
 
 ```bash
-HF_HOME=/cache HF_HUB_CACHE=/cache/hub FLASHINFER_DISABLE_VERSION_CHECK=1 \
-python3 exp/sslo_test/run_test.py \
-  --num-prompts 16 \
-  --max-num-seqs 8 \
-  --generation-max-tokens 128 \
-  --output-dir exp/sslo_test/output_smoke
+docker exec sk-sslo bash -lc 'cd /workspace/mlsys && bash exp/sslo_test/run_sweep.sh 2>&1 | tail -40'
+```
+
+For a smaller harness check, call `run_single.sh` with reduced sizes:
+
+```bash
+bash exp/sslo_test/run_single.sh 8 "Qwen/Qwen3-8B" 16 128 exp/sslo_test/output_smoke
 ```
 
 ## Output Layout
