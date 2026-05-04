@@ -55,9 +55,6 @@ exp/sslo_test/output_sweep/
 exp/sslo_test/output_smoke/
 
 # Local model/data artifacts
-cache/
-models/
-checkpoints/
 *.pt
 *.pth
 *.safetensors
