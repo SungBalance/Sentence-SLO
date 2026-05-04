@@ -23,6 +23,8 @@ class TestSsloConfig:
         assert cfg.ema_alpha == 0.2
         assert cfg.chunk_gen_estimator == "ema"
         assert cfg.chunk_gen_p99_window == 100
+        assert cfg.pending_pressure_lambda == 0.05
+        assert cfg.pending_hysteresis_gap == 0.5
 
     def test_invalid_chunk_unit_raises(self):
         with pytest.raises(ValueError, match="chunk_unit"):
@@ -62,4 +64,3 @@ class TestBuildSloState:
             state.chunk_gen_estimator,
             PercentileChunkGenerationEstimator,
         )
-

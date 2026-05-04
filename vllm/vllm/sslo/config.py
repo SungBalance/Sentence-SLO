@@ -22,6 +22,8 @@ class SsloConfig:
     chunk_gen_estimator: str = "ema"
     chunk_gen_p99_window: int = 100
     pending_warmup_chunks: int = 5
+    pending_pressure_lambda: float = 0.05
+    pending_hysteresis_gap: float = 0.5
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
@@ -66,4 +68,6 @@ def build_slo_state(config: SsloConfig) -> "RequestSLOState":
         ema_alpha=config.ema_alpha,
         chunk_gen_estimator=cge,
         pending_warmup_chunks=config.pending_warmup_chunks,
+        pending_pressure_lambda=config.pending_pressure_lambda,
+        pending_hysteresis_gap=config.pending_hysteresis_gap,
     )
