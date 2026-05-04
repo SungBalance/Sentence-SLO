@@ -983,6 +983,8 @@ class Scheduler(SchedulerInterface):
         new_running = []
         new_pending = []
         prev_pending_ids = {r.request_id for r in self.sslo_pending}
+        # SSLO
+        prev_pending_count = len(self.sslo_pending)
         for req in combined:
             was_pending = req.request_id in prev_pending_ids
             consec = self.sslo_consecutive_pending.get(req.request_id, 0)
@@ -994,9 +996,11 @@ class Scheduler(SchedulerInterface):
             elif slo_state is None or len(self.waiting) == 0:
                 eligible = False
             elif was_pending:
-                eligible = not slo_state.should_exit_pending(now)
+                eligible = not slo_state.should_exit_pending(
+                    now, prev_pending_count)
             else:
-                eligible = slo_state.should_enter_pending(now)
+                eligible = slo_state.should_enter_pending(
+                    now, prev_pending_count)
             if eligible:
                 if not was_pending and req.slo_state is not None:
                     req.slo_state.on_pending_enter(now)
@@ -1274,9 +1278,19 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
+            # SSLO
+            now_sslo = time.monotonic()
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # SSLO: use local cap (strict; redistribution above clamps len(running) to cap)
                 if len(self.running) >= max_num_running_reqs:
+                    break
+                # SSLO
+                if self.sslo_config.enabled and any(
+                    r.slo_state is not None
+                    and r.slo_state.should_exit_pending(
+                        now_sslo, len(self.sslo_pending))
+                    for r in self.sslo_pending
+                ):
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()

@@ -266,7 +266,8 @@ class RequestSLOState:
         chunk_gen_estimator: ChunkGenerationEstimator | None = None,
         pending_warmup_chunks: int = 5,
         pending_enter_factor: float = 2.5,
-        pending_exit_factor: float = 2.0,
+        pending_pressure_lambda: float = 0.0,
+        pending_hysteresis_gap: float = 0.5,
     ) -> None:
         self._estimator: ConsumeEstimator = (
             estimator if estimator is not None else WordRateEstimator()
@@ -283,7 +284,8 @@ class RequestSLOState:
         self._chunk_records: list[SLOChunkRecord] = []
         self._pending_warmup_chunks: int = pending_warmup_chunks
         self._pending_enter_factor: float = pending_enter_factor
-        self._pending_exit_factor: float = pending_exit_factor
+        self._pending_pressure_lambda: float = pending_pressure_lambda
+        self._pending_hysteresis_gap: float = pending_hysteresis_gap
         self._chunk_gen_estimator = (
             chunk_gen_estimator
             if chunk_gen_estimator is not None
@@ -390,12 +392,12 @@ class RequestSLOState:
         remaining = max(0.0, word_count_est - self.current_chunk_word_count)
         return remaining * per_token
 
-    def should_enter_pending(self, now: float) -> bool:
+    def should_enter_pending(self, now: float, pending_count: int = 0) -> bool:
         """True if a currently-running request should move to pending.
 
         Conditions (all required):
         - estimator has at least pending_warmup_chunks samples
-        - realtime_slack > pending_enter_factor × estimator.gen_time
+        - realtime_slack > effective enter factor × estimator.gen_time
         """
         estimator = self._chunk_gen_estimator
         if estimator.n_samples < self._pending_warmup_chunks:
@@ -406,14 +408,18 @@ class RequestSLOState:
         slack = self._realtime_slack(now)
         if slack is None:
             return False
-        return slack > self._pending_enter_factor * gen_time
+        effective_factor = (
+            self._pending_enter_factor
+            + self._pending_pressure_lambda * pending_count
+        )
+        return slack > effective_factor * gen_time
 
-    def should_exit_pending(self, now: float) -> bool:
+    def should_exit_pending(self, now: float, pending_count: int = 0) -> bool:
         """True if a currently-pending request should move back to running.
 
         Conditions (any one):
         - estimator no longer has data (shouldn't normally happen)
-        - realtime_slack ≤ pending_exit_factor × estimator.gen_time
+        - realtime_slack ≤ effective exit factor × estimator.gen_time
         - realtime_slack + 1 token margin ≤ predicted time to finish current chunk
         """
         estimator = self._chunk_gen_estimator
@@ -424,8 +430,13 @@ class RequestSLOState:
         slack = self._realtime_slack(now)
         if slack is None:
             return True
+        effective_enter = (
+            self._pending_enter_factor
+            + self._pending_pressure_lambda * pending_count
+        )
+        effective_exit = effective_enter - self._pending_hysteresis_gap
         # Hysteresis: low-bar exit
-        if slack <= self._pending_exit_factor * gen_time:
+        if slack <= effective_exit * gen_time:
             return True
         # Predicted-finish guard: current chunk's remaining time exceeds slack
         finish = self._predicted_finish_time()

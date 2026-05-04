@@ -387,8 +387,8 @@ class TestShouldExitPending:
         state = RequestSLOState()
         assert state.should_exit_pending(now=0.0) is True
 
-    def test_true_when_realtime_slack_below_exit_factor(self):
-        state = RequestSLOState(pending_exit_factor=2.0)
+    def test_true_when_realtime_slack_below_effective_exit_factor(self):
+        state = RequestSLOState()
         for _ in range(3):
             state.chunk_gen_estimator.update(pure_gen_time=1.0, word_count=2)
         state._decoding_start = 100.0
@@ -396,8 +396,8 @@ class TestShouldExitPending:
         # realtime_slack = 1.5; threshold = 2.0 → exit
         assert state.should_exit_pending(now=108.5) is True
 
-    def test_false_when_realtime_slack_above_exit_factor(self):
-        state = RequestSLOState(pending_exit_factor=2.0)
+    def test_false_when_realtime_slack_above_effective_exit_factor(self):
+        state = RequestSLOState()
         for _ in range(3):
             state.chunk_gen_estimator.update(pure_gen_time=1.0, word_count=2)
         state._decoding_start = 100.0
@@ -406,9 +406,9 @@ class TestShouldExitPending:
         assert state.should_exit_pending(now=105.0) is False
 
     def test_predicted_finish_guard_forces_exit(self):
-        # gen_time=1.0, per_token=0.1, word_count=10. Set exit factor very low
-        # so the predicted-finish guard is the deciding rule.
-        state = RequestSLOState(pending_exit_factor=0.1)
+        # gen_time=1.0, per_token=0.1, word_count=10. Set effective exit
+        # factor very low so the predicted-finish guard is the deciding rule.
+        state = RequestSLOState(pending_hysteresis_gap=2.4)
         for _ in range(5):
             state.chunk_gen_estimator.update(pure_gen_time=1.0, word_count=10)
         state._decoding_start = 100.0
