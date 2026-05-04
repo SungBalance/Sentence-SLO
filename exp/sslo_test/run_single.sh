@@ -7,9 +7,12 @@
 # and sslo_config.adaptive_batch_size.
 #
 # Usage:
-#   run_single.sh <max_num_seqs> <model> [num_prompts=256] [generation_max_tokens=512] [output_root=exp/sslo_test/output] [request_rate=0] [request_rate_seed=42]
+#   run_single.sh <max_num_seqs> <model> [num_prompts=256] [generation_max_tokens=512] [output_root=exp/sslo_test/output] [request_rate=0] [request_rate_seed=42] [modes=...] [tensor_parallel_size=1]
 #
 # request_rate: Poisson arrival rate in reqs/sec. 0 (default) submits all at once.
+# modes: comma-separated subset of {baseline,sslo,sslo_offload,sslo_adaptive,sslo_adaptive_offload}.
+#        Default: all 5. Env var SSLO_MODES is also honored as fallback.
+# tensor_parallel_size: vLLM TP. Default 1.
 #
 # Optional env vars:
 #   SSLO_KV_OFFLOAD_EXTRA  JSON dict for OffloadingConnector tuning.
@@ -28,7 +31,7 @@ fi
 MAX_NUM_SEQS="$1"
 MODEL="$2"
 MAX_MODEL_LEN=8192
-TENSOR_PARALLEL_SIZE=1
+TENSOR_PARALLEL_SIZE="${9:-1}"
 # GPU memory utilization — overridable via env var since shared GPUs may be busy.
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 
@@ -38,6 +41,7 @@ GENERATION_MAX_TOKENS="${4:-512}"
 OUTPUT_ROOT="${5:-exp/sslo_test/output}"
 REQUEST_RATE="${6:-0}"
 REQUEST_RATE_SEED="${7:-42}"
+MODES_ARG="${8:-${SSLO_MODES:-baseline,sslo,sslo_offload,sslo_adaptive,sslo_adaptive_offload}}"
 DATASET_NAME="koala"
 
 # === SSLO args ===
@@ -56,8 +60,8 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 # cpu_bytes_to_use is REQUIRED by CPUOffloadingSpec; default 16 GiB.
 export SSLO_KV_OFFLOAD_EXTRA="${SSLO_KV_OFFLOAD_EXTRA:-{\"cpu_bytes_to_use\": 17179869184}}"
 
-echo "[run_single] max_num_seqs=${MAX_NUM_SEQS} model=${MODEL} num_prompts=${NUM_PROMPTS} max_tokens=${GENERATION_MAX_TOKENS} request_rate=${REQUEST_RATE} (seed=${REQUEST_RATE_SEED})"
-echo "[run_single] modes=baseline,sslo,sslo_offload,sslo_adaptive,sslo_adaptive_offload  kv_offload_extra=${SSLO_KV_OFFLOAD_EXTRA}"
+echo "[run_single] max_num_seqs=${MAX_NUM_SEQS} model=${MODEL} num_prompts=${NUM_PROMPTS} max_tokens=${GENERATION_MAX_TOKENS} request_rate=${REQUEST_RATE} (seed=${REQUEST_RATE_SEED}) tp=${TENSOR_PARALLEL_SIZE}"
+echo "[run_single] modes=${MODES_ARG}  kv_offload_extra=${SSLO_KV_OFFLOAD_EXTRA}"
 echo "[run_single] output -> ${CONFIG_OUTPUT_DIR}"
 
 python3 exp/sslo_test/run_test.py \
@@ -73,4 +77,5 @@ python3 exp/sslo_test/run_test.py \
   --seconds-per-word "${SECONDS_PER_WORD}" \
   --output-dir "${CONFIG_OUTPUT_DIR}" \
   --request-rate "${REQUEST_RATE}" \
-  --request-rate-seed "${REQUEST_RATE_SEED}"
+  --request-rate-seed "${REQUEST_RATE_SEED}" \
+  --modes "${MODES_ARG}"

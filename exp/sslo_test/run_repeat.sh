@@ -4,16 +4,19 @@
 #
 #   run_repeat.sh <num_runs> <max_num_seqs> <model> [num_prompts=256] \
 #                 [generation_max_tokens=512] [output_root=exp/sslo_test/output] \
-#                 [request_rate=0] [base_seed=42]
+#                 [request_rate=0] [base_seed=42] [modes=...] [tensor_parallel_size=1]
 #
 # Each run writes to ${output_root}/run_{i}/seqs_${max_num_seqs}/.
 # request_rate is forwarded to run_single.sh; the seed is base_seed + i so each
 # run gets a different Poisson sample (when request_rate > 0).
+# modes: comma-separated subset; forwarded to run_single.sh as positional $8.
+#        Default = all 5 modes. SSLO_MODES env var also honored as fallback.
+# tensor_parallel_size: vLLM TP. Default 1; forwarded to run_single.sh as $9.
 # Run inside the sk-sslo-vllm container.
 set -euo pipefail
 
 if [[ $# -lt 3 ]]; then
-  echo "usage: $0 <num_runs> <max_num_seqs> <model> [num_prompts=256] [generation_max_tokens=512] [output_root=exp/sslo_test/output] [request_rate=0] [base_seed=42]" >&2
+  echo "usage: $0 <num_runs> <max_num_seqs> <model> [num_prompts=256] [generation_max_tokens=512] [output_root=exp/sslo_test/output] [request_rate=0] [base_seed=42] [modes=...] [tensor_parallel_size=1]" >&2
   exit 2
 fi
 
@@ -25,16 +28,18 @@ GENERATION_MAX_TOKENS="${5:-512}"
 OUTPUT_ROOT="${6:-exp/sslo_test/output}"
 REQUEST_RATE="${7:-0}"
 BASE_SEED="${8:-42}"
+MODES_ARG="${9:-${SSLO_MODES:-baseline,sslo,sslo_offload,sslo_adaptive,sslo_adaptive_offload}}"
+TENSOR_PARALLEL_SIZE="${10:-1}"
 
 for ((i=1; i<=NUM_RUNS; i++)); do
   RUN_OUTPUT_DIR="${OUTPUT_ROOT}/run_${i}"
   RUN_SEED=$((BASE_SEED + i))
-  echo "===== run ${i}/${NUM_RUNS} → ${RUN_OUTPUT_DIR}/seqs_${MAX_NUM_SEQS} (rate=${REQUEST_RATE} seed=${RUN_SEED}) ====="
+  echo "===== run ${i}/${NUM_RUNS} → ${RUN_OUTPUT_DIR}/seqs_${MAX_NUM_SEQS} (rate=${REQUEST_RATE} seed=${RUN_SEED} modes=${MODES_ARG} tp=${TENSOR_PARALLEL_SIZE}) ====="
   rm -rf "${RUN_OUTPUT_DIR}/seqs_${MAX_NUM_SEQS}"
   bash exp/sslo_test/run_single.sh \
     "${MAX_NUM_SEQS}" "${MODEL}" \
     "${NUM_PROMPTS}" "${GENERATION_MAX_TOKENS}" "${RUN_OUTPUT_DIR}" \
-    "${REQUEST_RATE}" "${RUN_SEED}"
+    "${REQUEST_RATE}" "${RUN_SEED}" "${MODES_ARG}" "${TENSOR_PARALLEL_SIZE}"
 done
 
 python3 exp/sslo_test/analysis/aggregate_repeats.py \

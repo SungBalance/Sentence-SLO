@@ -19,7 +19,10 @@ from lm_datasets import load_prompts
 
 
 DEFAULT_OUTPUT_DIR = "exp/sslo_test/output"
-GPU_READY_FREE_MEMORY_MIB = 92160
+# Threshold for "GPU is ready for next subprocess": at least this fraction of
+# the device's total memory must be free. Computed against actual total memory
+# (queried at runtime) so the same script works on 80GB / 96GB / etc. cards.
+GPU_READY_FREE_FRACTION = 0.95
 GPU_READY_TIMEOUT_S = 60.0
 GPU_READY_BASE_SLEEP_S = 5.0
 
@@ -53,6 +56,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=42,
         help="Seed for the Poisson inter-arrival sampler (reproducibility).",
+    )
+    parser.add_argument(
+        "--modes",
+        default="baseline,sslo,sslo_offload,sslo_adaptive,sslo_adaptive_offload",
+        help="Comma-separated subset of modes to run when --run-kind=all.",
     )
     return parser.parse_args()
 
@@ -218,62 +226,41 @@ async def run_one(args: argparse.Namespace) -> None:
     prompts = load_workload(args.dataset_name, args.num_prompts)
     print(f"{args.run_kind}: loaded {len(prompts)} prompts from {args.dataset_name}")
 
-    if args.run_kind == "sslo":
-        sslo_params = {
-            "enabled": True,
-            "chunk_unit": args.chunk_unit,
-            "seconds_per_word": args.seconds_per_word,
-            "chunk_gen_estimator": "p99",
-            "chunk_gen_p99_window": 100,
-        }
-    elif args.run_kind == "sslo_adaptive":
-        sslo_params = {
-            "enabled": True,
-            "adaptive_batch_size": True,
-            "chunk_unit": args.chunk_unit,
-            "seconds_per_word": args.seconds_per_word,
-            "chunk_gen_estimator": "p99",
-            "chunk_gen_p99_window": 100,
-        }
-    elif args.run_kind == "sslo_offload":
-        sslo_params = {
-            "enabled": True,
-            "offloading": True,
-            "chunk_unit": args.chunk_unit,
-            "seconds_per_word": args.seconds_per_word,
-            "chunk_gen_estimator": "p99",
-            "chunk_gen_p99_window": 100,
-        }
-    elif args.run_kind == "sslo_adaptive_offload":
-        sslo_params = {
-            "enabled": True,
-            "adaptive_batch_size": True,
-            "offloading": True,
-            "chunk_unit": args.chunk_unit,
-            "seconds_per_word": args.seconds_per_word,
-            "chunk_gen_estimator": "p99",
-            "chunk_gen_p99_window": 100,
-        }
-    else:
+    # Build sslo_params incrementally: start with the base SSLO config used by
+    # all sslo* modes, then add flags per mode suffix.
+    if args.run_kind == "baseline":
         sslo_params = {"enabled": False}
+    else:
+        sslo_params = {
+            "enabled": True,
+            "chunk_unit": args.chunk_unit,
+            "seconds_per_word": args.seconds_per_word,
+            "chunk_gen_estimator": "p99",
+            "chunk_gen_p99_window": 100,
+        }
+        if "adaptive" in args.run_kind:
+            sslo_params["adaptive_batch_size"] = True
+        if "offload" in args.run_kind:
+            sslo_params["offloading"] = True
 
-    # KV transfer config: SimpleCPUOffloadConnector is the always-on substrate
-    # across all conditions. The SSLO ablation toggles only sslo_config.offloading
-    # (preempt trigger), not the connector itself, so the comparison isolates
-    # policy effect. We pick SimpleCPUOffloadConnector (SupportsHMA) over
-    # OffloadingConnector so hybrid models (e.g., Qwen3.5-27B with
-    # linear+full attention layers) keep HMA enabled and avoid the unify-spec
-    # assert at vllm/v1/core/kv_cache_utils.py:1402.
-    # Extra config overridable via SSLO_KV_OFFLOAD_EXTRA env (JSON).
-    kv_transfer_config = KVTransferConfig(
-        kv_connector="SimpleCPUOffloadConnector",
-        kv_role="kv_both",
-        kv_connector_extra_config=json.loads(
-            os.environ.get("SSLO_KV_OFFLOAD_EXTRA", "{}")
-        ),
-    )
+    # KV transfer config: only enable the CPU-offload connector for the two
+    # offload SSLO modes. Non-offload modes (baseline, sslo, sslo_adaptive)
+    # run with the engine's default — no kv_transfer plumbing — so the
+    # baseline truly is vanilla vLLM and the sslo/sslo_adaptive comparisons
+    # don't carry connector overhead. Extra config overridable via
+    # SSLO_KV_OFFLOAD_EXTRA env (JSON).
+    needs_kv_offload = args.run_kind in ("sslo_offload", "sslo_adaptive_offload")
+    kv_transfer_config = None
+    if needs_kv_offload:
+        kv_transfer_config = KVTransferConfig(
+            kv_connector="SimpleCPUOffloadConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config=json.loads(
+                os.environ.get("SSLO_KV_OFFLOAD_EXTRA", "{}")
+            ),
+        )
 
-    engine_args = AsyncEngineArgs(
+    engine_kwargs: dict[str, Any] = dict(
         model=args.model,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
@@ -281,20 +268,19 @@ async def run_one(args: argparse.Namespace) -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_log_requests=False,
         sslo_params=sslo_params,
-        kv_transfer_config=kv_transfer_config,
-        # Keep HMA on so hybrid models (linear+full attention) skip the unify
-        # path triggered by kv_transfer_config defaults; the kv connector is
-        # SupportsHMA so this is safe.
-        disable_hybrid_kv_cache_manager=False,
-        # SimpleCPUOffloadConnector silently disables itself when prefix
-        # caching is off; force-enable so CPU offload actually runs.
-        enable_prefix_caching=True,
+        # Auto-load HF model's generation_config so SamplingParams defaults
+        # (temperature, top_p, top_k, etc.) come from the model.
+        generation_config="auto",
     )
+    if kv_transfer_config is not None:
+        engine_kwargs["kv_transfer_config"] = kv_transfer_config
+        engine_kwargs["disable_hybrid_kv_cache_manager"] = False
+        engine_kwargs["enable_prefix_caching"] = True
+    engine_args = AsyncEngineArgs(**engine_kwargs)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
-    sampling_params = SamplingParams(
-        max_tokens=args.generation_max_tokens,
-        temperature=0.0,
-    )
+    # Use the model's HF generation_config defaults; only override max_tokens
+    # so all runs produce the same response budget.
+    sampling_params = SamplingParams(max_tokens=args.generation_max_tokens)
 
     # Generate Poisson inter-arrival offsets relative to t0.
     import random as _random
@@ -433,14 +419,34 @@ def terminate_process_group(pgid: int) -> None:
         pass
 
 
+def _gpu_total_mib(gpu_index: str) -> int | None:
+    """Query total memory (MiB) of the given physical GPU index."""
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+                "-i", gpu_index,
+            ],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+        return int(output.splitlines()[0].strip())
+    except Exception:
+        return None
+
+
 def wait_for_gpu_memory_ready() -> None:
     # Poll the physical GPU index that CUDA_VISIBLE_DEVICES selects (default "0").
-    # If the env var contains multiple devices, just check the first.
     gpu_index = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0].strip() or "0"
+    total_mib = _gpu_total_mib(gpu_index) or 0
+    threshold_mib = int(total_mib * GPU_READY_FREE_FRACTION) if total_mib > 0 else 0
     print(
         "Waiting for GPU cleanup: "
         f"sleep {GPU_READY_BASE_SLEEP_S:.0f}s, then require "
-        f">{GPU_READY_FREE_MEMORY_MIB} MiB free on GPU {gpu_index}..."
+        f">{threshold_mib} MiB free on GPU {gpu_index} "
+        f"({GPU_READY_FREE_FRACTION:.0%} of {total_mib} MiB total)..."
     )
     time.sleep(GPU_READY_BASE_SLEEP_S)
     deadline = time.monotonic() + GPU_READY_TIMEOUT_S
@@ -453,20 +459,19 @@ def wait_for_gpu_memory_ready() -> None:
                     "nvidia-smi",
                     "--query-gpu=memory.free",
                     "--format=csv,noheader,nounits",
-                    "-i",
-                    gpu_index,
+                    "-i", gpu_index,
                 ],
                 text=True,
                 stderr=subprocess.STDOUT,
             ).strip()
             last_free_mib = int(output.splitlines()[0].strip())
-            if last_free_mib > GPU_READY_FREE_MEMORY_MIB:
+            if last_free_mib > threshold_mib:
                 print(f"GPU cleanup ready: free_memory={last_free_mib} MiB")
                 return
             print(
                 "GPU cleanup pending: "
                 f"free_memory={last_free_mib} MiB "
-                f"(need >{GPU_READY_FREE_MEMORY_MIB} MiB)"
+                f"(need >{threshold_mib} MiB)"
             )
         except Exception as exc:
             last_error = str(exc)
@@ -506,7 +511,13 @@ def run_all(args: argparse.Namespace) -> None:
             path.unlink()
 
     statuses: dict[str, int | None] = {}
-    modes = ("baseline", "sslo", "sslo_offload", "sslo_adaptive", "sslo_adaptive_offload")
+    valid_modes = {"baseline", "sslo", "sslo_offload", "sslo_adaptive", "sslo_adaptive_offload"}
+    requested = [m.strip() for m in args.modes.split(",") if m.strip()]
+    invalid = [m for m in requested if m not in valid_modes]
+    if invalid:
+        raise SystemExit(f"Unknown mode(s) in --modes: {invalid}")
+    modes = tuple(requested)
+    print(f"run_all: modes={modes}")
     for mode in modes:
         if mode != "baseline":
             wait_for_gpu_memory_ready()
