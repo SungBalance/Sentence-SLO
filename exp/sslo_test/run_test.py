@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
-"""Run baseline and SSLO TTFT experiments in isolated subprocesses."""
+"""Run one SSLO test mode for one config and write its JSONLs."""
 from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import os
-import signal
-import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
+import random as _random
+import torch
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from lm_datasets import load_prompts
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from metrics_utils import MODES_DEFAULT
+
 
 DEFAULT_OUTPUT_DIR = "exp/sslo_test/output"
-# Threshold for "GPU is ready for next subprocess": at least this fraction of
-# the device's total memory must be free. Computed against actual total memory
-# (queried at runtime) so the same script works on 80GB / 96GB / etc. cards.
-GPU_READY_FREE_FRACTION = 0.95
-GPU_READY_TIMEOUT_S = 60.0
-GPU_READY_BASE_SLEEP_S = 5.0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--run-kind",
-        choices=["all", "baseline", "sslo", "sslo_adaptive", "sslo_offload", "sslo_adaptive_offload"],
-        default="all",
+        required=True,
+        choices=list(MODES_DEFAULT),
     )
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--dataset-name", default="koala")
@@ -57,11 +55,6 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Seed for the Poisson inter-arrival sampler (reproducibility).",
     )
-    parser.add_argument(
-        "--modes",
-        default="baseline,sslo,sslo_offload,sslo_adaptive,sslo_adaptive_offload",
-        help="Comma-separated subset of modes to run when --run-kind=all.",
-    )
     return parser.parse_args()
 
 
@@ -82,12 +75,6 @@ def load_workload(dataset_name: str, num_prompts: int) -> list[str]:
     return repeated[:num_prompts]
 
 
-def record_value(record: Any, key: str) -> Any:
-    if isinstance(record, dict):
-        return record.get(key)
-    return getattr(record, key, None)
-
-
 def positive_number(value: Any) -> float | None:
     if value is None:
         return None
@@ -102,32 +89,14 @@ def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
     normalized = []
     for record in records:
         normalized.append({
-            "chunk_idx": record_value(record, "chunk_idx"),
-            "cumulative_slack": record_value(record, "cumulative_slack"),
-            "gen_time": record_value(record, "gen_time"),
-            "pending_time": record_value(record, "pending_time"),
-            "word_count": record_value(record, "word_count"),
-            "end_time_ts": record_value(record, "end_time_ts"),
+            "chunk_idx": getattr(record, "chunk_idx", None),
+            "cumulative_slack": getattr(record, "cumulative_slack", None),
+            "gen_time": getattr(record, "gen_time", None),
+            "pending_time": getattr(record, "pending_time", None),
+            "word_count": getattr(record, "word_count", None),
+            "end_time_ts": getattr(record, "end_time_ts", None),
         })
     return normalized
-
-
-def request_chunk_rows(
-    request_id: str,
-    records: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    return [
-        {
-            "request_id": request_id,
-            "chunk_idx": record.get("chunk_idx"),
-            "cumulative_slack": record.get("cumulative_slack"),
-            "gen_time": record.get("gen_time"),
-            "pending_time": record.get("pending_time"),
-            "word_count": record.get("word_count"),
-            "end_time_ts": record.get("end_time_ts"),
-        }
-        for record in records
-    ]
 
 
 async def collect_request_with_delay(
@@ -283,7 +252,6 @@ async def run_one(args: argparse.Namespace) -> None:
     sampling_params = SamplingParams(max_tokens=args.generation_max_tokens)
 
     # Generate Poisson inter-arrival offsets relative to t0.
-    import random as _random
     rate = args.request_rate
     rng = _random.Random(args.request_rate_seed)
     arrival_offsets: list[float] = []
@@ -307,30 +275,27 @@ async def run_one(args: argparse.Namespace) -> None:
         ]
         rows = await asyncio.gather(*tasks)
         elapsed = time.monotonic() - t0
-        write_jsonl(output_dir / f"{args.run_kind}_ttft.jsonl", rows)
+        request_rows = [{k: v for k, v in row.items() if k != "slo_chunk_records"} for row in rows]
+        write_jsonl(output_dir / f"requests_{args.run_kind}.jsonl", request_rows)
         chunk_rows = [
-            chunk_row
+            {"request_id": str(row["request_id"]), **chunk}
             for row in rows
-            for chunk_row in request_chunk_rows(
-                str(row["request_id"]), row.get("slo_chunk_records") or []
-            )
+            for chunk in (row.get("slo_chunk_records") or [])
         ]
-        write_jsonl(output_dir / f"{args.run_kind}_chunks.jsonl", chunk_rows)
+        write_jsonl(output_dir / f"chunks_{args.run_kind}.jsonl", chunk_rows)
         print(
             f"{args.run_kind}: completed {len(rows)} requests in {elapsed:.1f}s; "
-            f"wrote {output_dir / f'{args.run_kind}_ttft.jsonl'}"
+            f"wrote {output_dir / f'requests_{args.run_kind}.jsonl'}"
         )
         print(
             f"{args.run_kind}: wrote {len(chunk_rows)} chunks to "
-            f"{output_dir / f'{args.run_kind}_chunks.jsonl'}"
+            f"{output_dir / f'chunks_{args.run_kind}.jsonl'}"
         )
     finally:
         engine.shutdown()
         del engine
-        import gc
         gc.collect()
         try:
-            import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
@@ -339,217 +304,9 @@ async def run_one(args: argparse.Namespace) -> None:
         time.sleep(2)
 
 
-def child_command(args: argparse.Namespace, run_kind: str) -> list[str]:
-    return [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--run-kind",
-        run_kind,
-        "--model",
-        args.model,
-        "--dataset-name",
-        args.dataset_name,
-        "--num-prompts",
-        str(args.num_prompts),
-        "--max-model-len",
-        str(args.max_model_len),
-        "--max-num-seqs",
-        str(args.max_num_seqs),
-        "--generation-max-tokens",
-        str(args.generation_max_tokens),
-        "--tensor-parallel-size",
-        str(args.tensor_parallel_size),
-        "--gpu-memory-utilization",
-        str(args.gpu_memory_utilization),
-        "--chunk-unit",
-        args.chunk_unit,
-        "--seconds-per-word",
-        str(args.seconds_per_word),
-        "--output-dir",
-        args.output_dir,
-        "--request-rate",
-        str(args.request_rate),
-        "--request-rate-seed",
-        str(args.request_rate_seed),
-    ]
-
-
-def run_child(args: argparse.Namespace, run_kind: str) -> int:
-    output_dir = Path(args.output_dir)
-    env = os.environ.copy()
-    env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
-    env.pop("SSLO_STATS_LOG_PATH", None)
-    env.pop("SSLO_OFFLOAD_LOG_PATH", None)
-    if run_kind.startswith("sslo"):
-        env["SSLO_STATS_LOG_PATH"] = str(output_dir / f"{run_kind}_stats.jsonl")
-    if "offload" in run_kind:
-        env["SSLO_OFFLOAD_LOG_PATH"] = str(output_dir / f"{run_kind}_offload_log.jsonl")
-    print(f"Starting {run_kind} subprocess...")
-    with tempfile.TemporaryFile(mode="w+t") as output_file:
-        proc = subprocess.Popen(
-            child_command(args, run_kind),
-            env=env,
-            stdout=output_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-        returncode = 1
-        try:
-            returncode = proc.wait()
-        finally:
-            if returncode != 0:
-                terminate_process_group(proc.pid)
-        output_file.seek(0)
-        output = output_file.read()
-        if output:
-            print(output, end="")
-        return returncode
-
-
-def terminate_process_group(pgid: int) -> None:
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    time.sleep(1)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-
-
-def _gpu_total_mib(gpu_index: str) -> int | None:
-    """Query total memory (MiB) of the given physical GPU index."""
-    try:
-        output = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.total",
-                "--format=csv,noheader,nounits",
-                "-i", gpu_index,
-            ],
-            text=True,
-            stderr=subprocess.STDOUT,
-        ).strip()
-        return int(output.splitlines()[0].strip())
-    except Exception:
-        return None
-
-
-def wait_for_gpu_memory_ready() -> None:
-    # Poll the physical GPU index that CUDA_VISIBLE_DEVICES selects (default "0").
-    gpu_index = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0].strip() or "0"
-    total_mib = _gpu_total_mib(gpu_index) or 0
-    threshold_mib = int(total_mib * GPU_READY_FREE_FRACTION) if total_mib > 0 else 0
-    print(
-        "Waiting for GPU cleanup: "
-        f"sleep {GPU_READY_BASE_SLEEP_S:.0f}s, then require "
-        f">{threshold_mib} MiB free on GPU {gpu_index} "
-        f"({GPU_READY_FREE_FRACTION:.0%} of {total_mib} MiB total)..."
-    )
-    time.sleep(GPU_READY_BASE_SLEEP_S)
-    deadline = time.monotonic() + GPU_READY_TIMEOUT_S
-    last_error: str | None = None
-    last_free_mib: int | None = None
-    while time.monotonic() < deadline:
-        try:
-            output = subprocess.check_output(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=memory.free",
-                    "--format=csv,noheader,nounits",
-                    "-i", gpu_index,
-                ],
-                text=True,
-                stderr=subprocess.STDOUT,
-            ).strip()
-            last_free_mib = int(output.splitlines()[0].strip())
-            if last_free_mib > threshold_mib:
-                print(f"GPU cleanup ready: free_memory={last_free_mib} MiB")
-                return
-            print(
-                "GPU cleanup pending: "
-                f"free_memory={last_free_mib} MiB "
-                f"(need >{threshold_mib} MiB)"
-            )
-        except Exception as exc:
-            last_error = str(exc)
-            print(f"GPU cleanup poll failed: {last_error}")
-        time.sleep(2)
-    print(
-        "WARNING: GPU cleanup wait timed out; proceeding anyway. "
-        f"last_free_memory={last_free_mib} last_error={last_error}"
-    )
-
-
-def run_all(args: argparse.Namespace) -> None:
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for fname in (
-        "baseline_ttft.jsonl",
-        "baseline_chunks.jsonl",
-        "sslo_ttft.jsonl",
-        "sslo_chunks.jsonl",
-        "sslo_stats.jsonl",
-        "sslo_offload_ttft.jsonl",
-        "sslo_offload_chunks.jsonl",
-        "sslo_offload_stats.jsonl",
-        "sslo_offload_log.jsonl",
-        "sslo_adaptive_ttft.jsonl",
-        "sslo_adaptive_chunks.jsonl",
-        "sslo_adaptive_stats.jsonl",
-        "sslo_adaptive_offload_ttft.jsonl",
-        "sslo_adaptive_offload_chunks.jsonl",
-        "sslo_adaptive_offload_stats.jsonl",
-        "sslo_adaptive_offload_log.jsonl",
-        "summary.json",
-        "run_status.json",
-    ):
-        path = output_dir / fname
-        if path.exists():
-            path.unlink()
-
-    statuses: dict[str, int | None] = {}
-    valid_modes = {"baseline", "sslo", "sslo_offload", "sslo_adaptive", "sslo_adaptive_offload"}
-    requested = [m.strip() for m in args.modes.split(",") if m.strip()]
-    invalid = [m for m in requested if m not in valid_modes]
-    if invalid:
-        raise SystemExit(f"Unknown mode(s) in --modes: {invalid}")
-    modes = tuple(requested)
-    print(f"run_all: modes={modes}")
-    for mode in modes:
-        if mode != "baseline":
-            wait_for_gpu_memory_ready()
-        statuses[mode] = run_child(args, mode)
-        if statuses[mode] != 0:
-            for remaining in modes:
-                statuses.setdefault(remaining, None)
-            break
-    (output_dir / "run_status.json").write_text(json.dumps(statuses, indent=2) + "\n")
-
-    subprocess.run(
-        [
-            sys.executable,
-            str(Path(__file__).resolve().parent / "analyze.py"),
-            "--output-dir",
-            args.output_dir,
-            "--max-num-seqs",
-            str(args.max_num_seqs),
-        ],
-        check=True,
-    )
-    failed = {name: rc for name, rc in statuses.items() if rc not in (0, None)}
-    if failed:
-        raise SystemExit(f"Experiment subprocess failed: {failed}")
-
-
 def main() -> None:
     args = parse_args()
-    if args.run_kind == "all":
-        run_all(args)
-    else:
-        asyncio.run(run_one(args))
+    asyncio.run(run_one(args))
 
 
 if __name__ == "__main__":
