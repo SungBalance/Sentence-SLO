@@ -143,8 +143,8 @@ class TestPendingRedistribution:
         assert request.slo_state._pending_enter_ts is None
 
 
-class TestOffloadMarking:
-    def test_highest_score_in_combined_is_marked(self):
+class TestOffloadVictimSelection:
+    def test_highest_score_in_combined_selected(self):
         from vllm.v1.core.sched.scheduler import _sslo_score_key
         running = [
             make_mock_request("a", make_pending_eligible_state(0.1)),
@@ -153,9 +153,7 @@ class TestOffloadMarking:
         pending = [make_mock_request("c", make_pending_eligible_state(2.5))]
         combined = running + pending
         candidate = max(combined, key=_sslo_score_key)
-        candidate.sslo_offload_requested = True
         assert candidate.request_id == "c"
-        assert candidate.sslo_offload_requested is True
 
 
 class TestAdaptiveBatchSize:

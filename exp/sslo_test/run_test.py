@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--run-kind",
-        choices=["all", "baseline", "sslo", "sslo_adaptive"],
+        choices=["all", "baseline", "sslo", "sslo_adaptive", "sslo_offload", "sslo_adaptive_offload"],
         default="all",
     )
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
@@ -209,6 +209,7 @@ async def collect_request(
 
 async def run_one(args: argparse.Namespace) -> None:
     from vllm import AsyncLLMEngine, SamplingParams
+    from vllm.config import KVTransferConfig
     from vllm.engine.arg_utils import AsyncEngineArgs
 
     output_dir = Path(args.output_dir)
@@ -234,8 +235,43 @@ async def run_one(args: argparse.Namespace) -> None:
             "chunk_gen_estimator": "p99",
             "chunk_gen_p99_window": 100,
         }
+    elif args.run_kind == "sslo_offload":
+        sslo_params = {
+            "enabled": True,
+            "offloading": True,
+            "chunk_unit": args.chunk_unit,
+            "seconds_per_word": args.seconds_per_word,
+            "chunk_gen_estimator": "p99",
+            "chunk_gen_p99_window": 100,
+        }
+    elif args.run_kind == "sslo_adaptive_offload":
+        sslo_params = {
+            "enabled": True,
+            "adaptive_batch_size": True,
+            "offloading": True,
+            "chunk_unit": args.chunk_unit,
+            "seconds_per_word": args.seconds_per_word,
+            "chunk_gen_estimator": "p99",
+            "chunk_gen_p99_window": 100,
+        }
     else:
         sslo_params = {"enabled": False}
+
+    # KV transfer config: SimpleCPUOffloadConnector is the always-on substrate
+    # across all conditions. The SSLO ablation toggles only sslo_config.offloading
+    # (preempt trigger), not the connector itself, so the comparison isolates
+    # policy effect. We pick SimpleCPUOffloadConnector (SupportsHMA) over
+    # OffloadingConnector so hybrid models (e.g., Qwen3.5-27B with
+    # linear+full attention layers) keep HMA enabled and avoid the unify-spec
+    # assert at vllm/v1/core/kv_cache_utils.py:1402.
+    # Extra config overridable via SSLO_KV_OFFLOAD_EXTRA env (JSON).
+    kv_transfer_config = KVTransferConfig(
+        kv_connector="SimpleCPUOffloadConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config=json.loads(
+            os.environ.get("SSLO_KV_OFFLOAD_EXTRA", "{}")
+        ),
+    )
 
     engine_args = AsyncEngineArgs(
         model=args.model,
@@ -245,6 +281,14 @@ async def run_one(args: argparse.Namespace) -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_log_requests=False,
         sslo_params=sslo_params,
+        kv_transfer_config=kv_transfer_config,
+        # Keep HMA on so hybrid models (linear+full attention) skip the unify
+        # path triggered by kv_transfer_config defaults; the kv connector is
+        # SupportsHMA so this is safe.
+        disable_hybrid_kv_cache_manager=False,
+        # SimpleCPUOffloadConnector silently disables itself when prefix
+        # caching is off; force-enable so CPU offload actually runs.
+        enable_prefix_caching=True,
     )
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     sampling_params = SamplingParams(
@@ -349,8 +393,11 @@ def run_child(args: argparse.Namespace, run_kind: str) -> int:
     env = os.environ.copy()
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     env.pop("SSLO_STATS_LOG_PATH", None)
-    if run_kind in ("sslo", "sslo_adaptive"):
+    env.pop("SSLO_OFFLOAD_LOG_PATH", None)
+    if run_kind.startswith("sslo"):
         env["SSLO_STATS_LOG_PATH"] = str(output_dir / f"{run_kind}_stats.jsonl")
+    if "offload" in run_kind:
+        env["SSLO_OFFLOAD_LOG_PATH"] = str(output_dir / f"{run_kind}_offload_log.jsonl")
     print(f"Starting {run_kind} subprocess...")
     with tempfile.TemporaryFile(mode="w+t") as output_file:
         proc = subprocess.Popen(
@@ -440,9 +487,17 @@ def run_all(args: argparse.Namespace) -> None:
         "sslo_ttft.jsonl",
         "sslo_chunks.jsonl",
         "sslo_stats.jsonl",
+        "sslo_offload_ttft.jsonl",
+        "sslo_offload_chunks.jsonl",
+        "sslo_offload_stats.jsonl",
+        "sslo_offload_log.jsonl",
         "sslo_adaptive_ttft.jsonl",
         "sslo_adaptive_chunks.jsonl",
         "sslo_adaptive_stats.jsonl",
+        "sslo_adaptive_offload_ttft.jsonl",
+        "sslo_adaptive_offload_chunks.jsonl",
+        "sslo_adaptive_offload_stats.jsonl",
+        "sslo_adaptive_offload_log.jsonl",
         "summary.json",
         "run_status.json",
     ):
@@ -451,12 +506,13 @@ def run_all(args: argparse.Namespace) -> None:
             path.unlink()
 
     statuses: dict[str, int | None] = {}
-    for mode in ("baseline", "sslo", "sslo_adaptive"):
+    modes = ("baseline", "sslo", "sslo_offload", "sslo_adaptive", "sslo_adaptive_offload")
+    for mode in modes:
         if mode != "baseline":
             wait_for_gpu_memory_ready()
         statuses[mode] = run_child(args, mode)
         if statuses[mode] != 0:
-            for remaining in ("sslo", "sslo_adaptive"):
+            for remaining in modes:
                 statuses.setdefault(remaining, None)
             break
     (output_dir / "run_status.json").write_text(json.dumps(statuses, indent=2) + "\n")

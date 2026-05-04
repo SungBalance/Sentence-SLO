@@ -221,6 +221,8 @@ class SsloRequestStats:
     max_consecutive_pending: int
     final_ema_gen_time_s: float | None
     final_ema_per_word_time_s: float | None
+    total_offload_time_s: float
+    num_offload_intervals: int
 
 
 @dataclass
@@ -293,6 +295,10 @@ class RequestSLOState:
         self._num_pending_intervals: int = 0
         self._cur_consecutive_pending: int = 0
         self._max_consecutive_pending: int = 0
+        # Offload timing (mirrors pending mechanism)
+        self._offload_enter_ts: float | None = None
+        self._total_offload_time: float = 0.0
+        self._num_offload_intervals: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -339,6 +345,31 @@ class RequestSLOState:
             self._chunk_pending_time += now - self._pending_enter_ts
             self._pending_enter_ts = None
             self._cur_consecutive_pending = 0
+
+    def on_offload_enter(self, now: float) -> None:
+        """Mark the start of an offload interval (KV moved to CPU)."""
+        if self._offload_enter_ts is None:
+            self._offload_enter_ts = now
+            self._num_offload_intervals += 1
+
+    def on_offload_exit(self, now: float) -> None:
+        """Accumulate offload duration. No-op if not currently offloaded."""
+        if self._offload_enter_ts is not None:
+            self._total_offload_time += now - self._offload_enter_ts
+            self._offload_enter_ts = None
+
+    def is_overdue_post_warmup(self) -> bool:
+        """True if cumulative_slack < 0 and past the warmup period.
+
+        Warmup uses the same threshold as the pending mechanism
+        (pending_warmup_chunks). Acts as a per-request "contributing to
+        overdue signal" check used by the scheduler-side adaptive batch
+        size policy. Symmetric in spirit to should_enter_pending(now).
+        """
+        estimator = self._chunk_gen_estimator
+        if estimator.n_samples < self._pending_warmup_chunks:
+            return False
+        return self.cumulative_slack < 0
 
     def _realtime_slack(self, now: float) -> float | None:
         """Slack to next chunk's deadline using current wall clock.
@@ -424,6 +455,8 @@ class RequestSLOState:
             max_consecutive_pending=self._max_consecutive_pending,
             final_ema_gen_time_s=self._chunk_gen_estimator.gen_time,
             final_ema_per_word_time_s=self._chunk_gen_estimator.per_token_time,
+            total_offload_time_s=self._total_offload_time,
+            num_offload_intervals=self._num_offload_intervals,
         )
 
     def _flush_chunk(self, now: float, boundary_pos: int) -> None:

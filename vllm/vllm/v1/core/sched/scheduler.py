@@ -1008,10 +1008,12 @@ class Scheduler(SchedulerInterface):
                 self.sslo_consecutive_pending[req.request_id] = 0
                 new_running.append(req)
 
-        # SSLO (adaptive_batch_size): shadow as local; reduce if any overdue
+        # SSLO (adaptive_batch_size): shadow as local; halve if any request
+        # is overdue post-warmup (uses pending_warmup_chunks as the gate, so
+        # transient negative slack on the very first chunks does not trigger).
         max_num_running_reqs = self.max_num_running_reqs
         if self.sslo_config.adaptive_batch_size and any(
-            r.slo_state is not None and r.slo_state.sslo_score < 0
+            r.slo_state is not None and r.slo_state.is_overdue_post_warmup()
             for r in new_running
         ):
             max_num_running_reqs = max(1, max_num_running_reqs // 2)
@@ -1478,12 +1480,48 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    # SSLO (offloading): mark highest-slack request for future CPU offload
+                    # SSLO (offloading): preempt highest-slack victim immediately so its
+                    # KV is freed for next step's admission. OffloadingConnector saves the
+                    # victim's KV via scheduler_output.preempted_req_ids -> reqs_to_flush;
+                    # on resume get_num_new_matched_tokens + update_state_after_alloc
+                    # load it from CPU back to GPU.
                     if self.sslo_config.offloading:
-                        combined = self.running + self.sslo_pending
+                        combined = list(self.running) + list(self.sslo_pending)
                         if combined:
-                            candidate = max(combined, key=_sslo_score_key)
-                            candidate.sslo_offload_requested = True
+                            victim = max(combined, key=_sslo_score_key)
+                            self.sslo_consecutive_pending.pop(victim.request_id, None)
+                            if victim in self.sslo_pending:
+                                self.sslo_pending.remove(victim)
+                            else:
+                                self.running.remove(victim)
+                            self._preempt_request(victim, scheduled_timestamp)
+                            preempted_reqs.append(victim)
+                            # SSLO: per-request offload timing
+                            if victim.slo_state is not None:
+                                victim.slo_state.on_offload_enter(scheduled_timestamp)
+                            # SSLO: telemetry
+                            import os as _os
+                            sslo_offload_log_path = _os.environ.get(
+                                "SSLO_OFFLOAD_LOG_PATH"
+                            )
+                            if sslo_offload_log_path:
+                                import json as _json
+                                _os.makedirs(
+                                    _os.path.dirname(sslo_offload_log_path),
+                                    exist_ok=True,
+                                )
+                                with open(sslo_offload_log_path, "a") as f:
+                                    f.write(
+                                        _json.dumps({
+                                            "ts": scheduled_timestamp,
+                                            "victim_id": victim.request_id,
+                                            "trigger_req_id": request.request_id,
+                                            "num_computed_tokens_before_free":
+                                                victim.num_computed_tokens,
+                                            "num_preemptions": victim.num_preemptions,
+                                            "sslo_score": _sslo_score_key(victim),
+                                        }) + "\n"
+                                    )
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1549,6 +1587,9 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                # SSLO: per-request offload timing (no-op if not in offload)
+                if request.slo_state is not None:
+                    request.slo_state.on_offload_exit(scheduled_timestamp)
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule

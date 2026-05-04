@@ -18,7 +18,7 @@ BASELINE_CHUNKS = "baseline_chunks.jsonl"
 SSLO_TTFT = "sslo_ttft.jsonl"
 SSLO_CHUNKS = "sslo_chunks.jsonl"
 SSLO_STATS = "sslo_stats.jsonl"
-SSLO_VARIANTS = ("sslo", "sslo_adaptive")
+SSLO_VARIANTS = ("sslo", "sslo_offload", "sslo_adaptive", "sslo_adaptive_offload")
 EXTRA_METRIC_PREFIXES = (
     "h2_ttft_p99",
     "h2_ttft_max",
