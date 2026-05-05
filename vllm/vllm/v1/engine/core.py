@@ -357,11 +357,13 @@ class EngineCore:
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
     # SSLO
-    def update_slo_text(self, updates: list[tuple[str, str, float]]) -> None:
-        for req_id, text, ts in updates:
+    def update_slo_text(
+        self, updates: list[tuple[str, str, float, int]]
+    ) -> None:
+        for req_id, text, ts, num_tokens in updates:
             req = self.scheduler.requests.get(req_id)
             if req is not None and req.slo_state is not None:
-                req.slo_state.on_text_delta(text, ts)
+                req.slo_state.on_text_delta(text, ts, num_tokens)
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):

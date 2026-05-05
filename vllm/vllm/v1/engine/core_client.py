@@ -834,7 +834,9 @@ class SyncMPClient(MPClient):
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
     # SSLO
-    def send_slo_updates(self, updates: list[tuple[str, str, float]]) -> None:
+    def send_slo_updates(
+        self, updates: list[tuple[str, str, float, int]]
+    ) -> None:
         if updates:
             self._send_input(EngineCoreRequestType.SLO_UPDATE, updates)
 
@@ -1075,7 +1077,7 @@ class AsyncMPClient(MPClient):
 
     # SSLO
     async def send_slo_updates_async(
-        self, updates: list[tuple[str, str, float]]
+        self, updates: list[tuple[str, str, float, int]]
     ) -> None:
         if updates:
             await self._send_input(EngineCoreRequestType.SLO_UPDATE, updates)
@@ -1497,12 +1499,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     # SSLO
     async def send_slo_updates_async(
-        self, updates: list[tuple[str, str, float]]
+        self, updates: list[tuple[str, str, float, int]]
     ) -> None:
         if not updates:
             return
         by_engine: defaultdict[
-            EngineIdentity, list[tuple[str, str, float]]
+            EngineIdentity, list[tuple[str, str, float, int]]
         ] = defaultdict(list)
         for update in updates:
             req_id = update[0]

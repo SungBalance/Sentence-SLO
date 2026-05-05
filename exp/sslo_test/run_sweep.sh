@@ -5,7 +5,8 @@
 #   run_sweep.sh [num_runs=3]
 #
 # Env vars:
-#   PARALLEL=0    0=sequential, 2=2-GPU round-robin, 4=4-GPU round-robin
+#   PARALLEL=0    0=sequential (single GPU), 4=4-GPU parallel using
+#                 GPU_RATE_ASSIGNMENTS (manual rate→GPU map below).
 #
 # Run inside the sk-sslo container from /workspace/mlsys.
 set -euo pipefail
@@ -15,16 +16,27 @@ PARALLEL="${PARALLEL:-0}"
 
 MODEL="Qwen/Qwen3.5-35B-A3B"
 NUM_PROMPTS=256
-GENERATION_MAX_TOKENS=512
-MAX_MODEL_LEN=8192
+GENERATION_MAX_TOKENS=4096
+MAX_MODEL_LEN=0   # 0 = auto: vLLM derives from the model's HF config max
 TENSOR_PARALLEL_SIZE=1
-GPU_MEMORY_UTILIZATION=0.90
+GPU_MEMORY_UTILIZATION=0.95
 SECONDS_PER_WORD=0.28
 MODES="baseline,sslo,sslo_adaptive"
 
 CHUNK_UNITS=(sentence)
-MAX_NUM_SEQS_VALUES=(32 64)
-REQUEST_RATES=(0 2 8 16)
+MAX_NUM_SEQS_VALUES=(16 32 64 128)
+REQUEST_RATES=(0 4 16 32 64 128)
+
+# Manual GPU → rates assignment (one space-separated rate list per GPU).
+# Goal: balance wallclock — rate=4 is the slowest (256/4 = 64s arrival),
+# rate=0 the fastest (instant arrival), the rest scale by 1/rate. Pair so
+# the four GPUs finish around the same time.
+GPU_RATE_ASSIGNMENTS=(
+  "4"          # GPU 0 (slowest alone)
+  "16 128"     # GPU 1
+  "32 64"      # GPU 2
+  "0"          # GPU 3 (fastest alone)
+)
 
 BASE_OUTPUT="exp/sslo_test/output_sweep"
 BASE_SEED=42
@@ -181,8 +193,8 @@ run_subset() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-if [[ "${PARALLEL}" != "0" && "${PARALLEL}" != "2" && "${PARALLEL}" != "4" ]]; then
-  echo "ERROR: PARALLEL=${PARALLEL} is not supported. Supported values: 0, 2, 4." >&2
+if [[ "${PARALLEL}" != "0" && "${PARALLEL}" != "4" ]]; then
+  echo "ERROR: PARALLEL=${PARALLEL} is not supported. Supported values: 0, 4." >&2
   exit 1
 fi
 
@@ -195,17 +207,9 @@ for unit in "${CHUNK_UNITS[@]}"; do
   if [[ "${PARALLEL}" == "0" ]]; then
     run_subset "${unit}" "" "${REQUEST_RATES[@]}"
   else
-    N="${PARALLEL}"
     pids=()
-    for (( gpu_id=0; gpu_id<N; gpu_id++ )); do
-      gpu_rates=()
-      idx=0
-      for rate in "${REQUEST_RATES[@]}"; do
-        if (( idx % N == gpu_id )); then
-          gpu_rates+=("${rate}")
-        fi
-        (( idx++ )) || true
-      done
+    for (( gpu_id=0; gpu_id<${#GPU_RATE_ASSIGNMENTS[@]}; gpu_id++ )); do
+      read -ra gpu_rates <<< "${GPU_RATE_ASSIGNMENTS[gpu_id]}"
       echo "  GPU${gpu_id} rates=${gpu_rates[*]:-<none>}"
       if [[ ${#gpu_rates[@]} -gt 0 ]]; then
         run_subset "${unit}" "${gpu_id}" "${gpu_rates[@]}" \

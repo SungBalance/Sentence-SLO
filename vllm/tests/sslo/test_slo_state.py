@@ -483,3 +483,78 @@ class TestSsloScore:
         state.on_text_delta("Hello world. ", now)
         state.on_text_delta("Next sentence. ", now + 0.1)
         assert state.sslo_score == state.cumulative_slack
+
+
+# ---------------------------------------------------------------------------
+# min_chunk_tokens guard tests
+# ---------------------------------------------------------------------------
+
+
+class TestMinChunkTokensGuard:
+    def test_default_zero_disables_guard(self):
+        """min_chunk_tokens=0 (the standalone default) preserves old flush
+        behavior — every detected boundary flushes regardless of token count.
+        """
+        state = RequestSLOState()
+        state.on_text_delta("Hello world.", 1.0, num_tokens=2)
+        # Boundary detected at sentence end, chunk is flushed with only 2 tokens.
+        assert len(state.chunk_records) == 1
+        assert state.chunk_records[0]["text"] == "Hello world."
+
+    def test_short_chunk_deferred_until_threshold_exceeded(self):
+        """A boundary that produces a chunk with <= min_chunk_tokens tokens
+        is deferred and merged into the next chunk."""
+        state = RequestSLOState(min_chunk_tokens=16)
+        # First sentence: 5 tokens -> below threshold, defer.
+        state.on_text_delta("Hello world. ", 1.0, num_tokens=5)
+        assert len(state.chunk_records) == 0
+        # Second sentence: +20 tokens -> cumulative 25 > 16, flush at the
+        # boundary inside this delta. The flushed chunk should contain BOTH
+        # sentences (the deferred + the current one).
+        state.on_text_delta("This sentence is longer than sixteen tokens.", 2.0,
+                            num_tokens=20)
+        assert len(state.chunk_records) == 1
+        assert "Hello world." in state.chunk_records[0]["text"]
+        assert "longer than sixteen tokens." in state.chunk_records[0]["text"]
+
+    def test_consecutive_short_chunks_all_merged(self):
+        """Multiple short chunks in a row keep deferring until the cumulative
+        token count exceeds the threshold."""
+        state = RequestSLOState(min_chunk_tokens=10)
+        state.on_text_delta("A. ", 1.0, num_tokens=2)   # cum=2
+        state.on_text_delta("B. ", 2.0, num_tokens=2)   # cum=4
+        state.on_text_delta("C. ", 3.0, num_tokens=2)   # cum=6
+        state.on_text_delta("D. ", 4.0, num_tokens=2)   # cum=8
+        assert len(state.chunk_records) == 0  # all deferred so far
+        state.on_text_delta("E and more. ", 5.0, num_tokens=5)  # cum=13 > 10
+        assert len(state.chunk_records) == 1
+        # All five sentences merged into the first emitted chunk.
+        text = state.chunk_records[0]["text"]
+        for needle in ("A.", "B.", "C.", "D.", "E and more."):
+            assert needle in text
+
+    def test_on_finish_exempts_short_last_chunk(self):
+        """on_finish flushes the trailing pending text regardless of how few
+        tokens it has — the last chunk is exempt from the guard."""
+        state = RequestSLOState(min_chunk_tokens=16)
+        state.on_text_delta("Tiny.", 1.0, num_tokens=2)
+        assert len(state.chunk_records) == 0  # deferred
+        state.on_finish(2.0)
+        assert len(state.chunk_records) == 1
+        assert state.chunk_records[0]["text"] == "Tiny."
+
+    def test_after_flush_token_counter_resets(self):
+        """After a flush, the next chunk starts counting tokens from zero,
+        so a fresh short chunk after a long flushed one is again deferred."""
+        state = RequestSLOState(min_chunk_tokens=10)
+        # Delta 1: 12 tokens -> first sentence boundary flushes.
+        state.on_text_delta("First long enough sentence here.", 1.0,
+                            num_tokens=12)
+        assert len(state.chunk_records) == 1
+        # Delta 2: 3 tokens, sentence boundary -> below threshold, deferred.
+        state.on_text_delta("Short.", 2.0, num_tokens=3)
+        assert len(state.chunk_records) == 1  # still 1, not flushed
+        # on_finish forces the deferred tail out.
+        state.on_finish(3.0)
+        assert len(state.chunk_records) == 2
+        assert state.chunk_records[1]["text"] == "Short."

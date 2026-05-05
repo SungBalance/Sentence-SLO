@@ -120,7 +120,7 @@ class OutputProcessorOutput:
     request_outputs: list[RequestOutput | PoolingRequestOutput]
     reqs_to_abort: list[str]
     # SSLO
-    slo_updates: list[tuple[str, str, float]]
+    slo_updates: list[tuple[str, str, float, int]]
 
 
 @dataclass
@@ -203,12 +203,12 @@ class RequestState:
         _cfg = sslo_config if sslo_config is not None else _SsloConfig()
         self.slo_state: RequestSLOState = build_slo_state(_cfg)
         # SSLO
-        self._slo_pending_text_updates: list[tuple[str, float]] = []
+        self._slo_pending_text_updates: list[tuple[str, float, int]] = []
         # SSLO
         self._slo_text_len: int = 0  # tracks cumulative text length for delta extraction
 
     # SSLO
-    def take_slo_text_updates(self) -> list[tuple[str, float]]:
+    def take_slo_text_updates(self) -> list[tuple[str, float, int]]:
         out = self._slo_pending_text_updates
         self._slo_pending_text_updates = []
         return out
@@ -436,9 +436,15 @@ class RequestState:
                     slo_text = text[self._slo_text_len:]
                     self._slo_text_len = len(text)
                 if slo_text:
-                    self.slo_state.on_text_delta(slo_text, now)
+                    # SSLO: count new tokens for the min_chunk_tokens guard.
+                    # `token_ids` here is still the per-iteration new tokens
+                    # (it gets reassigned below in non-delta mode).
+                    num_new_tokens = len(token_ids)
+                    self.slo_state.on_text_delta(slo_text, now, num_new_tokens)
                     # SSLO
-                    self._slo_pending_text_updates.append((slo_text, now))
+                    self._slo_pending_text_updates.append(
+                        (slo_text, now, num_new_tokens)
+                    )
             if finished:
                 self.slo_state.on_finish(now)
         if not delta:
@@ -659,7 +665,8 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
-        slo_updates: list[tuple[str, str, float]] = []
+        # SSLO
+        slo_updates: list[tuple[str, str, float, int]] = []
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -721,8 +728,8 @@ class OutputProcessor:
                     request_outputs.append(request_output)
 
             # SSLO
-            for text, ts in req_state.take_slo_text_updates():
-                slo_updates.append((req_id, text, ts))
+            for text, ts, num_tokens in req_state.take_slo_text_updates():
+                slo_updates.append((req_id, text, ts, num_tokens))
 
             # Free completed requests.
             if finish_reason is not None:

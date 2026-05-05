@@ -268,6 +268,7 @@ class RequestSLOState:
         pending_enter_factor: float = 2.5,
         pending_pressure_lambda: float = 0.0,
         pending_hysteresis_gap: float = 0.5,
+        min_chunk_tokens: int = 0,
     ) -> None:
         self._estimator: ConsumeEstimator = (
             estimator if estimator is not None else WordRateEstimator()
@@ -278,6 +279,9 @@ class RequestSLOState:
         self._decoding_start: float | None = None
         self._cumulative_consume: float = 0.0
         self._pending_text: str = ""
+        self._pending_chunk_tokens: int = 0
+        self._search_offset: int = 0
+        self._min_chunk_tokens: int = min_chunk_tokens
         self._chunk_count: int = 0
         self.cumulative_slack: float = 0.0
         self._slack_dirty: bool = False
@@ -319,18 +323,42 @@ class RequestSLOState:
     def chunk_gen_estimator(self) -> ChunkGenerationEstimator:
         return self._chunk_gen_estimator
 
-    def on_text_delta(self, text: str, now: float) -> None:
+    def on_text_delta(self, text: str, now: float, num_tokens: int = 0) -> None:
         if self._decoding_start is None:
             self._decoding_start = now
         self._pending_text += text
-        while (pos := self._detector.find_boundary(self._pending_text)) is not None:
+        self._pending_chunk_tokens += num_tokens
+        while True:
+            sub = self._pending_text[self._search_offset:]
+            rel_pos = self._detector.find_boundary(sub)
+            if rel_pos is None:
+                break
+            pos = self._search_offset + rel_pos
+            if (
+                self._min_chunk_tokens > 0
+                and self._pending_chunk_tokens <= self._min_chunk_tokens
+            ):
+                # Defer: the chunk up to this boundary is too short. Skip
+                # past it so the next find_boundary searches further along
+                # the same accumulated text; keep _pending_chunk_tokens so
+                # the eventual flush counts the full merged span.
+                self._search_offset = pos
+                continue
             self._flush_chunk(now, pos)
+            # _flush_chunk slices _pending_text in place, so reset the
+            # offset and the per-chunk token counter.
+            self._search_offset = 0
+            self._pending_chunk_tokens = 0
 
     def on_finish(self, now: float) -> None:
         if self._decoding_start is None:
             self._decoding_start = now
         if self._pending_text:
+            # Last chunk is exempt from the min_chunk_tokens guard — flush
+            # remaining text regardless of token count.
             self._flush_chunk(now, len(self._pending_text))
+        self._search_offset = 0
+        self._pending_chunk_tokens = 0
 
     def on_pending_enter(self, now: float) -> None:
         """Mark the start of a pending interval."""

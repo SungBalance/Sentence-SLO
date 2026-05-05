@@ -72,6 +72,10 @@ def queue_stall_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | Non
 
 
 def slack_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    # Exclude chunk_idx == 0: cumulative_slack is fixed at 0.0 for the first
+    # chunk by definition (deadline starts there), so including it dilutes
+    # both the violation ratio and the distribution stats.
+    rows = [r for r in rows if r.get("chunk_idx") not in (None, 0)]
     values = numeric_values(rows, "cumulative_slack")
     neg_count = sum(1 for v in values if v < 0)
     return {

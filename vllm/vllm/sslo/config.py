@@ -24,6 +24,7 @@ class SsloConfig:
     pending_warmup_chunks: int = 5
     pending_pressure_lambda: float = 0.05
     pending_hysteresis_gap: float = 0.5
+    min_chunk_tokens: int = 16
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
@@ -41,6 +42,10 @@ class SsloConfig:
                 "chunk_gen_estimator must be one of "
                 f"{_VALID_CHUNK_GEN_ESTIMATORS}, "
                 f"got {self.chunk_gen_estimator!r}"
+            )
+        if self.min_chunk_tokens < 0:
+            raise ValueError(
+                f"min_chunk_tokens must be >= 0, got {self.min_chunk_tokens}"
             )
 
 
@@ -70,4 +75,5 @@ def build_slo_state(config: SsloConfig) -> "RequestSLOState":
         pending_warmup_chunks=config.pending_warmup_chunks,
         pending_pressure_lambda=config.pending_pressure_lambda,
         pending_hysteresis_gap=config.pending_hysteresis_gap,
+        min_chunk_tokens=config.min_chunk_tokens,
     )

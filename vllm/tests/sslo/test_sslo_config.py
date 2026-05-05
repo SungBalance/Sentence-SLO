@@ -25,6 +25,19 @@ class TestSsloConfig:
         assert cfg.chunk_gen_p99_window == 100
         assert cfg.pending_pressure_lambda == 0.05
         assert cfg.pending_hysteresis_gap == 0.5
+        assert cfg.min_chunk_tokens == 16
+
+    def test_min_chunk_tokens_custom(self):
+        cfg = SsloConfig(min_chunk_tokens=32)
+        assert cfg.min_chunk_tokens == 32
+
+    def test_min_chunk_tokens_zero_allowed(self):
+        cfg = SsloConfig(min_chunk_tokens=0)
+        assert cfg.min_chunk_tokens == 0
+
+    def test_min_chunk_tokens_negative_raises(self):
+        with pytest.raises(ValueError, match="min_chunk_tokens"):
+            SsloConfig(min_chunk_tokens=-1)
 
     def test_invalid_chunk_unit_raises(self):
         with pytest.raises(ValueError, match="chunk_unit"):
@@ -46,7 +59,10 @@ class TestBuildSloState:
 
     def test_paragraph_unit_uses_paragraph_detector(self):
         import time
-        state = build_slo_state(SsloConfig(chunk_unit="paragraph"))
+        # min_chunk_tokens=0 here so this test only exercises the detector
+        # choice, not the min-token guard.
+        state = build_slo_state(SsloConfig(chunk_unit="paragraph",
+                                           min_chunk_tokens=0))
         now = time.monotonic()
         state.on_text_delta("Hello world. More text.", now)
         assert len(state.chunk_records) == 0  # sentence boundary ignored
@@ -64,3 +80,7 @@ class TestBuildSloState:
             state.chunk_gen_estimator,
             PercentileChunkGenerationEstimator,
         )
+
+    def test_min_chunk_tokens_propagated(self):
+        state = build_slo_state(SsloConfig(min_chunk_tokens=24))
+        assert state._min_chunk_tokens == 24

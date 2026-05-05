@@ -35,7 +35,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--dataset-name", default="koala")
     parser.add_argument("--num-prompts", type=int, default=256)
-    parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument(
+        "--max-model-len", type=int, default=0,
+        help="Max model context length. 0 (default) = auto, "
+             "let vLLM derive from the model's HF config.",
+    )
     parser.add_argument("--max-num-seqs", type=int, default=64)
     parser.add_argument("--generation-max-tokens", type=int, default=512)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
@@ -86,15 +90,20 @@ def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
     records = getattr(request_output, "slo_chunk_records", None)
     if not records:
         return []
+    # records is a list of dicts (RequestSLOState.chunk_records returns
+    # asdict() results); use dict.get, not getattr-which-returns-None.
+    def _val(r, k):
+        return r.get(k) if isinstance(r, dict) else getattr(r, k, None)
+
     normalized = []
     for record in records:
         normalized.append({
-            "chunk_idx": getattr(record, "chunk_idx", None),
-            "cumulative_slack": getattr(record, "cumulative_slack", None),
-            "gen_time": getattr(record, "gen_time", None),
-            "pending_time": getattr(record, "pending_time", None),
-            "word_count": getattr(record, "word_count", None),
-            "end_time_ts": getattr(record, "end_time_ts", None),
+            "chunk_idx": _val(record, "chunk_idx"),
+            "cumulative_slack": _val(record, "cumulative_slack"),
+            "gen_time": _val(record, "gen_time"),
+            "pending_time": _val(record, "pending_time"),
+            "word_count": _val(record, "word_count"),
+            "end_time_ts": _val(record, "end_time_ts"),
         })
     return normalized
 
@@ -231,7 +240,6 @@ async def run_one(args: argparse.Namespace) -> None:
 
     engine_kwargs: dict[str, Any] = dict(
         model=args.model,
-        max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
@@ -241,6 +249,9 @@ async def run_one(args: argparse.Namespace) -> None:
         # (temperature, top_p, top_k, etc.) come from the model.
         generation_config="auto",
     )
+    if args.max_model_len > 0:
+        engine_kwargs["max_model_len"] = args.max_model_len
+    # else: omit so vLLM picks the model's config max.
     if kv_transfer_config is not None:
         engine_kwargs["kv_transfer_config"] = kv_transfer_config
         engine_kwargs["disable_hybrid_kv_cache_manager"] = False
