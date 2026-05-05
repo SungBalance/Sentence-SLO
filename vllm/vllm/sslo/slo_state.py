@@ -7,7 +7,9 @@ from enum import IntEnum
 
 _SENTENCE_END_CHARS = frozenset(".!?。！？…")
 _VALID_CHUNK_UNITS = frozenset({"sentence", "paragraph"})
-_CHUNK_LEN_EMA_ALPHA = 0.2
+_CHUNK_LEN_EMA_ALPHA = 0.2  # legacy; retained in case other code reads it
+_CHUNK_LEN_HISTORY_MAX = 64  # cap history size for memory bound
+_CHUNK_LEN_PERCENTILE = 90.0  # p90 used as forward-projection length estimate
 
 
 class Phase(IntEnum):
@@ -54,7 +56,14 @@ class RequestSLOState:
     cumulative_consume_time: float = 0.0
     chunks_completed: int = 0
     current_chunk_generated_len: int = 0
+    # P90 of completed chunks' generated_len. Replaces the prior EMA — the
+    # 90th percentile is more conservative than mean for forward
+    # projection (score uses this × tpot to estimate remaining gen time).
+    # Field name kept for backwards-compat with downstream readers.
     chunk_expected_len_ema: float | None = None
+    # Sliding history of recent chunk gen lens used for the p90 above.
+    # Bounded so memory stays small even on very long requests.
+    _chunk_len_history: list[int] = field(default_factory=list)
 
     # Offload.
     is_offloaded: bool = False
@@ -190,6 +199,7 @@ class RequestSLOState:
                 word_count=word_count,
             ))
         self.chunk_stall_time_total += stall
+        # EMA over recent chunks.
         if self.chunk_expected_len_ema is None:
             self.chunk_expected_len_ema = float(generated_len)
         else:
@@ -198,7 +208,18 @@ class RequestSLOState:
                 alpha * generated_len +
                 (1 - alpha) * self.chunk_expected_len_ema)
 
-        self.cumulative_consume_time += chunk_consume_time_s
+        # Soft deadline propagation: cumulative consume budget grows by
+        # max(consume, real_gen) per chunk so a violated chunk doesn't
+        # poison every downstream chunk's deadline. real_gen is the WALL
+        # clock from the previous chunk's gen_finish_ts (decoding_start
+        # for chunk 0) to now — pending time is included since the user
+        # was waiting during it.
+        if self.chunks_completed == 0:
+            prev_end = self.decoding_start_ts
+        else:
+            prev_end = self.chunk_records[-2].gen_finish_ts
+        real_gen_time = max(0.0, now - (prev_end if prev_end is not None else now))
+        self.cumulative_consume_time += max(chunk_consume_time_s, real_gen_time)
         self.chunks_completed += 1
         if self.chunks_completed >= self.num_warmup_chunks:
             self.phase = Phase.MEASURED

@@ -86,6 +86,8 @@ def make_scheduler(
     scheduler.sslo_config = cfg or SsloConfig(enabled=True)
     scheduler.tpot_ema = {max_num_running_reqs: 1.0}
     scheduler._sslo_wall_step_ema_s = 1.0
+    scheduler._sslo_avg_score = None
+    scheduler._sslo_max_score = None
     scheduler.sslo_offloaded = set()
     scheduler._sslo_prev_step_batch = None
     scheduler._sslo_prev_step_decoding_only = False

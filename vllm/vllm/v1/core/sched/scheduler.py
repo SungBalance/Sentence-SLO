@@ -203,6 +203,10 @@ class Scheduler(SchedulerInterface):
         self._sslo_pre_step_computed: dict[str, int] = {}
         # SSLO
         self._sslo_has_critical: bool = False
+        # SSLO: average + max score across admitted, recomputed each policy
+        # step. avg is diagnostic; max drives admission cap.
+        self._sslo_avg_score: float | None = None
+        self._sslo_max_score: float | None = None
         # SSLO
         self._sslo_active_cap: int = self.max_num_running_reqs
 
@@ -1212,6 +1216,19 @@ class Scheduler(SchedulerInterface):
 
         # SSLO: per-step stats for offline analysis. Gated by env var so it's
         # zero overhead when not requested.
+        # Average + max score across admitted. avg drives diagnostics; max
+        # drives the waiting-admission cap combined < max_num_running_reqs
+        # / max_score (admit only when no admitted is near SLO boundary).
+        finite_scores = [
+            s for s in scores.values()
+            if s is not None and s != float("inf")
+        ]
+        avg_score = (sum(finite_scores) / len(finite_scores)
+                     if finite_scores else None)
+        max_score = max(finite_scores) if finite_scores else None
+        self._sslo_avg_score = avg_score
+        self._sslo_max_score = max_score
+
         log_path = os.environ.get("SSLO_STATS_LOG_PATH")
         if log_path:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -1225,6 +1242,9 @@ class Scheduler(SchedulerInterface):
                 "waiting": len(self.waiting) + len(self.skipped_waiting),
                 "active_cap": self._sslo_active_cap,
                 "has_critical": self._sslo_has_critical,
+                "avg_score": avg_score,
+                "max_score": max_score,
+                "wall_step_ema_s": self._sslo_wall_step_ema_s,
             }
             with open(log_path, "a") as f:
                 f.write(json.dumps(stats_row) + "\n")
@@ -1293,6 +1313,7 @@ class Scheduler(SchedulerInterface):
             "total_step_count": state.total_step_count,
             "prefill_step_count": state.prefill_step_count,
             "chunks_completed": state.chunks_completed,
+            "num_preemptions": getattr(request, "num_preemptions", 0),
         }
         try:
             with open(log_path, "a") as f:
@@ -1742,6 +1763,14 @@ class Scheduler(SchedulerInterface):
                     break
                 if len(self.running) == self.max_num_running_reqs:
                     break
+                # SSLO: cap admitted at max_num_running_reqs / max_score.
+                # The most-at-risk admitted request defines available
+                # capacity; admit only while combined stays under that bound.
+                max_s = self._sslo_max_score
+                if max_s is not None and max_s > 0:
+                    combined = len(self.running) + len(self.sslo_pending)
+                    if combined >= self.max_num_running_reqs / max_s:
+                        break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
