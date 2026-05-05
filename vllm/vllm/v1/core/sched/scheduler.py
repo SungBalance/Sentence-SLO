@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -1148,12 +1150,53 @@ class Scheduler(SchedulerInterface):
                 overflow = cands_running[cap:]
                 cands_running = cands_running[:cap]
                 cands_pending.extend(overflow)
+            self._sslo_active_cap = cap
+
+            # SSLO: backfill running from pending so this step's batch hits
+            # cap when supply exists. Reserve room for waiting first
+            # (waiting > pending priority per spec). Done BEFORE the running
+            # loop so backfilled requests get tokens THIS step — keeps batch
+            # constant in non-adaptive sslo mode.
+            slack = cap - len(cands_running)
+            waiting_count = len(self.waiting) + len(self.skipped_waiting)
+            backfill_budget = max(0, slack - waiting_count)
+            if backfill_budget > 0 and cands_pending:
+                pending_pool = [
+                    r for r in cands_pending
+                    if r.request_id not in self.sslo_offloaded
+                ]
+                pending_pool.sort(
+                    key=lambda req: self._priority_key(
+                        scores[req.request_id], req.request_id))
+                for pick in pending_pool[:backfill_budget]:
+                    cands_pending.remove(pick)
+                    cands_running.append(pick)
+
             new_running = cands_running
             new_pending = cands_pending
 
         self.running = new_running
         self.sslo_pending = new_pending
         self._fire_pending_lifecycle(prev_pending_ids, new_running, new_pending, now)
+
+        # SSLO: per-step stats for offline analysis. Gated by env var so it's
+        # zero overhead when not requested.
+        log_path = os.environ.get("SSLO_STATS_LOG_PATH")
+        if log_path:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            stats_row = {
+                "ts": now,
+                "running": len(self.running),
+                "pending": len(self.sslo_pending),
+                "offloaded": len(self.sslo_offloaded),
+                "combined": len(self.running) + len(self.sslo_pending),
+                "waiting": len(self.waiting) + len(self.skipped_waiting),
+                "active_cap": self._sslo_active_cap,
+                "has_critical": self._sslo_has_critical,
+            }
+            with open(log_path, "a") as f:
+                f.write(json.dumps(stats_row) + "\n")
+
         return scores
 
     # SSLO
@@ -1925,24 +1968,9 @@ class Scheduler(SchedulerInterface):
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
-        # SSLO
-        if not self._sslo_has_critical:
-            while len(self.running) < self.max_num_running_reqs and self.sslo_pending:
-                candidates = [
-                    req for req in self.sslo_pending
-                    if req.request_id not in self.sslo_offloaded
-                ]
-                if not candidates:
-                    break
-                candidates.sort(
-                    key=lambda req: self._priority_key(
-                        sslo_scores.get(req.request_id), req.request_id))
-                pick = candidates[0]
-                self.sslo_pending.remove(pick)
-                self.running.append(pick)
-                state = pick.slo_state
-                assert state is not None
-                state.on_pending_exit(scheduled_timestamp)
+        # SSLO: pending-backfill happens inside _apply_sslo_policy (BEFORE
+        # the running loop) so backfilled requests get tokens this step and
+        # batch size stays at cap in non-adaptive mode.
 
         # SSLO: _reload_check already runs at the head of _apply_sslo_policy
         # so reloaded requests participate in this step's placement.

@@ -216,8 +216,11 @@ def test_non_critical_pending_to_running_at_07():
 
 
 def test_non_critical_running_to_pending_at_03():
+    # Demoted req stays in pending only when waiting blocks the backfill —
+    # otherwise the next step backfills it right back to keep batch at cap.
     req = make_request("running", make_state(deadline=10, expected_len=2))
     scheduler = make_scheduler(running=[req], max_num_running_reqs=1)
+    scheduler.waiting = [object()]  # waiting reserves the backfill slot
 
     scheduler._apply_sslo_policy(0.0)
 
@@ -229,11 +232,25 @@ def test_non_critical_hysteresis_keeps_state_in_band():
     running = make_request("running", make_state(deadline=10, expected_len=5))
     scheduler = make_scheduler(running=[running], pending=[pending],
                                max_num_running_reqs=2)
+    scheduler.waiting = [object()]  # block backfill so band placement holds
 
     scheduler._apply_sslo_policy(0.0)
 
     assert running in scheduler.running
     assert pending in scheduler.sslo_pending
+
+
+def test_non_critical_pending_backfills_when_waiting_empty():
+    # No waiting → pending request that's normally held in pending gets
+    # backfilled into running so this step's batch hits cap.
+    pending = make_request("pending", make_state(deadline=10, expected_len=5))
+    scheduler = make_scheduler(pending=[pending], max_num_running_reqs=1)
+    # Waiting empty (default) → backfill_budget == slack == 1.
+
+    scheduler._apply_sslo_policy(0.0)
+
+    assert pending in scheduler.running
+    assert scheduler.sslo_pending == []
 
 
 def test_cap_overflow_priority_sort():
@@ -249,11 +266,16 @@ def test_cap_overflow_priority_sort():
 
 
 def test_score_suspend_when_tpot_unobserved():
+    # Score-suspend keeps the score-based hysteresis off, but backfill still
+    # runs to keep batch at cap (the "non-adaptive batch is constant" rule).
+    # waiting is non-empty here to block backfill so we can verify the
+    # placement-preserving aspect of suspend mode.
     running = make_request("running", make_state(deadline=10, expected_len=2))
     pending = make_request("pending", make_state(deadline=10, expected_len=9))
     scheduler = make_scheduler(running=[running], pending=[pending],
                                max_num_running_reqs=2)
     scheduler.tpot_ema = {}
+    scheduler.waiting = [object()]  # block backfill
 
     scheduler._apply_sslo_policy(0.0)
 
