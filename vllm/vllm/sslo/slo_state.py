@@ -241,6 +241,9 @@ class SLOChunkRecord:
 class RequestSLOState:
     """Tracks cumulative SLO slack for a single streaming request.
 
+    Slack sign convention: slack > 0 is healthy; slack < 0 is
+    overdue. Both realtime_slack and cumulative_slack follow this sign.
+
     Usage::
 
         state = RequestSLOState()

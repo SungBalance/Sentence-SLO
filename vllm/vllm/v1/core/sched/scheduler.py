@@ -118,6 +118,18 @@ class Scheduler(SchedulerInterface):
         # SSLO
         self.sslo_consecutive_pending = {}
         # SSLO
+        self.sslo_pending_entered_at: dict[str, float] = {}
+        # SSLO
+        self.sslo_forced_pending_due_to_cap: dict[str, int] = {}
+        # SSLO
+        self.current_max_num_running_reqs: int = self.max_num_running_reqs
+        # SSLO
+        self._sslo_cap_safe_steps: int = 0
+        # SSLO
+        self._sslo_iter_time_ema_s: float = 0.0
+        # SSLO
+        self._sslo_last_schedule_ts: float | None = None
+        # SSLO
         if self.sslo_config.enabled:
             self.schedule = self.schedule_sslo
         self.max_num_scheduled_tokens = (
@@ -975,69 +987,182 @@ class Scheduler(SchedulerInterface):
         return scheduler_output
 
     # SSLO
+    def _update_sslo_iter_time_ema(self, now: float) -> None:
+        if self._sslo_last_schedule_ts is None:
+            self._sslo_last_schedule_ts = now
+            return
+        delta = max(0.0, now - self._sslo_last_schedule_ts)
+        alpha = self.sslo_config.iter_time_ema_alpha
+        if self._sslo_iter_time_ema_s == 0.0:
+            self._sslo_iter_time_ema_s = delta
+        else:
+            self._sslo_iter_time_ema_s = (
+                alpha * delta + (1.0 - alpha) * self._sslo_iter_time_ema_s
+            )
+        self._sslo_last_schedule_ts = now
+
+    # SSLO
+    def _sslo_max_pending_duration_s(self) -> float:
+        return self.sslo_config.max_pending_num * self._sslo_iter_time_ema_s
+
+    # SSLO
+    def _classify_must_run_tier(self, req: "Request", now: float) -> int:
+        state = req.slo_state
+        assert state is not None
+        pending_count = self.sslo_consecutive_pending.get(req.request_id, 0)
+        in_pending = any(
+            pending.request_id == req.request_id for pending in self.sslo_pending
+        )
+
+        if state.is_overdue_post_warmup():
+            return 0
+        realtime_slack = state._realtime_slack(now)
+        predicted_finish = state._predicted_finish_time()
+        if (realtime_slack is not None and predicted_finish is not None
+                and realtime_slack < predicted_finish):
+            return 0
+
+        if in_pending and state.should_exit_pending(now, pending_count):
+            return 1
+
+        if in_pending:
+            entered = self.sslo_pending_entered_at.get(req.request_id)
+            max_duration = self._sslo_max_pending_duration_s()
+            if (entered is not None and max_duration > 0.0
+                    and (now - entered) >= max_duration):
+                return 2
+
+        return 3
+
+    # SSLO
+    def _sslo_urgency_key(self, req: "Request", now: float,
+                         tier: int) -> tuple[int, float, str]:
+        state = req.slo_state
+        assert state is not None
+        realtime_slack = state._realtime_slack(now)
+        cumulative_slack = state.cumulative_slack
+        slack_values = [
+            slack for slack in (realtime_slack, cumulative_slack)
+            if slack is not None
+        ]
+        base = min(slack_values) if slack_values else 0.0
+        forced = self.sslo_forced_pending_due_to_cap.get(req.request_id, 0)
+        penalty = self.sslo_config.forced_pending_weight * forced
+        return (tier, base - penalty, req.request_id)
+
+    # SSLO
+    def _sslo_clear_pending_state(self, req: "Request",
+                                  now: float | None = None) -> None:
+        if req in self.sslo_pending:
+            if now is not None and req.slo_state is not None:
+                req.slo_state.on_pending_exit(now)
+            self.sslo_pending.remove(req)
+        self.sslo_consecutive_pending.pop(req.request_id, None)
+        self.sslo_pending_entered_at.pop(req.request_id, None)
+        self.sslo_forced_pending_due_to_cap.pop(req.request_id, None)
+
+    # SSLO
+    def _update_dynamic_cap(self, now: float) -> None:
+        if not self.sslo_config.adaptive_batch_size:
+            self.current_max_num_running_reqs = self.max_num_running_reqs
+            return
+
+        base = self.max_num_running_reqs
+        cur = self.current_max_num_running_reqs
+        cfg = self.sslo_config
+        candidates = self.running + self.sslo_pending
+        slacks = [
+            req.slo_state._realtime_slack(now)
+            for req in candidates
+            if req.slo_state is not None
+        ]
+        slacks = [slack for slack in slacks if slack is not None]
+        worst = min(slacks) if slacks else 0.0
+
+        if worst < -cfg.severe_overdue_margin_s:
+            next_cap = max(cfg.min_num_running_reqs, int(cur * 0.5))
+            self._sslo_cap_safe_steps = 0
+        elif worst < 0:
+            next_cap = max(cfg.min_num_running_reqs, int(cur * 0.75))
+            self._sslo_cap_safe_steps = 0
+        else:
+            self._sslo_cap_safe_steps += 1
+            if self._sslo_cap_safe_steps >= cfg.cap_growth_safe_steps:
+                next_cap = min(base, cur + cfg.cap_growth_step)
+                self._sslo_cap_safe_steps = 0
+            else:
+                next_cap = cur
+
+        self.current_max_num_running_reqs = next_cap
+
+    # SSLO
+    def _compute_waiting_admission_budget(self, now: float) -> int:
+        reserved = 0
+        for req in self.sslo_pending:
+            tier = self._classify_must_run_tier(req, now)
+            if tier in (0, 1):
+                reserved += 1
+        return max(
+            0,
+            self.current_max_num_running_reqs - len(self.running) - reserved,
+        )
+
+    # SSLO
     def schedule_sslo(self) -> SchedulerOutput:
         import time as _time
         now = _time.monotonic()
+        self._update_sslo_iter_time_ema(now)
+        self._update_dynamic_cap(now)
+
         combined = self.running + self.sslo_pending
-        combined.sort(key=_sslo_score_key)
-        new_running = []
-        new_pending = []
-        prev_pending_ids = {r.request_id for r in self.sslo_pending}
-        # SSLO
-        prev_pending_count = len(self.sslo_pending)
+        prev_pending_ids = {req.request_id for req in self.sslo_pending}
+        tiers: dict[str, int] = {}
         for req in combined:
-            was_pending = req.request_id in prev_pending_ids
-            consec = self.sslo_consecutive_pending.get(req.request_id, 0)
-            slo_state = req.slo_state
-            # Scheduler-side guards (system state); per-request slack/EMA logic
-            # is encapsulated in slo_state.should_{enter,exit}_pending(now).
-            if consec >= self.sslo_config.max_consecutive_pending:
-                eligible = False
-            elif slo_state is None or len(self.waiting) == 0:
-                eligible = False
-            elif was_pending:
-                eligible = not slo_state.should_exit_pending(
-                    now, prev_pending_count)
-            else:
-                eligible = slo_state.should_enter_pending(
-                    now, prev_pending_count)
-            if eligible:
-                if not was_pending and req.slo_state is not None:
-                    req.slo_state.on_pending_enter(now)
-                self.sslo_consecutive_pending[req.request_id] = consec + 1
-                new_pending.append(req)
-            else:
-                if was_pending and req.slo_state is not None:
-                    req.slo_state.on_pending_exit(now)
-                self.sslo_consecutive_pending[req.request_id] = 0
-                new_running.append(req)
+            tiers[req.request_id] = self._classify_must_run_tier(req, now)
 
-        # SSLO (adaptive_batch_size): shadow as local; halve if any request
-        # is overdue post-warmup (uses pending_warmup_chunks as the gate, so
-        # transient negative slack on the very first chunks does not trigger).
-        max_num_running_reqs = self.max_num_running_reqs
-        if self.sslo_config.adaptive_batch_size and any(
-            r.slo_state is not None and r.slo_state.is_overdue_post_warmup()
-            for r in new_running
-        ):
-            max_num_running_reqs = max(1, max_num_running_reqs // 2)
+        must_pool = [req for req in combined if tiers[req.request_id] < 3]
+        normal_pool = [req for req in combined if tiers[req.request_id] == 3]
+        must_pool.sort(
+            key=lambda req: self._sslo_urgency_key(
+                req, now, tiers[req.request_id]))
+        normal_pool.sort(key=lambda req: self._sslo_urgency_key(req, now, 3))
 
-        # SSLO: enforce hard cap on len(self.running). vLLM's InputBatch is
-        # sized to max_num_seqs and asserts new_req_index < max_num_reqs, so
-        # the running list must NEVER exceed the cap. If max_consecutive_pending
-        # forces too many requests back, bump the highest-slack overflow to
-        # pending (cap takes priority over starvation prevention).
-        if len(new_running) > max_num_running_reqs:
-            new_running.sort(key=_sslo_score_key)
-            overflow = new_running[max_num_running_reqs:]
-            new_running = new_running[:max_num_running_reqs]
-            for req in overflow:
-                if req.slo_state is not None:
-                    req.slo_state.on_pending_enter(now)
+        max_num_running_reqs = self.current_max_num_running_reqs
+        if len(must_pool) >= max_num_running_reqs:
+            new_running = must_pool[:max_num_running_reqs]
+            rejected_must = must_pool[max_num_running_reqs:]
+            new_pending = rejected_must + normal_pool
+        else:
+            remaining = max_num_running_reqs - len(must_pool)
+            new_running = must_pool + normal_pool[:remaining]
+            rejected_must = []
+            new_pending = normal_pool[remaining:]
+
+        for req in rejected_must:
+            self.sslo_forced_pending_due_to_cap[req.request_id] = (
+                self.sslo_forced_pending_due_to_cap.get(req.request_id, 0) + 1
+            )
+        for req in new_running:
+            self.sslo_forced_pending_due_to_cap.pop(req.request_id, None)
+
+        for req in new_pending:
+            state = req.slo_state
+            assert state is not None
+            if req.request_id not in prev_pending_ids:
+                state.on_pending_enter(now)
+                self.sslo_pending_entered_at[req.request_id] = now
+                self.sslo_consecutive_pending[req.request_id] = 1
+            else:
                 self.sslo_consecutive_pending[req.request_id] = (
                     self.sslo_consecutive_pending.get(req.request_id, 0) + 1
                 )
-                new_pending.append(req)
+        for req in new_running:
+            state = req.slo_state
+            assert state is not None
+            if req.request_id in prev_pending_ids:
+                state.on_pending_exit(now)
+            self.sslo_pending_entered_at.pop(req.request_id, None)
+            self.sslo_consecutive_pending.pop(req.request_id, None)
 
         self.running = new_running
         self.sslo_pending = new_pending
@@ -1280,17 +1405,17 @@ class Scheduler(SchedulerInterface):
 
             # SSLO
             now_sslo = time.monotonic()
+            # SSLO
+            sslo_budget = (
+                self._compute_waiting_admission_budget(now_sslo)
+                if self.sslo_config.enabled else None
+            )
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # SSLO: use local cap (strict; redistribution above clamps len(running) to cap)
                 if len(self.running) >= max_num_running_reqs:
                     break
                 # SSLO
-                if self.sslo_config.enabled and any(
-                    r.slo_state is not None
-                    and r.slo_state.should_exit_pending(
-                        now_sslo, len(self.sslo_pending))
-                    for r in self.sslo_pending
-                ):
+                if sslo_budget is not None and sslo_budget <= 0:
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -1503,10 +1628,10 @@ class Scheduler(SchedulerInterface):
                         combined = list(self.running) + list(self.sslo_pending)
                         if combined:
                             victim = max(combined, key=_sslo_score_key)
-                            self.sslo_consecutive_pending.pop(victim.request_id, None)
-                            if victim in self.sslo_pending:
-                                self.sslo_pending.remove(victim)
-                            else:
+                            was_pending = victim in self.sslo_pending
+                            self._sslo_clear_pending_state(
+                                victim, scheduled_timestamp)
+                            if not was_pending:
                                 self.running.remove(victim)
                             self._preempt_request(victim, scheduled_timestamp)
                             preempted_reqs.append(victim)
@@ -1599,6 +1724,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                # SSLO
+                if sslo_budget is not None:
+                    sslo_budget -= 1
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # SSLO: per-request offload timing (no-op if not in offload)
@@ -2258,10 +2386,7 @@ class Scheduler(SchedulerInterface):
             self.running = remove_all(self.running, stopped_running_reqs)
             for request in stopped_running_reqs:
                 # SSLO
-                self.sslo_consecutive_pending.pop(request.request_id, None)
-                # SSLO
-                if request in self.sslo_pending:
-                    self.sslo_pending.remove(request)
+                self._sslo_clear_pending_state(request, time.monotonic())
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
@@ -2579,10 +2704,7 @@ class Scheduler(SchedulerInterface):
             self.running = remove_all(self.running, running_requests_to_remove)
             for request in running_requests_to_remove:
                 # SSLO
-                self.sslo_consecutive_pending.pop(request.request_id, None)
-                # SSLO
-                if request in self.sslo_pending:
-                    self.sslo_pending.remove(request)
+                self._sslo_clear_pending_state(request, time.monotonic())
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
@@ -2624,10 +2746,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         # SSLO
-        self.sslo_consecutive_pending.pop(request.request_id, None)
-        # SSLO
-        if request in self.sslo_pending:
-            self.sslo_pending.remove(request)
+        self._sslo_clear_pending_state(request, time.monotonic())
         del self.requests[request.request_id]
 
     @property
