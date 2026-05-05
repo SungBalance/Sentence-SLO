@@ -27,6 +27,23 @@ CHUNK_UNITS=(sentence)
 MAX_NUM_SEQS_VALUES=(16 32 64 128)
 REQUEST_RATES=(0 4 16 32 64 128)
 
+# Optional env overrides (space-separated). Useful for verification sweeps.
+if [[ -n "${MAX_NUM_SEQS_VALUES_OVERRIDE:-}" ]]; then
+  IFS=' ' read -ra MAX_NUM_SEQS_VALUES <<< "${MAX_NUM_SEQS_VALUES_OVERRIDE}"
+fi
+if [[ -n "${REQUEST_RATES_OVERRIDE:-}" ]]; then
+  IFS=' ' read -ra REQUEST_RATES <<< "${REQUEST_RATES_OVERRIDE}"
+fi
+if [[ -n "${MODES_OVERRIDE:-}" ]]; then
+  MODES="${MODES_OVERRIDE}"
+fi
+if [[ -n "${MODEL_OVERRIDE:-}" ]]; then
+  MODEL="${MODEL_OVERRIDE}"
+fi
+if [[ -n "${GENERATION_MAX_TOKENS_OVERRIDE:-}" ]]; then
+  GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS_OVERRIDE}"
+fi
+
 # Manual GPU → rates assignment (one space-separated rate list per GPU).
 # Goal: balance wallclock — rate=4 is the slowest (256/4 = 64s arrival),
 # rate=0 the fastest (instant arrival), the rest scale by 1/rate. Pair so

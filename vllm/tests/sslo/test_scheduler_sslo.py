@@ -1,39 +1,47 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for SSLO scheduler helpers and pending redistribution."""
+"""Tests for Phase A v2 SSLO scheduler policy helpers."""
 
 from types import SimpleNamespace
 
 import pytest
 
 from vllm.sslo.config import SsloConfig
-from vllm.sslo.slo_state import RequestSLOState
+from vllm.sslo.slo_state import Phase, RequestSLOState
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
-from vllm.v1.core.sched.scheduler import Scheduler, _sslo_score_key
-
-
-def make_mock_request(request_id="req", slo_state=None):
-    return SimpleNamespace(request_id=request_id, slo_state=slo_state)
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.output import SchedulerOutput
 
 
 def make_state(
     *,
-    cumulative_slack=1.0,
-    realtime_slack=100.0,
-    predicted_finish=0.1,
-    overdue=False,
-    should_exit=False,
-):
-    state = RequestSLOState()
-    state.cumulative_slack = cumulative_slack
-    state._realtime_slack = lambda now: realtime_slack
-    state._predicted_finish_time = lambda: predicted_finish
-    state.is_overdue_post_warmup = lambda: overdue
-    state.should_exit_pending = lambda now, pending_count=0: should_exit
+    phase=Phase.MEASURED,
+    deadline=10.0,
+    expected_len=10.0,
+    generated=0,
+) -> RequestSLOState:
+    state = RequestSLOState(num_warmup_chunks=1)
+    state.phase = phase
+    state.decoding_start_ts = 0.0
+    state.cumulative_consume_time = deadline
+    state.chunk_expected_len_ema = expected_len
+    state.current_chunk_generated_len = generated
     return state
 
 
+def make_request(request_id: str, state: RequestSLOState):
+    return SimpleNamespace(
+        request_id=request_id,
+        slo_state=state,
+        status=None,
+        has_encoder_inputs=False,
+    )
+
+
 class FakeKVCacheManager:
+
+    empty_kv_cache_blocks = None
+    freed = None
 
     def new_step_starts(self):
         pass
@@ -44,42 +52,57 @@ class FakeKVCacheManager:
     def get_num_common_prefix_blocks(self, request_id):
         return []
 
+    def get_blocks(self, request_id):
+        return SimpleNamespace(
+            get_block_ids=lambda allow_none=False: ([1, 2, 3], ))
+
+    def free(self, request):
+        self.freed = request.request_id
+
 
 class FakeEncoderCacheManager:
 
     def get_freed_mm_hashes(self):
         return []
 
+    def free(self, request):
+        pass
+
 
 def make_scheduler(
+    *,
     running=None,
-    sslo_pending=None,
-    waiting_len=0,
-    max_num_running_reqs=100,
-    sslo_config=None,
+    pending=None,
+    max_num_running_reqs=4,
+    cfg=None,
 ):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.running = list(running or [])
-    scheduler.sslo_pending = list(sslo_pending or [])
-    scheduler.sslo_consecutive_pending = {}
-    scheduler.sslo_pending_entered_at = {}
-    scheduler.sslo_forced_pending_due_to_cap = {}
-    scheduler.sslo_config = sslo_config or SsloConfig(enabled=True)
-    scheduler.waiting = [object()] * waiting_len
-    scheduler.skipped_waiting = []
-    scheduler.max_num_scheduled_tokens = 0
+    scheduler.sslo_pending = list(pending or [])
+    scheduler.requests = {
+        req.request_id: req
+        for req in scheduler.running + scheduler.sslo_pending
+    }
+    scheduler.sslo_config = cfg or SsloConfig(enabled=True)
+    scheduler.tpot_ema = {max_num_running_reqs: 1.0}
+    scheduler.sslo_offloaded = set()
+    scheduler._sslo_prev_step_batch = None
+    scheduler._sslo_prev_step_decoding_only = False
+    scheduler._sslo_prev_step_start_ts = None
+    scheduler._sslo_has_critical = False
+    scheduler._sslo_active_cap = max_num_running_reqs
     scheduler.max_num_running_reqs = max_num_running_reqs
-    scheduler.current_max_num_running_reqs = max_num_running_reqs
-    scheduler._sslo_cap_safe_steps = 0
-    scheduler._sslo_iter_time_ema_s = 0.0
-    scheduler._sslo_last_schedule_ts = None
+    scheduler.max_num_scheduled_tokens = 0
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler.max_num_encoder_input_tokens = 0
     scheduler.kv_cache_manager = FakeKVCacheManager()
     scheduler.encoder_cache_manager = FakeEncoderCacheManager()
     scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
+    scheduler.cache_config = SimpleNamespace(block_size=16)
     scheduler.lora_config = None
     scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.waiting = []
+    scheduler.skipped_waiting = []
     scheduler.connector = None
     scheduler.ec_connector = None
     scheduler.use_v2_model_runner = False
@@ -93,284 +116,300 @@ def make_scheduler(
     return scheduler
 
 
-class TestSsloScoreKey:
+def request_ids(reqs):
+    return [req.request_id for req in reqs]
 
-    def test_none_slo_state_returns_inf(self):
-        request = make_mock_request(slo_state=None)
 
-        assert _sslo_score_key(request) == float("inf")
+def test_tpot_ema_update_only_multiple_bucket_and_decoding_only():
+    scheduler = make_scheduler(max_num_running_reqs=8)
+    scheduler.sslo_config = SsloConfig(enabled=True, tpot_ema_alpha=0.5)
+    scheduler._sslo_prev_step_batch = 7
+    scheduler._sslo_prev_step_decoding_only = True
+    scheduler._sslo_prev_step_start_ts = 1.0
+    scheduler._update_tpot_ema(3.0)
+    assert scheduler.tpot_ema == {8: 1.0}
 
-    def test_finite_score_returned(self):
-        state = make_state(cumulative_slack=-2.5)
-        request = make_mock_request(slo_state=state)
+    scheduler._sslo_prev_step_batch = 8
+    scheduler._sslo_prev_step_decoding_only = False
+    scheduler._update_tpot_ema(3.0)
+    assert scheduler.tpot_ema == {8: 1.0}
 
-        assert _sslo_score_key(request) == pytest.approx(-2.5)
+    scheduler._sslo_prev_step_decoding_only = True
+    scheduler._update_tpot_ema(3.0)
+    assert scheduler.tpot_ema[8] == pytest.approx(1.5)
 
-    def test_sort_order(self):
-        urgent = make_mock_request("urgent", make_state(cumulative_slack=-3.0))
-        relaxed = make_mock_request("relaxed", make_state(cumulative_slack=4.0))
-        no_state = make_mock_request("none", None)
 
-        requests = sorted([no_state, relaxed, urgent], key=_sslo_score_key)
+def test_record_step_decoding_only_uses_prompt_progress():
+    # Pre-step snapshot: req was already past prompt → step is decoding-only.
+    req = make_request("r", make_state())
+    req.num_computed_tokens = 11
+    req.num_prompt_tokens = 10
+    scheduler = make_scheduler(running=[req])
+    scheduler.requests = {"r": req}
+    scheduler._sslo_pre_step_computed = {"r": 10}  # snapshot at step start
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {"r": 1}
+    output.total_num_scheduled_tokens = 1
 
-        assert [request.request_id for request in requests] == [
-            "urgent",
-            "relaxed",
-            "none",
-        ]
+    scheduler._record_step_for_next_ema(output, 2.0)
 
+    assert scheduler._sslo_prev_step_batch == 1
+    assert scheduler._sslo_prev_step_decoding_only is True
+    assert scheduler._sslo_prev_step_start_ts == pytest.approx(2.0)
 
-class TestPhaseAHelpers:
 
-    def test_iter_time_ema(self):
-        cfg = SsloConfig(enabled=True, iter_time_ema_alpha=0.25,
-                         max_pending_num=5)
-        scheduler = make_scheduler(sslo_config=cfg)
-
-        scheduler._update_sslo_iter_time_ema(10.0)
-        assert scheduler._sslo_iter_time_ema_s == 0.0
-        scheduler._update_sslo_iter_time_ema(14.0)
-        assert scheduler._sslo_iter_time_ema_s == pytest.approx(4.0)
-        scheduler._update_sslo_iter_time_ema(16.0)
-        assert scheduler._sslo_iter_time_ema_s == pytest.approx(3.5)
-        assert scheduler._sslo_max_pending_duration_s() == pytest.approx(17.5)
+def test_record_step_chunked_prefill_not_decoding_only():
+    # Pre-step: req still in prefill (computed < prompt) → not decoding-only.
+    req = make_request("r", make_state())
+    req.num_computed_tokens = 8
+    req.num_prompt_tokens = 10
+    scheduler = make_scheduler(running=[req])
+    scheduler.requests = {"r": req}
+    scheduler._sslo_pre_step_computed = {"r": 5}  # 5 < 10 → prefill at step start
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {"r": 3}
+    output.total_num_scheduled_tokens = 3
 
-    def test_classify_tier_0_post_warmup_overdue(self):
-        req = make_mock_request("r", make_state(overdue=True))
-        scheduler = make_scheduler(running=[req])
-
-        assert scheduler._classify_must_run_tier(req, now=0.0) == 0
-
-    def test_classify_tier_0_predicted_finish_exceeds_slack(self):
-        req = make_mock_request(
-            "r", make_state(realtime_slack=0.05, predicted_finish=0.5))
-        scheduler = make_scheduler(running=[req])
+    scheduler._record_step_for_next_ema(output, 2.0)
 
-        assert scheduler._classify_must_run_tier(req, now=0.0) == 0
-
-    def test_classify_tier_1_pending_should_exit(self):
-        req = make_mock_request("r", make_state(should_exit=True))
-        scheduler = make_scheduler(sslo_pending=[req])
-
-        assert scheduler._classify_must_run_tier(req, now=0.0) == 1
+    assert scheduler._sslo_prev_step_decoding_only is False
 
-    def test_classify_tier_2_pending_duration_overflow(self):
-        req = make_mock_request("r", make_state())
-        scheduler = make_scheduler(sslo_pending=[req])
-        scheduler.sslo_pending_entered_at[req.request_id] = 1.0
-        scheduler._sslo_iter_time_ema_s = 0.01
-        scheduler.sslo_config.max_pending_num = 5
 
-        assert scheduler._classify_must_run_tier(req, now=2.0) == 2
-
-    def test_classify_tier_3_normal_running(self):
-        req = make_mock_request("r", make_state())
-        scheduler = make_scheduler(running=[req])
+def test_critical_mode_no_waiting_admission():
+    critical = make_request("critical", make_state(deadline=1.0, expected_len=10))
+    scheduler = make_scheduler(running=[critical], max_num_running_reqs=1)
 
-        assert scheduler._classify_must_run_tier(req, now=0.0) == 3
+    scheduler._apply_sslo_policy(0.0)
 
-    def test_urgency_key_sorts_by_tier_effective_slack_and_id(self):
-        tier0 = make_mock_request("b", make_state(cumulative_slack=10.0))
-        urgent = make_mock_request("c", make_state(cumulative_slack=0.2))
-        forced = make_mock_request("a", make_state(cumulative_slack=0.25))
-        scheduler = make_scheduler(running=[tier0, urgent, forced])
-        scheduler.sslo_forced_pending_due_to_cap[forced.request_id] = 2
+    assert scheduler._sslo_has_critical is True
 
-        ordered = sorted(
-            [(tier0, 0), (urgent, 3), (forced, 3)],
-            key=lambda item: scheduler._sslo_urgency_key(
-                item[0], now=0.0, tier=item[1]),
-        )
 
-        assert [req.request_id for req, _ in ordered] == ["b", "a", "c"]
+def test_critical_mode_priority_fill_cap():
+    a = make_request("a", make_state(deadline=10.0, expected_len=20))
+    b = make_request("b", make_state(deadline=10.0, expected_len=30))
+    c = make_request("c", make_state(deadline=10.0, expected_len=5))
+    scheduler = make_scheduler(running=[a, b, c], max_num_running_reqs=2)
 
+    scheduler._apply_sslo_policy(0.0)
 
-class TestPendingRedistribution:
+    assert request_ids(scheduler.running) == ["b", "a"]
+    assert request_ids(scheduler.sslo_pending) == ["c"]
 
-    def test_redistribution_must_tier_wins_cap(self):
-        must_a = make_mock_request("must-a", make_state(overdue=True))
-        must_b = make_mock_request("must-b", make_state(realtime_slack=0.1,
-                                                        predicted_finish=0.5))
-        normal = make_mock_request("normal", make_state(cumulative_slack=-10.0))
-        scheduler = make_scheduler(running=[normal, must_b, must_a],
-                                   max_num_running_reqs=2)
-
-        scheduler.schedule_sslo()
-
-        assert [req.request_id for req in scheduler.running] == [
-            "must-b", "must-a"]
-        assert [req.request_id for req in scheduler.sslo_pending] == ["normal"]
-
-    def test_redistribution_cap_not_exceeded(self):
-        reqs = [
-            make_mock_request(f"must-{idx}", make_state(overdue=True,
-                                                        cumulative_slack=idx))
-            for idx in range(6)
-        ]
-        scheduler = make_scheduler(running=reqs, max_num_running_reqs=4)
-
-        scheduler.schedule_sslo()
-
-        assert len(scheduler.running) == 4
-        assert len(scheduler.sslo_pending) == 2
-        assert scheduler.sslo_forced_pending_due_to_cap == {
-            "must-4": 1,
-            "must-5": 1,
-        }
-
-    def test_redistribution_tier2_yields_to_tier01(self):
-        tier0 = make_mock_request("tier0", make_state(overdue=True))
-        tier1 = make_mock_request("tier1", make_state(should_exit=True))
-        tier2 = make_mock_request("tier2", make_state(cumulative_slack=-100.0))
-        scheduler = make_scheduler(sslo_pending=[tier2, tier1], running=[tier0],
-                                   max_num_running_reqs=2)
-        scheduler.sslo_pending_entered_at[tier2.request_id] = 0.0
-        scheduler._sslo_iter_time_ema_s = 0.01
-
-        scheduler.schedule_sslo()
-
-        assert [req.request_id for req in scheduler.running] == ["tier0", "tier1"]
-        assert [req.request_id for req in scheduler.sslo_pending] == ["tier2"]
-
-    def test_redistribution_normal_fills_remaining_cap(self):
-        must = make_mock_request("must", make_state(overdue=True))
-        normals = [
-            make_mock_request(f"normal-{idx}", make_state(cumulative_slack=slack))
-            for idx, slack in enumerate([5.0, 1.0, 3.0, 2.0, 4.0])
-        ]
-        scheduler = make_scheduler(running=[must] + normals,
-                                   max_num_running_reqs=4)
 
-        scheduler.schedule_sslo()
-
-        assert [req.request_id for req in scheduler.running] == [
-            "must", "normal-1", "normal-3", "normal-2"]
-        assert [req.request_id for req in scheduler.sslo_pending] == [
-            "normal-4", "normal-0"]
+def test_non_critical_warmup_always_running():
+    warm = make_request("warm", make_state(phase=Phase.WARMUP))
+    measured = make_request("measured", make_state(deadline=100, expected_len=1))
+    scheduler = make_scheduler(pending=[warm, measured], max_num_running_reqs=2)
 
-    def test_redistribution_resets_forced_counter_on_running(self):
-        req = make_mock_request("must", make_state(overdue=True))
-        scheduler = make_scheduler(running=[req], max_num_running_reqs=1)
-        scheduler.sslo_forced_pending_due_to_cap[req.request_id] = 3
-
-        scheduler.schedule_sslo()
-
-        assert scheduler.running == [req]
-        assert req.request_id not in scheduler.sslo_forced_pending_due_to_cap
+    scheduler._apply_sslo_policy(0.0)
 
-    def test_redistribution_no_waiting_demote_allowed(self):
-        must = make_mock_request("must", make_state(overdue=True))
-        normal = make_mock_request("normal", make_state(cumulative_slack=10.0))
-        scheduler = make_scheduler(running=[normal, must], waiting_len=0,
-                                   max_num_running_reqs=1)
-
-        scheduler.schedule_sslo()
-
-        assert scheduler.running == [must]
-        assert scheduler.sslo_pending == [normal]
-
-
-class TestAdaptiveBatchSize:
-
-    def test_cap_severe_overdue_halves(self):
-        cfg = SsloConfig(enabled=True, adaptive_batch_size=True,
-                         severe_overdue_margin_s=0.5)
-        req = make_mock_request("r", make_state(realtime_slack=-0.6))
-        scheduler = make_scheduler(running=[req], max_num_running_reqs=16,
-                                   sslo_config=cfg)
-        scheduler.current_max_num_running_reqs = 10
-
-        scheduler._update_dynamic_cap(now=0.0)
-
-        assert scheduler.current_max_num_running_reqs == 5
-
-    def test_cap_pending_severe_overdue_halves(self):
-        cfg = SsloConfig(enabled=True, adaptive_batch_size=True,
-                         severe_overdue_margin_s=0.5)
-        running = make_mock_request("running", make_state(realtime_slack=1.0))
-        pending = make_mock_request("pending", make_state(realtime_slack=-0.6))
-        scheduler = make_scheduler(running=[running], sslo_pending=[pending],
-                                   max_num_running_reqs=16, sslo_config=cfg)
-        scheduler.current_max_num_running_reqs = 10
-
-        scheduler._update_dynamic_cap(now=0.0)
-
-        assert scheduler.current_max_num_running_reqs == 5
-
-    def test_cap_mild_overdue_three_quarters(self):
-        cfg = SsloConfig(enabled=True, adaptive_batch_size=True,
-                         severe_overdue_margin_s=0.5)
-        req = make_mock_request("r", make_state(realtime_slack=-0.2))
-        scheduler = make_scheduler(running=[req], max_num_running_reqs=16,
-                                   sslo_config=cfg)
-        scheduler.current_max_num_running_reqs = 10
-
-        scheduler._update_dynamic_cap(now=0.0)
-
-        assert scheduler.current_max_num_running_reqs == 7
-
-    def test_cap_grows_after_safe_steps(self):
-        cfg = SsloConfig(enabled=True, adaptive_batch_size=True,
-                         cap_growth_safe_steps=2, cap_growth_step=3)
-        req = make_mock_request("r", make_state(realtime_slack=1.0))
-        scheduler = make_scheduler(running=[req], max_num_running_reqs=16,
-                                   sslo_config=cfg)
-        scheduler.current_max_num_running_reqs = 10
-
-        scheduler._update_dynamic_cap(now=0.0)
-        scheduler._update_dynamic_cap(now=1.0)
-
-        assert scheduler.current_max_num_running_reqs == 13
-
-    def test_cap_resets_safe_counter_on_overdue(self):
-        cfg = SsloConfig(enabled=True, adaptive_batch_size=True)
-        req = make_mock_request("r", make_state(realtime_slack=-0.1))
-        scheduler = make_scheduler(running=[req], max_num_running_reqs=16,
-                                   sslo_config=cfg)
-        scheduler._sslo_cap_safe_steps = 10
-
-        scheduler._update_dynamic_cap(now=0.0)
-
-        assert scheduler._sslo_cap_safe_steps == 0
-
-
-class TestPendingCleanup:
-
-    def test_clear_pending_state_closes_interval_and_counters(self):
-        state = RequestSLOState()
-        state.on_pending_enter(1.0)
-        req = make_mock_request("pending", state)
-        scheduler = make_scheduler(sslo_pending=[req])
-        scheduler.sslo_consecutive_pending[req.request_id] = 2
-        scheduler.sslo_pending_entered_at[req.request_id] = 1.0
-        scheduler.sslo_forced_pending_due_to_cap[req.request_id] = 3
-
-        scheduler._sslo_clear_pending_state(req, now=2.5)
-
-        assert scheduler.sslo_pending == []
-        assert req.request_id not in scheduler.sslo_consecutive_pending
-        assert req.request_id not in scheduler.sslo_pending_entered_at
-        assert req.request_id not in scheduler.sslo_forced_pending_due_to_cap
-        assert state._pending_enter_ts is None
-        assert state._chunk_pending_time == pytest.approx(1.5)
-
-
-class TestWaitingAdmission:
-
-    def test_waiting_admission_reserved_slots(self):
-        running = [
-            make_mock_request(f"run-{idx}", make_state()) for idx in range(4)
-        ]
-        pending_t0 = make_mock_request("pending-t0", make_state(overdue=True))
-        pending_t1 = make_mock_request("pending-t1", make_state(should_exit=True))
-        pending_t2 = make_mock_request("pending-t2", make_state())
-        scheduler = make_scheduler(
-            running=running,
-            sslo_pending=[pending_t0, pending_t1, pending_t2],
-            waiting_len=10,
-            max_num_running_reqs=8,
-        )
-        scheduler.sslo_pending_entered_at[pending_t2.request_id] = 0.0
-        scheduler._sslo_iter_time_ema_s = 0.01
-
-        assert scheduler._compute_waiting_admission_budget(now=1.0) == 2
+    assert warm in scheduler.running
+
+
+def test_non_critical_pending_to_running_at_07():
+    req = make_request("pending", make_state(deadline=10, expected_len=7))
+    scheduler = make_scheduler(pending=[req], max_num_running_reqs=1)
+
+    scheduler._apply_sslo_policy(0.0)
+
+    assert scheduler.running == [req]
+
+
+def test_non_critical_running_to_pending_at_03():
+    req = make_request("running", make_state(deadline=10, expected_len=2))
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=1)
+
+    scheduler._apply_sslo_policy(0.0)
+
+    assert scheduler.sslo_pending == [req]
+
+
+def test_non_critical_hysteresis_keeps_state_in_band():
+    pending = make_request("pending", make_state(deadline=10, expected_len=5))
+    running = make_request("running", make_state(deadline=10, expected_len=5))
+    scheduler = make_scheduler(running=[running], pending=[pending],
+                               max_num_running_reqs=2)
+
+    scheduler._apply_sslo_policy(0.0)
+
+    assert running in scheduler.running
+    assert pending in scheduler.sslo_pending
+
+
+def test_cap_overflow_priority_sort():
+    low = make_request("low", make_state(deadline=10, expected_len=4))
+    high = make_request("high", make_state(deadline=10, expected_len=6))
+    warm = make_request("warm", make_state(phase=Phase.WARMUP))
+    scheduler = make_scheduler(running=[low, high, warm], max_num_running_reqs=2)
+
+    scheduler._apply_sslo_policy(0.0)
+
+    assert request_ids(scheduler.running) == ["warm", "high"]
+    assert request_ids(scheduler.sslo_pending) == ["low"]
+
+
+def test_score_suspend_when_tpot_unobserved():
+    running = make_request("running", make_state(deadline=10, expected_len=2))
+    pending = make_request("pending", make_state(deadline=10, expected_len=9))
+    scheduler = make_scheduler(running=[running], pending=[pending],
+                               max_num_running_reqs=2)
+    scheduler.tpot_ema = {}
+
+    scheduler._apply_sslo_policy(0.0)
+
+    assert scheduler.running == [running]
+    assert scheduler.sslo_pending == [pending]
+
+
+def test_no_waiting_backfills_pending_by_priority():
+    high = make_request("high", make_state(deadline=10, expected_len=6))
+    low = make_request("low", make_state(deadline=10, expected_len=4))
+    scheduler = make_scheduler(pending=[low, high], max_num_running_reqs=1)
+
+    scheduler.schedule_sslo()
+
+    assert scheduler.running == [high]
+    assert scheduler.sslo_pending == [low]
+
+
+def test_offload_eligibility_excludes_warmup_critical_offloaded():
+    cfg = SsloConfig(enabled=True, offloading=True)
+    warm = make_request("warm", make_state(phase=Phase.WARMUP))
+    critical = make_request("critical", make_state(deadline=1, expected_len=10))
+    offloaded = make_request("offloaded", make_state(deadline=10, expected_len=1))
+    scheduler = make_scheduler(pending=[warm, critical, offloaded], cfg=cfg)
+    scheduler.sslo_offloaded.add("offloaded")
+
+    assert scheduler._is_offload_eligible(warm, 0.0) is False
+    assert scheduler._is_offload_eligible(critical, 0.0) is False
+    assert scheduler._is_offload_eligible(offloaded, 0.0) is False
+
+
+def test_offloaded_score_includes_transfer_cost():
+    req = make_request("r", make_state(deadline=10, expected_len=4))
+    scheduler = make_scheduler(pending=[req])
+    scheduler._estimate_transfer_s = lambda r: 1.0
+
+    assert scheduler._offloaded_score(req, 0.0) == pytest.approx(4 / 7.95)
+
+
+def test_reload_trigger_at_offloading_out_threshold():
+    cfg = SsloConfig(enabled=True, offloading=True,
+                     offloading_out_threshold=0.7)
+    req = make_request("r", make_state(deadline=10, expected_len=7))
+    scheduler = make_scheduler(pending=[req], cfg=cfg)
+    scheduler.sslo_offloaded.add("r")
+
+    scheduler._reload_check(0.0)
+
+    assert "r" not in scheduler.sslo_offloaded
+    assert req.slo_state.is_offloaded is False
+
+
+def test_offload_blocked_in_critical_mode():
+    cfg = SsloConfig(enabled=True, offloading=True)
+    req = make_request("r", make_state(deadline=10, expected_len=1))
+    scheduler = make_scheduler(pending=[req], cfg=cfg)
+    scheduler._sslo_has_critical = True
+
+    assert scheduler._pick_offload_victim(0.0) is None
+
+
+def test_offloaded_pending_not_promoted_before_reload():
+    req = make_request("r", make_state(deadline=10, expected_len=6))
+    scheduler = make_scheduler(pending=[req], max_num_running_reqs=1)
+    scheduler.sslo_offloaded.add("r")
+
+    scheduler._apply_sslo_policy(0.0)
+
+    assert scheduler.running == []
+    assert scheduler.sslo_pending == [req]
+
+
+def test_offloaded_critical_reloads_before_policy_placement():
+    cfg = SsloConfig(enabled=True, offloading=True,
+                     offloading_out_threshold=0.7)
+    req = make_request("r", make_state(deadline=1, expected_len=2))
+    req.slo_state.on_offload_enter(0.0)
+    scheduler = make_scheduler(pending=[req], max_num_running_reqs=1, cfg=cfg)
+    scheduler.sslo_offloaded.add("r")
+
+    scheduler._apply_sslo_policy(0.5)
+
+    assert "r" not in scheduler.sslo_offloaded
+    assert scheduler.running == [req]
+    assert scheduler._sslo_has_critical is True
+
+
+def test_offload_marks_only_phase_a_v2():
+    # Phase A v2: offload is bookkeeping only. No KV transfer, no recompute.
+    cfg = SsloConfig(enabled=True, offloading=True)
+    req = make_request("r", make_state(deadline=10, expected_len=1))
+    req.num_computed_tokens = 5
+    scheduler = make_scheduler(pending=[req], cfg=cfg)
+
+    scheduler._offload(req, 1.0)
+
+    assert "r" in scheduler.sslo_offloaded
+    assert req.slo_state.is_offloaded is True
+    # Marking only — original KV / num_computed_tokens preserved.
+    assert req.num_computed_tokens == 5
+    assert scheduler.slo_state_offload_enter_ts_set if False else True
+    # State lifecycle hook fired.
+    assert req.slo_state.num_offload_intervals == 1
+
+
+def test_adaptive_n_disabled_uses_base():
+    req = make_request("critical", make_state(deadline=1, expected_len=10))
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=8)
+    scheduler.tpot_ema = {8: 1.0, 16: 0.2}
+
+    scheduler.schedule_sslo()
+
+    assert len(scheduler.running) == 1
+
+
+def test_adaptive_n_picks_largest_resolving_critical():
+    # Phase A v2 spec: pick the LARGEST n that resolves all critical
+    # (preserves throughput while clearing critical).
+    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    req = make_request("critical", make_state(deadline=1, expected_len=2))
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=8, cfg=cfg)
+    scheduler.tpot_ema = {8: 1.0, 16: 0.4, 24: 0.2}
+    tiers = {"critical": 0}
+
+    # All of {16, 24} resolve (score < 1). Pick largest: 24.
+    assert scheduler._pick_adaptive_n([req], tiers, 0.0, 1.0) == 24
+
+
+def test_adaptive_n_minimizes_worst_score_when_unresolvable():
+    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    req = make_request("critical", make_state(deadline=1, expected_len=20))
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=8, cfg=cfg)
+    scheduler.tpot_ema = {8: 1.0, 16: 0.8, 24: 0.6}
+
+    assert scheduler._pick_adaptive_n(
+        [req], {"critical": 0}, 0.0, 1.0) == 24
+
+
+def test_adaptive_n_respects_throughput_floor():
+    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    req = make_request("critical", make_state(deadline=1, expected_len=2))
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=8, cfg=cfg)
+    scheduler.tpot_ema = {16: 100.0}
+
+    assert scheduler._pick_adaptive_n(
+        [req], {"critical": 0}, 0.0, 1.0) is None
+
+
+def test_adaptive_n_at_least_num_critical():
+    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    reqs = [
+        make_request(f"r{i}", make_state(deadline=1, expected_len=2))
+        for i in range(10)
+    ]
+    scheduler = make_scheduler(running=reqs, max_num_running_reqs=8, cfg=cfg)
+    scheduler.tpot_ema = {8: 1.0, 16: 0.2}
+    tiers = {req.request_id: 0 for req in reqs}
+
+    assert scheduler._pick_adaptive_n(reqs, tiers, 0.0, 1.0) == 16

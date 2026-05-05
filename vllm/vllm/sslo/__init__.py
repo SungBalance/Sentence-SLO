@@ -3,21 +3,17 @@
 
 from vllm.sslo.config import SsloConfig, build_slo_state
 from vllm.sslo.slo_state import (
-    ChunkGenerationEstimator,
-    ConsumeEstimator,
-    EmaChunkGenerationEstimator,
-    PercentileChunkGenerationEstimator,
+    ChunkRecord,
+    Phase,
     RequestSLOState,
-    WordRateEstimator,
+    SsloRequestStats,
 )
 
 __all__ = [
-    "ChunkGenerationEstimator",
-    "ConsumeEstimator",
-    "EmaChunkGenerationEstimator",
-    "PercentileChunkGenerationEstimator",
+    "ChunkRecord",
+    "Phase",
     "RequestSLOState",
+    "SsloRequestStats",
     "SsloConfig",
-    "WordRateEstimator",
     "build_slo_state",
 ]
