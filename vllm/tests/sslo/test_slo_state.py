@@ -52,6 +52,19 @@ def test_chunk_record_and_diagnostics_append():
     assert state.num_pending_intervals == 1
 
 
+def test_on_step_tracks_total_and_prefill_counts():
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    state.on_step(decoding_only=True)
+    state.on_step(decoding_only=False)
+    state.on_step(decoding_only=False)
+    state.on_step(decoding_only=True)
+    assert state.total_step_count == 4
+    assert state.prefill_step_count == 2
+    stats = state.compute_stats()
+    assert stats.total_step_count == 4
+    assert stats.prefill_step_count == 2
+
+
 def test_chunk1_records_real_slack():
     # Chunk 1+ uses the real slack/stall computation.
     state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)

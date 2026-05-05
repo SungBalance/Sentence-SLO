@@ -37,6 +37,13 @@ class SsloRequestStats:
     num_offload_intervals: int
     chunks_completed: int
     final_chunk_expected_len_ema: float | None
+    # Scheduler-side step accounting. total_step_count = scheduler steps in
+    # which this request received any tokens. prefill_step_count = subset
+    # that mixed prefill (NOT decoding-only). Ratio reveals how often this
+    # request shared a batch with prefill — a proxy for batch-composition
+    # pressure that slows decode progress.
+    total_step_count: int = 0
+    prefill_step_count: int = 0
 
 
 @dataclass
@@ -61,6 +68,12 @@ class RequestSLOState:
     pending_enter_ts: float | None = None
     total_offload_time_s: float = 0.0
     num_offload_intervals: int = 0
+    # Scheduler step accounting (incremented by Scheduler each step).
+    total_step_count: int = 0
+    prefill_step_count: int = 0
+    # Set by Scheduler after the first request_done log to avoid duplicate
+    # dumps from the multiple cleanup paths (finish, abort, fail-load).
+    done_logged: bool = False
 
     # Config constants.
     seconds_per_word: float = 0.28
@@ -205,6 +218,16 @@ class RequestSLOState:
         self._current_chunk_pending_time_s += interval
         self.pending_enter_ts = None
 
+    def on_step(self, decoding_only: bool) -> None:
+        """Increment per-request scheduler step counters.
+
+        Called by the scheduler once per scheduling step in which this
+        request was scheduled. Diagnostic only — not used by scoring.
+        """
+        self.total_step_count += 1
+        if not decoding_only:
+            self.prefill_step_count += 1
+
     def on_offload_enter(self, now: float) -> None:
         if self.offload_enter_ts is None:
             self.offload_enter_ts = now
@@ -261,6 +284,8 @@ class RequestSLOState:
             num_offload_intervals=self.num_offload_intervals,
             chunks_completed=self.chunks_completed,
             final_chunk_expected_len_ema=self.chunk_expected_len_ema,
+            total_step_count=self.total_step_count,
+            prefill_step_count=self.prefill_step_count,
         )
 
     def chunk_records_asdict(self) -> list[dict]:

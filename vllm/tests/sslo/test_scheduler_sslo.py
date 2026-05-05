@@ -85,6 +85,7 @@ def make_scheduler(
     }
     scheduler.sslo_config = cfg or SsloConfig(enabled=True)
     scheduler.tpot_ema = {max_num_running_reqs: 1.0}
+    scheduler._sslo_wall_step_ema_s = 1.0
     scheduler.sslo_offloaded = set()
     scheduler._sslo_prev_step_batch = None
     scheduler._sslo_prev_step_decoding_only = False
@@ -275,6 +276,7 @@ def test_score_suspend_when_tpot_unobserved():
     scheduler = make_scheduler(running=[running], pending=[pending],
                                max_num_running_reqs=2)
     scheduler.tpot_ema = {}
+    scheduler._sslo_wall_step_ema_s = 0.0  # no step observed yet
     scheduler.waiting = [object()]  # block backfill
 
     scheduler._apply_sslo_policy(0.0)

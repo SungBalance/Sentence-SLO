@@ -184,8 +184,13 @@ class Scheduler(SchedulerInterface):
         self.running: list[Request] = []
         # SSLO
         self.sslo_pending: list[Request] = []
-        # SSLO
+        # SSLO: per-batch-size decode-only TPOT (used by adaptive batching).
         self.tpot_ema: dict[int, float] = {}
+        # SSLO: wall-clock-per-step EMA across ALL steps (incl. prefill mix).
+        # Used by score() so forward projection reflects the actual rate at
+        # which a running request is making progress, not the steady-state
+        # decode rate.
+        self._sslo_wall_step_ema_s: float = 0.0
         # SSLO
         self.sslo_offloaded: set[str] = set()
         # SSLO
@@ -1001,15 +1006,27 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         del scheduler_output
         prev_batch = self._sslo_prev_step_batch
+        if prev_batch is None or self._sslo_prev_step_start_ts is None:
+            return
+        delta = now - self._sslo_prev_step_start_ts
+        alpha = self.sslo_config.tpot_ema_alpha
+
+        # Wall-step EMA: every step, regardless of decoding-only or batch
+        # size. Used by score() so forward projection sees the real wall
+        # clock per step (prefill cost included).
+        if self._sslo_wall_step_ema_s == 0.0:
+            self._sslo_wall_step_ema_s = delta
+        else:
+            self._sslo_wall_step_ema_s = (
+                alpha * delta + (1 - alpha) * self._sslo_wall_step_ema_s)
+
+        # Per-bucket TPOT EMA: only decoding-only steps at exact bucket
+        # multiples. Used by adaptive batching for n-selection.
         if (
-            prev_batch is not None
-            and self._sslo_prev_step_decoding_only
+            self._sslo_prev_step_decoding_only
             and prev_batch % self.sslo_config.tpot_bucket_size == 0
-            and self._sslo_prev_step_start_ts is not None
         ):
-            delta = now - self._sslo_prev_step_start_ts
             prev = self.tpot_ema.get(prev_batch)
-            alpha = self.sslo_config.tpot_ema_alpha
             self.tpot_ema[prev_batch] = (
                 delta if prev is None else alpha * delta + (1 - alpha) * prev)
 
@@ -1037,6 +1054,15 @@ class Scheduler(SchedulerInterface):
                     break
         self._sslo_prev_step_decoding_only = decoding_only
         self._sslo_prev_step_start_ts = now
+
+        # SSLO: per-request step accounting. Increments total_step_count
+        # always, prefill_step_count only when this step wasn't decoding-only.
+        # Lets offline analysis compute prefill ratio per request as a
+        # batch-composition pressure proxy.
+        for req_id in scheduler_output.num_scheduled_tokens:
+            req = self.requests.get(req_id)
+            if req is not None and req.slo_state is not None:
+                req.slo_state.on_step(decoding_only)
 
     # SSLO
     def _classify_tier(self, req: Request, score: float | None) -> int:
@@ -1066,7 +1092,12 @@ class Scheduler(SchedulerInterface):
         self._sslo_active_cap = self.max_num_running_reqs
         prev_pending_ids = {req.request_id for req in self.sslo_pending}
         base_n = self.max_num_running_reqs
-        base_tpot = self.tpot_ema.get(base_n)
+        # Score uses the wall-step EMA (prefill-aware) so forward projection
+        # tracks actual progress, not idealised decode-only TPOT. None until
+        # at least one step has been observed.
+        base_tpot = (
+            self._sslo_wall_step_ema_s
+            if self._sslo_wall_step_ema_s > 0.0 else None)
         admitted = list(self.running) + list(self.sslo_pending)
         scores: dict[str, float | None] = {}
         tiers: dict[str, int] = {}
@@ -1185,6 +1216,7 @@ class Scheduler(SchedulerInterface):
         if log_path:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             stats_row = {
+                "kind": "step",
                 "ts": now,
                 "running": len(self.running),
                 "pending": len(self.sslo_pending),
@@ -1234,6 +1266,40 @@ class Scheduler(SchedulerInterface):
         if request.slo_state is not None:
             request.slo_state.on_pending_exit(now)
             request.slo_state.on_offload_exit(now)
+            self._sslo_log_request_done(request, now)
+
+    # SSLO
+    def _sslo_log_request_done(self, request: Request, now: float) -> None:
+        # Per-request final state dump for offline analysis. Goes to the same
+        # file as per-step scheduler_stats but with kind="request_done" so
+        # readers can demux. Idempotent across the multiple cleanup paths
+        # (finish, abort, fail-load) via slo_state.done_logged.
+        log_path = os.environ.get("SSLO_STATS_LOG_PATH")
+        if not log_path:
+            return
+        state = request.slo_state
+        if state is None or state.done_logged:
+            return
+        # request.request_id is the engine-internal "<user_id>-<uuid>" form;
+        # split off the user_id prefix for cross-referencing chunks.jsonl
+        # which uses the user-side id.
+        rid = request.request_id
+        user_id = rid.split("-", 1)[0] if "-" in rid else rid
+        row = {
+            "kind": "request_done",
+            "ts": now,
+            "request_id": rid,
+            "user_request_id": user_id,
+            "total_step_count": state.total_step_count,
+            "prefill_step_count": state.prefill_step_count,
+            "chunks_completed": state.chunks_completed,
+        }
+        try:
+            with open(log_path, "a") as f:
+                f.write(json.dumps(row) + "\n")
+            state.done_logged = True
+        except OSError:
+            pass
 
     # SSLO
     def _pick_offload_victim(
@@ -1266,7 +1332,9 @@ class Scheduler(SchedulerInterface):
         if req.request_id in self.sslo_offloaded:
             return False
         if score is None:
-            base_tpot = self.tpot_ema.get(self.max_num_running_reqs)
+            base_tpot = (
+                self._sslo_wall_step_ema_s
+                if self._sslo_wall_step_ema_s > 0.0 else None)
             score = state.score(now, base_tpot)
         if score is None:
             return False
@@ -1295,7 +1363,9 @@ class Scheduler(SchedulerInterface):
         )
         if effective_ttd <= 0:
             return float("inf")
-        base_tpot = self.tpot_ema.get(self.max_num_running_reqs)
+        base_tpot = (
+            self._sslo_wall_step_ema_s
+            if self._sslo_wall_step_ema_s > 0.0 else None)
         base_score = state.score(now, base_tpot)
         if base_score is None or base_score == float("inf"):
             return float("inf")
