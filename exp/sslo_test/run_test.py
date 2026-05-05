@@ -95,15 +95,27 @@ def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
     def _val(r, k):
         return r.get(k) if isinstance(r, dict) else getattr(r, k, None)
 
+    # Map Phase A v2 ChunkRecord fields (slack_s, pending_time_s,
+    # gen_finish_ts, ...) to the analyze.py-stable schema below. Fall back
+    # to v1 field names when present for backward compatibility.
     normalized = []
     for record in records:
+        slack = _val(record, "slack_s")
+        if slack is None:
+            slack = _val(record, "cumulative_slack")
+        pending = _val(record, "pending_time_s")
+        if pending is None:
+            pending = _val(record, "pending_time")
+        end_ts = _val(record, "gen_finish_ts")
+        if end_ts is None:
+            end_ts = _val(record, "end_time_ts")
         normalized.append({
             "chunk_idx": _val(record, "chunk_idx"),
-            "cumulative_slack": _val(record, "cumulative_slack"),
+            "cumulative_slack": slack,
             "gen_time": _val(record, "gen_time"),
-            "pending_time": _val(record, "pending_time"),
+            "pending_time": pending,
             "word_count": _val(record, "word_count"),
-            "end_time_ts": _val(record, "end_time_ts"),
+            "end_time_ts": end_ts,
         })
     return normalized
 
@@ -205,7 +217,8 @@ async def run_one(args: argparse.Namespace) -> None:
     print(f"{args.run_kind}: loaded {len(prompts)} prompts from {args.dataset_name}")
 
     # Build sslo_params incrementally: start with the base SSLO config used by
-    # all sslo* modes, then add flags per mode suffix.
+    # all sslo* modes, then add flags per mode suffix. Field names match the
+    # Phase A v2 SsloConfig (vllm/vllm/sslo/config.py).
     if args.run_kind == "baseline":
         sslo_params = {"enabled": False}
     else:
@@ -213,11 +226,9 @@ async def run_one(args: argparse.Namespace) -> None:
             "enabled": True,
             "chunk_unit": args.chunk_unit,
             "seconds_per_word": args.seconds_per_word,
-            "chunk_gen_estimator": "p99",
-            "chunk_gen_p99_window": 100,
         }
         if "adaptive" in args.run_kind:
-            sslo_params["adaptive_batch_size"] = True
+            sslo_params["adaptive_batching"] = True
         if "offload" in args.run_kind:
             sslo_params["offloading"] = True
 

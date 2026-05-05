@@ -1325,10 +1325,26 @@ class Scheduler(SchedulerInterface):
         base_n = self.max_num_running_reqs
         if not base_tpot:
             return None
-        base_throughput = base_n / base_tpot
-        n_critical = sum(1 for tier in tiers.values() if tier == 0)
-        candidates: list[int] = []
         bucket = self.sslo_config.tpot_bucket_size
+        n_critical = sum(1 for tier in tiers.values() if tier == 0)
+
+        # Fallback: when only the base bucket has been profiled (no smaller
+        # bucket data available yet), drop to 90% of base rounded DOWN to a
+        # multiple of `bucket`. Gives critical requests immediate headroom
+        # while sub-base profiling warms up. Floor at max(n_critical, bucket).
+        profiled_below_base = [
+            n for n in self.tpot_ema
+            if n != base_n and n % bucket == 0 and self.tpot_ema[n] > 0
+        ]
+        if not profiled_below_base:
+            fallback_n = int(base_n * 0.9) // bucket * bucket
+            if (fallback_n >= max(n_critical, bucket)
+                    and fallback_n < base_n):
+                return fallback_n
+            return None
+
+        base_throughput = base_n / base_tpot
+        candidates: list[int] = []
         for n in sorted(self.tpot_ema):
             tpot = self.tpot_ema[n]
             if n % bucket != 0 or n < n_critical or tpot <= 0:

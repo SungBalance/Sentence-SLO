@@ -152,8 +152,16 @@ class RequestSLOState:
 
         deadline = self.chunk_deadline()
         assert deadline is not None
-        slack = deadline - now
-        stall = max(0.0, now - deadline)
+        # Chunk 0 has no preceding consumption budget — its deadline is the
+        # decoding start itself, so slack/stall are not meaningful. Treat
+        # chunk 0 as always on-time (slack=0) so request-level compliance
+        # measures only chunks 1+ where the consumer has a real budget.
+        if self.chunks_completed == 0:
+            slack = 0.0
+            stall = 0.0
+        else:
+            slack = deadline - now
+            stall = max(0.0, now - deadline)
         consume_finish = deadline + chunk_consume_time_s
         generated_len = self.current_chunk_generated_len or max(1, word_count)
 

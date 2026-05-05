@@ -413,3 +413,47 @@ def test_adaptive_n_at_least_num_critical():
     tiers = {req.request_id: 0 for req in reqs}
 
     assert scheduler._pick_adaptive_n(reqs, tiers, 0.0, 1.0) == 16
+
+
+def test_adaptive_n_fallback_when_only_base_bucket_profiled():
+    # Only the base bucket has TPOT data → fall back to 90% of base
+    # rounded down to a multiple of bucket_size (8). 64 * 0.9 = 57.6 → 56.
+    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    req = make_request("critical", make_state(deadline=1, expected_len=2))
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=64, cfg=cfg)
+    scheduler.tpot_ema = {64: 1.0}
+    tiers = {"critical": 0}
+
+    assert scheduler._pick_adaptive_n([req], tiers, 0.0, 1.0) == 56
+
+
+def test_adaptive_n_fallback_floors_at_n_critical():
+    # Fallback would be 56, but n_critical is 60 → cannot reduce below
+    # critical count, return None.
+    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    reqs = [
+        make_request(f"r{i}", make_state(deadline=1, expected_len=2))
+        for i in range(60)
+    ]
+    scheduler = make_scheduler(running=reqs, max_num_running_reqs=64, cfg=cfg)
+    scheduler.tpot_ema = {64: 1.0}
+    tiers = {req.request_id: 0 for req in reqs}
+
+    assert scheduler._pick_adaptive_n(reqs, tiers, 0.0, 1.0) is None
+
+
+def test_adaptive_n_fallback_inactive_when_sub_buckets_present():
+    # Sub-base bucket (32) is profiled → existing comparative logic runs,
+    # fallback rule does NOT apply.
+    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    req = make_request("critical", make_state(deadline=1, expected_len=2))
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=64, cfg=cfg)
+    # 32 has same throughput (32/0.5 = 64) as base (64/1.0 = 64) → passes 0.9 floor.
+    scheduler.tpot_ema = {64: 1.0, 32: 0.5}
+    tiers = {"critical": 0}
+
+    # Sub-bucket logic kicks in: largest resolving n at score < 1.
+    # At n=32, tpot=0.5, score = 2*0.5 / 1 = 1.0 → not < 1, so worst-score min.
+    # Both 32 and 64 give same score = 1.0; min returns smaller (32).
+    picked = scheduler._pick_adaptive_n([req], tiers, 0.0, 1.0)
+    assert picked in (32, 64)  # Existing minimize-worst-score path

@@ -42,12 +42,31 @@ def test_chunk_record_and_diagnostics_append():
     assert record.chunk_idx == 0
     assert record.deadline_ts == pytest.approx(5.0)
     assert record.gen_finish_ts == pytest.approx(5.5)
-    assert record.slack_s == pytest.approx(-0.5)
-    assert record.stall_s == pytest.approx(0.5)
+    # Chunk 0 has no preceding consumption budget — slack and stall are
+    # forced to 0 so the first chunk doesn't auto-violate request SLO.
+    assert record.slack_s == 0.0
+    assert record.stall_s == 0.0
     assert record.pending_time_s == pytest.approx(0.3)
-    assert state.chunk_stall_time_total == pytest.approx(0.5)
+    assert state.chunk_stall_time_total == 0.0
     assert state.total_pending_time_s == pytest.approx(0.3)
     assert state.num_pending_intervals == 1
+
+
+def test_chunk1_records_real_slack():
+    # Chunk 1+ uses the real slack/stall computation.
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    state.on_token(0.0)
+    state.on_chunk_boundary(0.5, word_count=2, chunk_consume_time_s=1.0)
+    # Now decoding_start=0.0, cumulative_consume=1.0, deadline of chunk 1
+    # is 0.0 + 1.0 = 1.0.
+    state.on_token(0.5)
+    state.on_chunk_boundary(2.0, word_count=2, chunk_consume_time_s=1.0)
+    rec = state.chunk_records[1]
+    assert rec.chunk_idx == 1
+    assert rec.deadline_ts == pytest.approx(1.0)
+    assert rec.gen_finish_ts == pytest.approx(2.0)
+    assert rec.slack_s == pytest.approx(-1.0)  # missed deadline by 1s
+    assert rec.stall_s == pytest.approx(1.0)
 
 
 def test_chunk_expected_len_ema_updates():
