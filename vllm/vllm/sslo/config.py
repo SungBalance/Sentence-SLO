@@ -25,6 +25,11 @@ class SsloConfig:
     offload_bandwidth_bytes_per_s: float = 1e10
     seconds_per_word: float = 0.28
     chunk_unit: str = "sentence"
+    # Defer flushing a found chunk boundary until the accumulated token count
+    # since the last flush reaches this threshold. Short chunks (e.g. "Yes.")
+    # are merged into the next chunk so the consume_time and chunk EMA are
+    # not skewed by sub-token sentences.
+    min_chunk_tokens: int = 16
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
@@ -38,6 +43,9 @@ class SsloConfig:
             value = getattr(self, name)
             if value < 1:
                 raise ValueError(f"{name} must be >= 1, got {value}")
+        if self.min_chunk_tokens < 0:
+            raise ValueError(
+                f"min_chunk_tokens must be >= 0, got {self.min_chunk_tokens}")
         for name in (
             "seconds_per_word",
             "critical_threshold",
@@ -79,4 +87,5 @@ def build_slo_state(config: SsloConfig) -> "RequestSLOState":
         seconds_per_word=config.seconds_per_word,
         num_warmup_chunks=config.num_warmup_chunks,
         chunk_unit=config.chunk_unit,
+        min_chunk_tokens=config.min_chunk_tokens,
     )

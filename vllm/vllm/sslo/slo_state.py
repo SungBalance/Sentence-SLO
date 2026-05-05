@@ -66,6 +66,11 @@ class RequestSLOState:
     seconds_per_word: float = 0.28
     num_warmup_chunks: int = 4
     chunk_unit: str = "sentence"
+    # When a sentence/paragraph boundary is found but the unflushed token
+    # count since the last flush is below this threshold, the chunk is held
+    # back and merged into the next one. Prevents short-utterance noise
+    # (e.g. "Yes.") from skewing the chunk-length EMA.
+    min_chunk_tokens: int = 16
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
@@ -76,8 +81,19 @@ class RequestSLOState:
             raise ValueError("seconds_per_word must be >= 0")
         if self.num_warmup_chunks < 0:
             raise ValueError("num_warmup_chunks must be >= 0")
+        if self.min_chunk_tokens < 0:
+            raise ValueError("min_chunk_tokens must be >= 0")
         self._pending_text = ""
         self._current_chunk_pending_time_s = 0.0
+        # Tokens accumulated since the last flush (used for min_chunk_tokens
+        # merging). Reset on every successful flush; carries across boundaries
+        # that are deferred.
+        self._unflushed_token_count = 0
+        # Position in _pending_text from which to scan for the next boundary.
+        # Advances past held-back boundaries so a short sentence ("Yes.") is
+        # merged into the next sentence when more text arrives, instead of
+        # flushing alone the moment the threshold is crossed.
+        self._search_offset = 0
 
     @property
     def cumulative_slack(self) -> float:
@@ -196,20 +212,33 @@ class RequestSLOState:
     def on_text_delta(self, text: str, now: float, num_tokens: int = 0) -> None:
         if not text and num_tokens <= 0:
             return
-        if num_tokens > 0:
-            for _ in range(num_tokens):
-                self.on_token(now)
-        else:
+        delta_tokens = num_tokens if num_tokens > 0 else 1
+        for _ in range(delta_tokens):
             self.on_token(now)
+        self._unflushed_token_count += delta_tokens
         self._pending_text += text
 
+        # Flush only at boundaries WHERE the accumulated unflushed token
+        # count meets min_chunk_tokens. Otherwise advance past the boundary
+        # so the next call can merge it into a later chunk.
         while True:
-            boundary = self._find_boundary(self._pending_text)
-            if boundary is None:
+            sub = self._pending_text[self._search_offset:]
+            rel = self._find_boundary(sub)
+            if rel is None:
                 break
+            boundary = self._search_offset + rel
+            if self._unflushed_token_count < self.min_chunk_tokens:
+                # Held back: skip past this boundary so subsequent scans
+                # look at the NEXT one. The text remains in _pending_text
+                # so it gets merged into the eventual flush.
+                self._search_offset = boundary
+                continue
             self._flush_text_chunk(now, boundary)
 
     def on_finish(self, now: float) -> None:
+        # Force-flush any held-back text on request completion so the last
+        # chunk's diagnostics aren't lost even if it's shorter than
+        # min_chunk_tokens.
         if self._pending_text:
             self._flush_text_chunk(now, len(self._pending_text))
         elif self.decoding_start_ts is None:
@@ -238,6 +267,9 @@ class RequestSLOState:
             chunk_consume_time_s=word_count * self.seconds_per_word,
         )
         self._pending_text = self._pending_text[boundary_pos:]
+        # Reset both counters — held-back tokens emitted; suffix is fresh.
+        self._unflushed_token_count = 0
+        self._search_offset = 0
 
     def _find_boundary(self, text: str) -> int | None:
         if self.chunk_unit == "paragraph":

@@ -97,12 +97,51 @@ def test_offload_lifecycle_counters():
 
 
 def test_text_delta_compatibility_flushes_by_chunk_unit():
-    sentence = RequestSLOState(chunk_unit="sentence", num_warmup_chunks=1)
+    # min_chunk_tokens=0 disables the merging guard so each boundary flushes.
+    sentence = RequestSLOState(
+        chunk_unit="sentence", num_warmup_chunks=1, min_chunk_tokens=0)
     sentence.on_text_delta("Hello world.", 1.0, num_tokens=2)
     assert len(sentence.chunk_records) == 1
 
-    paragraph = RequestSLOState(chunk_unit="paragraph", num_warmup_chunks=1)
+    paragraph = RequestSLOState(
+        chunk_unit="paragraph", num_warmup_chunks=1, min_chunk_tokens=0)
     paragraph.on_text_delta("Hello world.", 1.0, num_tokens=2)
     assert len(paragraph.chunk_records) == 0
     paragraph.on_text_delta("\n\nNext", 1.1, num_tokens=1)
     assert len(paragraph.chunk_records) == 1
+
+
+def test_short_chunk_below_min_tokens_is_held_back():
+    state = RequestSLOState(
+        chunk_unit="sentence", num_warmup_chunks=1, min_chunk_tokens=10)
+    # First sentence is short (3 tokens) — should NOT flush yet.
+    state.on_text_delta("Yes.", 1.0, num_tokens=3)
+    assert len(state.chunk_records) == 0
+    # Second sentence brings cumulative tokens to 12 (>=10) — flushes the
+    # merged chunk at the next boundary.
+    state.on_text_delta(" The answer is final.", 1.1, num_tokens=9)
+    assert len(state.chunk_records) == 1
+    # The merged chunk's word count covers BOTH sentences.
+    rec = state.chunk_records[0]
+    assert rec.word_count == len("Yes. The answer is final.".split())
+
+
+def test_on_finish_force_flushes_held_back_text():
+    state = RequestSLOState(
+        chunk_unit="sentence", num_warmup_chunks=1, min_chunk_tokens=10)
+    state.on_text_delta("Short.", 1.0, num_tokens=2)
+    assert len(state.chunk_records) == 0
+    state.on_finish(now=2.0)
+    # Tail flushed even though it's below min_chunk_tokens.
+    assert len(state.chunk_records) == 1
+
+
+def test_min_chunk_tokens_resets_after_flush():
+    state = RequestSLOState(
+        chunk_unit="sentence", num_warmup_chunks=1, min_chunk_tokens=5)
+    # 10 tokens total → flushes at the boundary.
+    state.on_text_delta("This is a longer first sentence.", 1.0, num_tokens=10)
+    assert len(state.chunk_records) == 1
+    # Counter must reset; another 10-token sentence flushes again.
+    state.on_text_delta(" Another long sentence here too.", 1.1, num_tokens=10)
+    assert len(state.chunk_records) == 2

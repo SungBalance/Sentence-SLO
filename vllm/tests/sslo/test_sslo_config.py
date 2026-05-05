@@ -25,6 +25,7 @@ def test_defaults_match_phase_a_v2_plan():
     assert cfg.offload_bandwidth_bytes_per_s == 1e10
     assert cfg.seconds_per_word == 0.28
     assert cfg.chunk_unit == "sentence"
+    assert cfg.min_chunk_tokens == 16
     assert not hasattr(cfg, "adaptive_batch_size")
     assert not hasattr(cfg, "max_pending_num")
     assert not hasattr(cfg, "iter_time_ema_alpha")
@@ -44,6 +45,7 @@ def test_defaults_match_phase_a_v2_plan():
         ("offload_safety_margin_s", -0.1),
         ("offload_bandwidth_bytes_per_s", 0.0),
         ("seconds_per_word", -0.1),
+        ("min_chunk_tokens", -1),
     ],
 )
 def test_validation_rejects_invalid_values(field, value):
@@ -68,9 +70,11 @@ def test_build_slo_state_freezes_config_constants():
         seconds_per_word=0.5,
         num_warmup_chunks=7,
         chunk_unit="paragraph",
+        min_chunk_tokens=24,
     )
     state = build_slo_state(cfg)
     assert isinstance(state, RequestSLOState)
     assert state.seconds_per_word == 0.5
     assert state.num_warmup_chunks == 7
     assert state.chunk_unit == "paragraph"
+    assert state.min_chunk_tokens == 24
