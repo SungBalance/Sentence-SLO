@@ -295,3 +295,9 @@ Added 7 new metric categories to exp/sslo_test/ for systemic-effect analysis (in
 `analyze.py` writes all these to `summary.json`; `aggregate_repeats.py` and `aggregate_sweep.py` extend their METRICS tuples to print per-mode mean ± stddev.
 
 Existing 36-cell sweep re-aggregated successfully — all metrics populate from existing chunks/stats jsonl except #6 (which needs a fresh run since `total_pending_time_s` is per-request and was added to row schema in this change).
+
+## 2026-05-06 (stall-aware slack + seqs=64 sweep)
+
+- Modified: `vllm/vllm/sslo/slo_state.py` — `cumulative_consume_time` now updated stall-aware (`max(end_offset, current) + audio`) so a late chunk extends only the next deadline by its overage; previous formula carried debt forward and inflated downstream `위반률`. Added `ChunkConsumeEstimator` class (legacy `word_count × seconds_per_word` default) so TTS-derived durations can be injected later without touching `RequestSLOState`. Tests adjusted (`test_chunk1_records_real_slack`, `test_score_formula_and_deadline_sign`).
+- Modified: `exp/sslo_test/run_sweep.sh` — defaults set to `MAX_NUM_SEQS_VALUES="64"`, `REQUEST_RATES="0 4 16 32"`, `CHUNK_UNITS="sentence paragraph"`. `GPU_RATE_ASSIGNMENTS` now auto-derived round-robin from `REQUEST_RATES` across `NUM_PARALLEL_GPUS=4`, removing the second hand-edited rate list.
+- Verification: 58 SSLO tests pass inside `sk-sslo-vllm`. 24-cell sweep ran end-to-end (T+258m): TTFT p99 baseline ~278s → sslo/sslo_adaptive ~145–155s (~1.9× speedup); chunk_violation% ≤0.1% across all modes (formula B effect — no carryover); SLO compliance 97.6–98.6%; `summary.csv` written with 72 rows.
