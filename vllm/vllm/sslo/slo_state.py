@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING
 
@@ -182,6 +182,49 @@ class ChunkRecord:
     word_count: int
 
 
+class ChunkStatCollector:
+    """Per-request chunk-level diagnostic accumulator.
+
+    Owns the per-chunk records list, the running stall_time_total
+    aggregate, and the rolling pending-time bucket that gets stamped
+    onto each ChunkRecord at chunk completion (then resets).
+    """
+
+    def __init__(self) -> None:
+        self.records: list[ChunkRecord] = []
+        self.stall_time_total: float = 0.0
+        self._current_pending_s: float = 0.0
+
+    def record(
+        self,
+        *,
+        chunk_idx: int,
+        deadline_ts: float,
+        gen_finish_ts: float,
+        slack_s: float,
+        stall_s: float,
+        word_count: int,
+    ) -> None:
+        self.records.append(
+            ChunkRecord(
+                chunk_idx=chunk_idx,
+                deadline_ts=deadline_ts,
+                gen_finish_ts=gen_finish_ts,
+                slack_s=slack_s,
+                stall_s=stall_s,
+                pending_time_s=self._current_pending_s,
+                word_count=word_count,
+            ))
+        self.stall_time_total += stall_s
+        self._current_pending_s = 0.0
+
+    def accumulate_pending(self, interval_s: float) -> None:
+        self._current_pending_s += interval_s
+
+    def asdict(self) -> list[dict]:
+        return [asdict(record) for record in self.records]
+
+
 @dataclass
 class SsloRequestStats:
     chunk_stall_time_total: float
@@ -212,8 +255,7 @@ class RequestSLOState:
     offload_enter_ts: float | None = None
 
     # Diagnostic output.
-    chunk_records: list[ChunkRecord] = field(default_factory=list)
-    chunk_stall_time_total: float = 0.0
+    chunk_stats: ChunkStatCollector | None = None
     total_pending_time_s: float = 0.0
     num_pending_intervals: int = 0
     pending_enter_ts: float | None = None
@@ -243,9 +285,10 @@ class RequestSLOState:
         if self.consume_estimator is None:
             self.consume_estimator = ChunkConsumeEstimator(
                 seconds_per_word=self.seconds_per_word)
+        if self.chunk_stats is None:
+            self.chunk_stats = ChunkStatCollector()
         self._chunk_len_predictor = ChunkLengthPredictor(
             strategy=self.chunk_len_strategy)
-        self._current_chunk_pending_time_s = 0.0
 
     @classmethod
     def from_config(cls, config: "SsloConfig") -> "RequestSLOState":
@@ -267,6 +310,14 @@ class RequestSLOState:
     @property
     def is_offloaded(self) -> bool:
         return self.offload_enter_ts is not None
+
+    @property
+    def chunk_records(self) -> list[ChunkRecord]:
+        return self.chunk_stats.records
+
+    @property
+    def chunk_stall_time_total(self) -> float:
+        return self.chunk_stats.stall_time_total
 
     @property
     def chunk_expected_len(self) -> float | None:
@@ -337,17 +388,14 @@ class RequestSLOState:
             stall = max(0.0, now - deadline)
         generated_len = self.current_chunk_generated_len or max(1, word_count)
 
-        self.chunk_records.append(
-            ChunkRecord(
-                chunk_idx=self.chunks_completed,
-                deadline_ts=deadline,
-                gen_finish_ts=now,
-                slack_s=slack,
-                stall_s=stall,
-                pending_time_s=self._current_chunk_pending_time_s,
-                word_count=word_count,
-            ))
-        self.chunk_stall_time_total += stall
+        self.chunk_stats.record(
+            chunk_idx=self.chunks_completed,
+            deadline_ts=deadline,
+            gen_finish_ts=now,
+            slack_s=slack,
+            stall_s=stall,
+            word_count=word_count,
+        )
         self._chunk_len_predictor.update(int(generated_len))
 
         # Stall-aware deadline propagation. The next chunk's deadline is
@@ -363,7 +411,6 @@ class RequestSLOState:
                                         + chunk_consume_time_s)
         self.chunks_completed += 1
         self.current_chunk_generated_len = 0
-        self._current_chunk_pending_time_s = 0.0
 
     def on_pending_enter(self, now: float) -> None:
         if self.pending_enter_ts is None:
@@ -375,7 +422,7 @@ class RequestSLOState:
             return
         interval = now - self.pending_enter_ts
         self.total_pending_time_s += interval
-        self._current_chunk_pending_time_s += interval
+        self.chunk_stats.accumulate_pending(interval)
         self.pending_enter_ts = None
 
     def on_step(self, decoding_only: bool) -> None:
@@ -448,4 +495,4 @@ class RequestSLOState:
         )
 
     def chunk_records_asdict(self) -> list[dict]:
-        return [asdict(record) for record in self.chunk_records]
+        return self.chunk_stats.asdict()
