@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
-"""Print a compact sweep progress report from partial summary.json files."""
+"""Compact sweep progress report from partial summary.json files."""
 from __future__ import annotations
 
+import argparse
 import json
-from glob import glob
 from pathlib import Path
 
-BASE = "exp/sslo_test/output_sweep"
-TOTAL_CELLS = 2 * 3 * 4 * 3  # chunk_units * seqs * rates * runs
+DEFAULT_ROOT = "exp/sslo_test/output_sweep"
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--sweep-root", default=DEFAULT_ROOT)
+    return p.parse_args()
 
 
 def main() -> None:
-    summaries = sorted(glob(f"{BASE}/*/seqs_*/rate_*/run_*/summary.json"))
-    print(f"Progress: {len(summaries)}/{TOTAL_CELLS} cells completed")
+    args = parse_args()
+    root = Path(args.sweep_root)
+    summaries = sorted(root.glob("*/*/seqs_*/rate_*/run_*/summary.json"))
+    print(f"Progress: {len(summaries)} run summaries under {root}")
     if not summaries:
         return
 
     agg: dict[str, list[tuple]] = {}
     for path in summaries:
-        s = json.loads(Path(path).read_text())
+        s = json.loads(path.read_text())
         ttft = s.get("metrics", {}).get("ttft", {})
         slack = s.get("metrics", {}).get("slack", {})
         comp = s.get("metrics", {}).get("slo_compliance", {})

@@ -2,7 +2,11 @@
 # Unified full sweep: chunk_unit × max_num_seqs × request_rate × N trials × modes.
 #
 # Usage:
-#   run_sweep.sh [num_runs=3]
+#   run_sweep.sh [num_runs=3] [--label NAME]
+#
+# --label NAME (or LABEL env var) writes outputs to
+# exp/sslo_test/output_sweep_<NAME>/ instead of the default output_sweep/.
+# Useful for keeping multiple comparison sweeps side by side.
 #
 # Env vars:
 #   PARALLEL=0    0=sequential (single GPU), 4=4-GPU parallel using
@@ -10,6 +14,26 @@
 #
 # Run inside the sk-sslo container from /workspace/mlsys.
 set -euo pipefail
+
+LABEL="${LABEL:-}"
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --label)
+      LABEL="$2"
+      shift 2
+      ;;
+    --label=*)
+      LABEL="${1#--label=}"
+      shift
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${POSITIONAL_ARGS[@]}"
 
 NUM_RUNS="${1:-3}"
 PARALLEL="${PARALLEL:-0}"
@@ -55,7 +79,8 @@ GPU_RATE_ASSIGNMENTS=(
   "0"          # GPU 3 (fastest alone)
 )
 
-BASE_OUTPUT="exp/sslo_test/output_sweep"
+SWEEP_ROOT="exp/sslo_test/output_sweep"
+BASE_OUTPUT="${SWEEP_ROOT}/${LABEL:-default}"
 BASE_SEED=42
 GPU_READY_FREE_FRAC=0.95
 GPU_READY_TIMEOUT_S=60
@@ -184,7 +209,13 @@ PYEOF
 
   python3 exp/sslo_test/analyze.py \
     --output-dir "${out_dir}" \
-    --max-num-seqs "${seqs}"
+    --max-num-seqs "${seqs}" \
+    --chunk-unit "${unit}" \
+    --request-rate "${rate}" \
+    --model "${MODEL}" \
+    --generation-max-tokens "${GENERATION_MAX_TOKENS}" \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    ${LABEL:+--label "${LABEL}"}
 }
 
 # ---------------------------------------------------------------------------
@@ -261,3 +292,9 @@ for unit in "${CHUNK_UNITS[@]}"; do
     --num-runs "${NUM_RUNS}" \
     --modes "${MODES}"
 done
+
+echo
+echo "--- writing summary.csv across all labels under ${SWEEP_ROOT}/ ---"
+python3 exp/sslo_test/analysis/sweep_summary_csv.py \
+  --sweep-root "${SWEEP_ROOT}" \
+  --output "${SWEEP_ROOT}/summary.csv"

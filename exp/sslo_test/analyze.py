@@ -22,6 +22,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-seqs", type=int, default=MAX_NUM_SEQS)
     parser.add_argument("--chunk-unit", default="sentence")
     parser.add_argument("--request-rate", type=float, default=0.0)
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--generation-max-tokens", type=int, default=None)
+    parser.add_argument("--max-model-len", type=int, default=None)
+    parser.add_argument("--label", default=None)
     return parser.parse_args()
 
 
@@ -59,16 +63,9 @@ def distribution_stats(
     return stats
 
 
-def latency_stats(rows: list[dict[str, Any]], key: str) -> dict[str, float | int | None]:
+def dist_for_key(rows: list[dict[str, Any]], key: str) -> dict[str, float | int | None]:
+    """Standard mean/p50/p90/p99/max distribution over rows[*][key]."""
     return distribution_stats(numeric_values(rows, key), (50, 90, 99))
-
-
-def tpot_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
-    return distribution_stats(numeric_values(rows, "tpot"), (50, 90, 99))
-
-
-def queue_stall_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
-    return distribution_stats(numeric_values(rows, "queue_stall"), (50, 90, 99))
 
 
 def slack_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
@@ -101,21 +98,19 @@ def neg_slack_magnitude_stats(rows: list[dict[str, Any]]) -> dict[str, float | i
 
 
 def request_compliance_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
-    request_has_chunk: dict[str, bool] = {}
-    request_has_neg_slack: dict[str, bool] = {}
+    seen: set[str] = set()
+    violated: set[str] = set()
     for row in rows:
-        request_id = row.get("request_id")
-        if request_id is None:
+        rid = row.get("request_id")
+        if rid is None:
             continue
-        request_id = str(request_id)
-        request_has_chunk[request_id] = True
+        rid = str(rid)
+        seen.add(rid)
         slack = row.get("cumulative_slack")
         if slack is not None and float(slack) < 0:
-            request_has_neg_slack[request_id] = True
-    total = len(request_has_chunk)
-    compliant = sum(
-        1 for rid in request_has_chunk if not request_has_neg_slack.get(rid, False)
-    )
+            violated.add(rid)
+    total = len(seen)
+    compliant = total - len(violated)
     return {
         "rate": (compliant / total) if total else None,
         "count": compliant,
@@ -123,13 +118,9 @@ def request_compliance_stats(rows: list[dict[str, Any]]) -> dict[str, float | in
     }
 
 
-def scheduler_queue_stats(rows: list[dict[str, Any]], key: str) -> dict[str, float | int | None]:
-    return distribution_stats(numeric_values(rows, key), (50, 90, 99))
-
-
 def pending_request_stats(rows: list[dict[str, Any]]) -> dict[str, dict[str, float | int | None]]:
     return {
-        "time": distribution_stats(numeric_values(rows, "total_pending_time_s"), (50, 90, 99)),
+        "time": dist_for_key(rows, "total_pending_time_s"),
         "intervals": distribution_stats(numeric_values(rows, "num_pending_intervals"), (50, 90)),
     }
 
@@ -217,6 +208,10 @@ def analyze(
     max_num_seqs: int,
     chunk_unit: str = "sentence",
     request_rate: float = 0.0,
+    model: str | None = None,
+    generation_max_tokens: int | None = None,
+    max_model_len: int | None = None,
+    label: str | None = None,
 ) -> dict[str, Any]:
     request_rows_all = read_jsonl(output_dir / "requests.jsonl")
     chunk_rows_all = read_jsonl(output_dir / "chunks.jsonl")
@@ -265,11 +260,11 @@ def analyze(
             cohort, _, h2_mode = h2_rows(baseline_req, req_rows, max_num_seqs)
             h2_req = h2_mode
 
-        ttft_pc = latency_stats(h2_req, "ttft")
+        ttft_pc = dist_for_key(h2_req, "ttft")
         ttft_pc["cohort"] = cohort
-        metrics["ttft"][mode] = {"all": latency_stats(req_rows, "ttft"), "post_cap": ttft_pc}
-        metrics["tpot"][mode] = tpot_stats(req_rows)
-        metrics["queue_stall"][mode] = queue_stall_stats(req_rows)
+        metrics["ttft"][mode] = {"all": dist_for_key(req_rows, "ttft"), "post_cap": ttft_pc}
+        metrics["tpot"][mode] = dist_for_key(req_rows, "tpot")
+        metrics["queue_stall"][mode] = dist_for_key(req_rows, "queue_stall")
         s = slack_stats(ch_rows)
         mag = neg_slack_magnitude_stats(ch_rows)
         metrics["slack"][mode] = {**s, "magnitude": mag}
@@ -280,8 +275,8 @@ def analyze(
     for mode in SSLO_MODES:
         sched_rows = sched_by_mode[mode]
         metrics["scheduler"][mode] = {
-            "running": scheduler_queue_stats(sched_rows, "running"),
-            "combined": scheduler_queue_stats(sched_rows, "combined"),
+            "running": dist_for_key(sched_rows, "running"),
+            "combined": dist_for_key(sched_rows, "combined"),
         }
 
     scheduler_saturation: dict[str, Any] = {}
@@ -311,9 +306,13 @@ def analyze(
 
     summary: dict[str, Any] = {
         "config": {
+            "model": model,
+            "label": label,
             "max_num_seqs": max_num_seqs,
             "chunk_unit": chunk_unit,
             "request_rate": request_rate,
+            "generation_max_tokens": generation_max_tokens,
+            "max_model_len": max_model_len,
             "is_control": is_control,
             "modes_run": modes_run,
         },
@@ -346,6 +345,10 @@ def main() -> None:
         args.max_num_seqs,
         chunk_unit=args.chunk_unit,
         request_rate=args.request_rate,
+        model=args.model,
+        generation_max_tokens=args.generation_max_tokens,
+        max_model_len=args.max_model_len,
+        label=args.label,
     )
 
 
