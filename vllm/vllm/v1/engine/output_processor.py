@@ -10,8 +10,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 # SSLO
 from vllm.sslo.slo_state import RequestSLOState
-# SSLO
-from vllm.sslo.config import build_slo_state
 
 import numpy as np
 import torch
@@ -201,7 +199,7 @@ class RequestState:
         # SSLO
         from vllm.sslo.config import SsloConfig as _SsloConfig
         _cfg = sslo_config if sslo_config is not None else _SsloConfig()
-        self.slo_state: RequestSLOState = build_slo_state(_cfg)
+        self.slo_state: RequestSLOState = RequestSLOState.from_config(_cfg)
         # SSLO
         self._slo_pending_text_updates: list[tuple[str, float, int]] = []
         # SSLO

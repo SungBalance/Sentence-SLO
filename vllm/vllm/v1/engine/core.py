@@ -344,8 +344,9 @@ class EngineCore:
             )
 
         # SSLO
-        from vllm.sslo.config import build_slo_state
-        request.slo_state = build_slo_state(self.vllm_config.sslo_config)
+        from vllm.sslo.slo_state import RequestSLOState
+        request.slo_state = RequestSLOState.from_config(
+            self.vllm_config.sslo_config)
         self.scheduler.add_request(request)
 
     def abort_requests(self, request_ids: list[str]):

@@ -8,7 +8,7 @@ from vllm.sslo.slo_state import ChunkRecord, Phase, RequestSLOState
 
 def measured_state() -> RequestSLOState:
     state = RequestSLOState(num_warmup_chunks=1)
-    state.on_token(0.0, 1)
+    state.on_token(0.0)
     state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=10.0)
     return state
 
@@ -17,13 +17,13 @@ def test_phase_transitions_on_token_and_chunk_boundary():
     state = RequestSLOState(num_warmup_chunks=2)
 
     assert state.phase == Phase.PREFILL
-    state.on_token(1.0, 10)
+    state.on_token(1.0)
     assert state.phase == Phase.WARMUP
     assert state.decoding_start_ts == pytest.approx(1.0)
 
     state.on_chunk_boundary(1.2, word_count=1, chunk_consume_time_s=0.5)
     assert state.phase == Phase.WARMUP
-    state.on_token(1.3, 11)
+    state.on_token(1.3)
     state.on_chunk_boundary(1.4, word_count=2, chunk_consume_time_s=0.7)
     assert state.phase == Phase.MEASURED
     assert state.chunks_completed == 2
@@ -31,7 +31,7 @@ def test_phase_transitions_on_token_and_chunk_boundary():
 
 def test_chunk_record_and_diagnostics_append():
     state = RequestSLOState(num_warmup_chunks=1)
-    state.on_token(5.0, 1)
+    state.on_token(5.0)
     state.on_pending_enter(5.1)
     state.on_pending_exit(5.4)
     state.on_chunk_boundary(5.5, word_count=3, chunk_consume_time_s=0.84)
@@ -86,11 +86,11 @@ def test_chunk1_records_real_slack():
 def test_chunk_expected_len_p90_tracks_history():
     state = RequestSLOState(num_warmup_chunks=1, chunk_len_strategy="p90")
     for _ in range(10):
-        state.on_token(0.0, 1)
+        state.on_token(0.0)
     state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
     assert state.chunk_expected_len == pytest.approx(10.0)
     for _ in range(20):
-        state.on_token(0.2, 1)
+        state.on_token(0.2)
     state.on_chunk_boundary(0.3, word_count=4, chunk_consume_time_s=1.0)
     # p90 over [10, 20] picks the larger one.
     assert state.chunk_expected_len == pytest.approx(20.0)
@@ -99,11 +99,11 @@ def test_chunk_expected_len_p90_tracks_history():
 def test_chunk_expected_len_ema_strategy_smooths():
     state = RequestSLOState(num_warmup_chunks=1, chunk_len_strategy="ema")
     for _ in range(10):
-        state.on_token(0.0, 1)
+        state.on_token(0.0)
     state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
     assert state.chunk_expected_len == pytest.approx(10.0)
     for _ in range(20):
-        state.on_token(0.2, 1)
+        state.on_token(0.2)
     state.on_chunk_boundary(0.3, word_count=4, chunk_consume_time_s=1.0)
     # EMA(alpha=0.2): 0.2*20 + 0.8*10 = 12.0
     assert state.chunk_expected_len == pytest.approx(12.0)
@@ -117,7 +117,7 @@ def test_chunk_len_strategy_validates():
 def test_score_formula_and_deadline_sign():
     state = measured_state()
     for _ in range(4):
-        state.on_token(1.0, 1)
+        state.on_token(1.0)
 
     # measured_state(): chunk 0 finishes at 0.1 with consume=10.0. Under
     # stall-aware propagation: cumulative_consume = max(0.1, 0) + 10.0 =
@@ -130,7 +130,7 @@ def test_score_formula_and_deadline_sign():
 
 def test_score_none_during_warmup_or_missing_inputs():
     warmup = RequestSLOState(num_warmup_chunks=4)
-    warmup.on_token(0.0, 1)
+    warmup.on_token(0.0)
     warmup.on_chunk_boundary(0.1, word_count=1, chunk_consume_time_s=1.0)
     assert warmup.score(0.2, 0.1) is None
 

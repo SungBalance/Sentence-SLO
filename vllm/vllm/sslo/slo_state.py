@@ -2,8 +2,13 @@
 """SSLO request lifecycle state for score-based scheduling."""
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from enum import IntEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.sslo.config import SsloConfig
 
 _SENTENCE_END_CHARS = frozenset(".!?。！？…")
 _VALID_CHUNK_UNITS = frozenset({"sentence", "paragraph"})
@@ -85,12 +90,92 @@ class ChunkConsumeEstimator:
         return word_count * self.seconds_per_word
 
 
+class ChunkSeparator:
+    """Stream-aware chunk boundary detector.
+
+    Accumulates streamed text deltas and yields complete chunks at
+    sentence or paragraph boundaries. Boundaries with fewer than
+    `min_chunk_tokens` tokens accumulated since the last flush are
+    deferred — the boundary advances past them so a short fragment
+    (e.g. "Yes.") merges into the next chunk.
+    """
+
+    def __init__(
+        self,
+        chunk_unit: str = "sentence",
+        min_chunk_tokens: int = 16,
+    ) -> None:
+        if chunk_unit not in _VALID_CHUNK_UNITS:
+            raise ValueError(
+                f"chunk_unit must be one of {sorted(_VALID_CHUNK_UNITS)}, "
+                f"got {chunk_unit!r}")
+        if min_chunk_tokens < 0:
+            raise ValueError("min_chunk_tokens must be >= 0")
+        self.chunk_unit = chunk_unit
+        self.min_chunk_tokens = min_chunk_tokens
+        self._pending_text = ""
+        self._unflushed_token_count = 0
+        self._search_offset = 0
+
+    def feed(self, text: str, num_tokens: int) -> Iterator[str]:
+        """Feed a streamed text delta; yield chunk strings as boundaries form."""
+        if not text and num_tokens <= 0:
+            return
+        self._unflushed_token_count += num_tokens if num_tokens > 0 else 1
+        self._pending_text += text
+        while True:
+            sub = self._pending_text[self._search_offset:]
+            rel = self._find_boundary(sub)
+            if rel is None:
+                return
+            boundary = self._search_offset + rel
+            if self._unflushed_token_count < self.min_chunk_tokens:
+                # Held back: skip past this boundary so subsequent scans
+                # look at the NEXT one. The text remains in _pending_text
+                # so it gets merged into the eventual flush.
+                self._search_offset = boundary
+                continue
+            chunk = self._pending_text[:boundary]
+            self._pending_text = self._pending_text[boundary:]
+            self._unflushed_token_count = 0
+            self._search_offset = 0
+            yield chunk
+
+    def flush(self) -> str | None:
+        """Force-flush any held-back text (call on stream completion)."""
+        if not self._pending_text:
+            return None
+        chunk = self._pending_text
+        self._pending_text = ""
+        self._unflushed_token_count = 0
+        self._search_offset = 0
+        return chunk
+
+    def _find_boundary(self, text: str) -> int | None:
+        if self.chunk_unit == "paragraph":
+            idx = text.find("\n\n")
+            return None if idx == -1 else idx + 2
+
+        i = 0
+        n = len(text)
+        while i < n:
+            if text[i] in _SENTENCE_END_CHARS:
+                j = i + 1
+                while j < n and text[j] in _SENTENCE_END_CHARS:
+                    j += 1
+                if j >= n or text[j].isspace():
+                    return j
+                i = j
+            else:
+                i += 1
+        return None
+
+
 @dataclass
 class ChunkRecord:
     chunk_idx: int
     deadline_ts: float
     gen_finish_ts: float
-    consume_finish_ts: float
     slack_s: float
     stall_s: float
     pending_time_s: float
@@ -118,14 +203,12 @@ class SsloRequestStats:
 @dataclass
 class RequestSLOState:
     # Lifecycle.
-    phase: Phase = Phase.PREFILL
     decoding_start_ts: float | None = None
     cumulative_consume_time: float = 0.0
     chunks_completed: int = 0
     current_chunk_generated_len: int = 0
 
     # Offload.
-    is_offloaded: bool = False
     offload_enter_ts: float | None = None
 
     # Diagnostic output.
@@ -140,51 +223,50 @@ class RequestSLOState:
     total_step_count: int = 0
     prefill_step_count: int = 0
 
-    # Config constants.
+    # Config snapshots — used to construct the default helpers below.
+    # Provide chunk_separator / consume_estimator directly to override.
     seconds_per_word: float = 0.28
     num_warmup_chunks: int = 4
     chunk_unit: str = "sentence"
-    # Strategy used to project remaining chunk length. See
-    # ChunkLengthPredictor for semantics. "p90" is the default — biases
-    # score() toward overestimating remaining work.
     chunk_len_strategy: str = _DEFAULT_CHUNK_LEN_STRATEGY
-    # When a sentence/paragraph boundary is found but the unflushed token
-    # count since the last flush is below this threshold, the chunk is held
-    # back and merged into the next one. Prevents short-utterance noise
-    # (e.g. "Yes.") from skewing the chunk-length predictor.
     min_chunk_tokens: int = 16
-    # Estimator for a chunk's audio consumption time. Defaults to a
-    # word_count × seconds_per_word estimator; inject a TTS-driven instance
-    # to use measured durations.
+    chunk_separator: ChunkSeparator | None = None
     consume_estimator: ChunkConsumeEstimator | None = None
 
     def __post_init__(self) -> None:
-        if self.chunk_unit not in _VALID_CHUNK_UNITS:
-            raise ValueError(
-                f"chunk_unit must be one of {sorted(_VALID_CHUNK_UNITS)}, "
-                f"got {self.chunk_unit!r}")
-        if self.seconds_per_word < 0:
-            raise ValueError("seconds_per_word must be >= 0")
         if self.num_warmup_chunks < 0:
             raise ValueError("num_warmup_chunks must be >= 0")
-        if self.min_chunk_tokens < 0:
-            raise ValueError("min_chunk_tokens must be >= 0")
+        if self.chunk_separator is None:
+            self.chunk_separator = ChunkSeparator(
+                chunk_unit=self.chunk_unit,
+                min_chunk_tokens=self.min_chunk_tokens)
         if self.consume_estimator is None:
             self.consume_estimator = ChunkConsumeEstimator(
                 seconds_per_word=self.seconds_per_word)
         self._chunk_len_predictor = ChunkLengthPredictor(
             strategy=self.chunk_len_strategy)
-        self._pending_text = ""
         self._current_chunk_pending_time_s = 0.0
-        # Tokens accumulated since the last flush (used for min_chunk_tokens
-        # merging). Reset on every successful flush; carries across boundaries
-        # that are deferred.
-        self._unflushed_token_count = 0
-        # Position in _pending_text from which to scan for the next boundary.
-        # Advances past held-back boundaries so a short sentence ("Yes.") is
-        # merged into the next sentence when more text arrives, instead of
-        # flushing alone the moment the threshold is crossed.
-        self._search_offset = 0
+
+    @classmethod
+    def from_config(cls, config: "SsloConfig") -> "RequestSLOState":
+        return cls(
+            seconds_per_word=config.seconds_per_word,
+            num_warmup_chunks=config.num_warmup_chunks,
+            chunk_unit=config.chunk_unit,
+            min_chunk_tokens=config.min_chunk_tokens,
+        )
+
+    @property
+    def phase(self) -> Phase:
+        if self.decoding_start_ts is None:
+            return Phase.PREFILL
+        if self.chunks_completed >= self.num_warmup_chunks:
+            return Phase.MEASURED
+        return Phase.WARMUP
+
+    @property
+    def is_offloaded(self) -> bool:
+        return self.offload_enter_ts is not None
 
     @property
     def chunk_expected_len(self) -> float | None:
@@ -227,10 +309,8 @@ class RequestSLOState:
             return float("inf")
         return (remaining * tpot_s) / time_to_deadline
 
-    def on_token(self, now: float, token_id: int | None = None) -> None:
-        del token_id
-        if self.phase == Phase.PREFILL:
-            self.phase = Phase.WARMUP
+    def on_token(self, now: float) -> None:
+        if self.decoding_start_ts is None:
             self.decoding_start_ts = now
         self.current_chunk_generated_len += 1
 
@@ -242,8 +322,6 @@ class RequestSLOState:
     ) -> None:
         if self.decoding_start_ts is None:
             self.decoding_start_ts = now
-        if self.phase == Phase.PREFILL:
-            self.phase = Phase.WARMUP
 
         deadline = self.chunk_deadline()
         assert deadline is not None
@@ -257,7 +335,6 @@ class RequestSLOState:
         else:
             slack = deadline - now
             stall = max(0.0, now - deadline)
-        consume_finish = deadline + chunk_consume_time_s
         generated_len = self.current_chunk_generated_len or max(1, word_count)
 
         self.chunk_records.append(
@@ -265,7 +342,6 @@ class RequestSLOState:
                 chunk_idx=self.chunks_completed,
                 deadline_ts=deadline,
                 gen_finish_ts=now,
-                consume_finish_ts=consume_finish,
                 slack_s=slack,
                 stall_s=stall,
                 pending_time_s=self._current_chunk_pending_time_s,
@@ -286,8 +362,6 @@ class RequestSLOState:
                                             self.cumulative_consume_time)
                                         + chunk_consume_time_s)
         self.chunks_completed += 1
-        if self.chunks_completed >= self.num_warmup_chunks:
-            self.phase = Phase.MEASURED
         self.current_chunk_generated_len = 0
         self._current_chunk_pending_time_s = 0.0
 
@@ -317,47 +391,46 @@ class RequestSLOState:
     def on_offload_enter(self, now: float) -> None:
         if self.offload_enter_ts is None:
             self.offload_enter_ts = now
-            self.is_offloaded = True
             self.num_offload_intervals += 1
 
     def on_offload_exit(self, now: float) -> None:
         if self.offload_enter_ts is not None:
             self.total_offload_time_s += now - self.offload_enter_ts
         self.offload_enter_ts = None
-        self.is_offloaded = False
 
-    def on_text_delta(self, text: str, now: float, num_tokens: int = 0) -> None:
+    def on_text_delta(
+        self,
+        text: str,
+        now: float,
+        num_tokens: int = 0,
+    ) -> None:
         if not text and num_tokens <= 0:
             return
         delta_tokens = num_tokens if num_tokens > 0 else 1
         for _ in range(delta_tokens):
             self.on_token(now)
-        self._unflushed_token_count += delta_tokens
-        self._pending_text += text
-
-        # Flush only at boundaries WHERE the accumulated unflushed token
-        # count meets min_chunk_tokens. Otherwise advance past the boundary
-        # so the next call can merge it into a later chunk.
-        while True:
-            sub = self._pending_text[self._search_offset:]
-            rel = self._find_boundary(sub)
-            if rel is None:
-                break
-            boundary = self._search_offset + rel
-            if self._unflushed_token_count < self.min_chunk_tokens:
-                # Held back: skip past this boundary so subsequent scans
-                # look at the NEXT one. The text remains in _pending_text
-                # so it gets merged into the eventual flush.
-                self._search_offset = boundary
-                continue
-            self._flush_text_chunk(now, boundary)
+        for chunk_text in self.chunk_separator.feed(text, delta_tokens):
+            word_count = len(chunk_text.split())
+            self.on_chunk_boundary(
+                now=now,
+                word_count=word_count,
+                chunk_consume_time_s=self.consume_estimator.estimate(
+                    chunk_text, word_count),
+            )
 
     def on_finish(self, now: float) -> None:
         # Force-flush any held-back text on request completion so the last
         # chunk's diagnostics aren't lost even if it's shorter than
         # min_chunk_tokens.
-        if self._pending_text:
-            self._flush_text_chunk(now, len(self._pending_text))
+        remaining = self.chunk_separator.flush()
+        if remaining:
+            word_count = len(remaining.split())
+            self.on_chunk_boundary(
+                now=now,
+                word_count=word_count,
+                chunk_consume_time_s=self.consume_estimator.estimate(
+                    remaining, word_count),
+            )
         elif self.decoding_start_ts is None:
             self.decoding_start_ts = now
 
@@ -376,36 +449,3 @@ class RequestSLOState:
 
     def chunk_records_asdict(self) -> list[dict]:
         return [asdict(record) for record in self.chunk_records]
-
-    def _flush_text_chunk(self, now: float, boundary_pos: int) -> None:
-        chunk_text = self._pending_text[:boundary_pos]
-        word_count = len(chunk_text.split())
-        self.on_chunk_boundary(
-            now=now,
-            word_count=word_count,
-            chunk_consume_time_s=self.consume_estimator.estimate(
-                chunk_text, word_count),
-        )
-        self._pending_text = self._pending_text[boundary_pos:]
-        # Reset both counters — held-back tokens emitted; suffix is fresh.
-        self._unflushed_token_count = 0
-        self._search_offset = 0
-
-    def _find_boundary(self, text: str) -> int | None:
-        if self.chunk_unit == "paragraph":
-            idx = text.find("\n\n")
-            return None if idx == -1 else idx + 2
-
-        i = 0
-        n = len(text)
-        while i < n:
-            if text[i] in _SENTENCE_END_CHARS:
-                j = i + 1
-                while j < n and text[j] in _SENTENCE_END_CHARS:
-                    j += 1
-                if j >= n or text[j].isspace():
-                    return j
-                i = j
-            else:
-                i += 1
-        return None

@@ -36,56 +36,37 @@ class SsloConfig:
             raise ValueError(
                 f"chunk_unit must be one of {sorted(_VALID_CHUNK_UNITS)}, "
                 f"got {self.chunk_unit!r}")
-        for name in (
-            "num_warmup_chunks",
-            "tpot_bucket_size",
-        ):
+        for name in ("num_warmup_chunks", "tpot_bucket_size"):
             value = getattr(self, name)
             if value < 1:
                 raise ValueError(f"{name} must be >= 1, got {value}")
-        if self.min_chunk_tokens < 0:
-            raise ValueError(
-                f"min_chunk_tokens must be >= 0, got {self.min_chunk_tokens}")
+        for name in ("tpot_ema_alpha",
+                     "adaptive_batching_min_throughput_ratio"):
+            value = getattr(self, name)
+            if not (0 < value <= 1):
+                raise ValueError(f"{name} must be in (0, 1], got {value}")
         for name in (
-            "seconds_per_word",
-            "critical_threshold",
-            "pending_in_threshold",
-            "pending_out_threshold",
-            "offloading_in_threshold",
-            "offloading_out_threshold",
-            "adaptive_batching_min_throughput_ratio",
-            "offload_safety_margin_s",
-            "offload_bandwidth_bytes_per_s",
+                "critical_threshold",
+                "pending_in_threshold",
+                "pending_out_threshold",
+                "offloading_in_threshold",
+                "offloading_out_threshold",
+                "offload_safety_margin_s",
+                "seconds_per_word",
         ):
             value = getattr(self, name)
             if value < 0:
                 raise ValueError(f"{name} must be >= 0, got {value}")
-        for name in (
-            "tpot_ema_alpha",
-            "adaptive_batching_min_throughput_ratio",
-        ):
-            value = getattr(self, name)
-            if not (0 < value <= 1):
-                raise ValueError(f"{name} must be in (0, 1], got {value}")
-            if self.tpot_bucket_size <= 0:
-                raise ValueError("tpot_bucket_size must be > 0")
+        if self.min_chunk_tokens < 0:
+            raise ValueError(
+                f"min_chunk_tokens must be >= 0, got {self.min_chunk_tokens}")
+        if self.offload_bandwidth_bytes_per_s <= 0:
+            raise ValueError(
+                f"offload_bandwidth_bytes_per_s must be > 0, "
+                f"got {self.offload_bandwidth_bytes_per_s}")
         if self.pending_in_threshold > self.pending_out_threshold:
             raise ValueError(
                 "pending_in_threshold must be <= pending_out_threshold")
         if self.offloading_in_threshold > self.offloading_out_threshold:
             raise ValueError(
                 "offloading_in_threshold must be <= offloading_out_threshold")
-        if self.offload_bandwidth_bytes_per_s <= 0:
-            raise ValueError("offload_bandwidth_bytes_per_s must be > 0")
-
-
-def build_slo_state(config: SsloConfig) -> "RequestSLOState":
-    """Create a RequestSLOState from SsloConfig."""
-    from vllm.sslo.slo_state import RequestSLOState
-
-    return RequestSLOState(
-        seconds_per_word=config.seconds_per_word,
-        num_warmup_chunks=config.num_warmup_chunks,
-        chunk_unit=config.chunk_unit,
-        min_chunk_tokens=config.min_chunk_tokens,
-    )

@@ -3,7 +3,7 @@
 
 import pytest
 
-from vllm.sslo.config import SsloConfig, build_slo_state
+from vllm.sslo.config import SsloConfig
 from vllm.sslo.slo_state import RequestSLOState
 
 
@@ -65,14 +65,14 @@ def test_invalid_chunk_unit_raises():
         SsloConfig(chunk_unit="token")
 
 
-def test_build_slo_state_freezes_config_constants():
+def test_from_config_freezes_constants():
     cfg = SsloConfig(
         seconds_per_word=0.5,
         num_warmup_chunks=7,
         chunk_unit="paragraph",
         min_chunk_tokens=24,
     )
-    state = build_slo_state(cfg)
+    state = RequestSLOState.from_config(cfg)
     assert isinstance(state, RequestSLOState)
     assert state.seconds_per_word == 0.5
     assert state.num_warmup_chunks == 7

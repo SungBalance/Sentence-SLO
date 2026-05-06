@@ -21,8 +21,14 @@ def make_state(
     generated=0,
 ) -> RequestSLOState:
     state = RequestSLOState(num_warmup_chunks=1)
-    state.phase = phase
-    state.decoding_start_ts = 0.0
+    # phase is derived from decoding_start_ts + chunks_completed; set the
+    # underlying state to land in the requested phase.
+    if phase == Phase.PREFILL:
+        state.decoding_start_ts = None
+    else:
+        state.decoding_start_ts = 0.0
+        if phase == Phase.MEASURED:
+            state.chunks_completed = max(state.num_warmup_chunks, 1)
     state.cumulative_consume_time = deadline
     state.chunk_expected_len = expected_len
     state.current_chunk_generated_len = generated
