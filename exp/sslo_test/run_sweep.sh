@@ -4,74 +4,59 @@
 # Usage:
 #   run_sweep.sh [num_runs=3] [--label NAME]
 #
-# --label NAME (or LABEL env var) writes outputs to
-# exp/sslo_test/output_sweep_<NAME>/ instead of the default output_sweep/.
-# Useful for keeping multiple comparison sweeps side by side.
+# Env-var overrides (all optional; bare names — no _OVERRIDE suffix):
+#   MODEL=Qwen/Qwen3.5-35B-A3B
+#   NUM_PROMPTS=256
+#   GENERATION_MAX_TOKENS=4096
+#   MAX_MODEL_LEN=0                  (0 = auto, vLLM uses model HF config max)
+#   TENSOR_PARALLEL_SIZE=1
+#   GPU_MEMORY_UTILIZATION=0.95
+#   SECONDS_PER_WORD=0.28
+#   MODES=baseline,sslo,sslo_adaptive
+#   CHUNK_UNITS="sentence"           (space-separated)
+#   MAX_NUM_SEQS_VALUES="16 32 64 128"
+#   REQUEST_RATES="0 4 16 32 64 128"
+#   LABEL=                           (default-named subdir if empty)
+#   PARALLEL=0                       (0=sequential, 4=split across 4 GPUs)
 #
-# Env vars:
-#   PARALLEL=0    0=sequential (single GPU), 4=4-GPU parallel using
-#                 GPU_RATE_ASSIGNMENTS (manual rate→GPU map below).
+# --label NAME (or LABEL env) writes outputs to
+#   exp/sslo_test/output_sweep/<NAME>/...
+# so multiple comparison sweeps can sit side by side and feed one
+# summary.csv at exp/sslo_test/output_sweep/summary.csv.
 #
 # Run inside the sk-sslo container from /workspace/mlsys.
 set -euo pipefail
 
 LABEL="${LABEL:-}"
-POSITIONAL_ARGS=()
+POSITIONAL=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --label)
-      LABEL="$2"
-      shift 2
-      ;;
-    --label=*)
-      LABEL="${1#--label=}"
-      shift
-      ;;
-    *)
-      POSITIONAL_ARGS+=("$1")
-      shift
-      ;;
+    --label)    LABEL="$2"; shift 2 ;;
+    --label=*)  LABEL="${1#--label=}"; shift ;;
+    *)          POSITIONAL+=("$1"); shift ;;
   esac
 done
-set -- "${POSITIONAL_ARGS[@]}"
+set -- "${POSITIONAL[@]}"
 
 NUM_RUNS="${1:-3}"
 PARALLEL="${PARALLEL:-0}"
 
-MODEL="Qwen/Qwen3.5-35B-A3B"
-NUM_PROMPTS=256
-GENERATION_MAX_TOKENS=4096
-MAX_MODEL_LEN=0   # 0 = auto: vLLM derives from the model's HF config max
-TENSOR_PARALLEL_SIZE=1
-GPU_MEMORY_UTILIZATION=0.95
-SECONDS_PER_WORD=0.28
-MODES="baseline,sslo,sslo_adaptive"
+MODEL="${MODEL:-Qwen/Qwen3.5-35B-A3B}"
+NUM_PROMPTS="${NUM_PROMPTS:-256}"
+GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS:-4096}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-0}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
+SECONDS_PER_WORD="${SECONDS_PER_WORD:-0.28}"
+MODES="${MODES:-baseline,sslo,sslo_adaptive}"
 
-CHUNK_UNITS=(sentence)
-MAX_NUM_SEQS_VALUES=(16 32 64 128)
-REQUEST_RATES=(0 4 16 32 64 128)
+read -ra CHUNK_UNITS_ARR        <<< "${CHUNK_UNITS:-sentence}"
+read -ra MAX_NUM_SEQS_VALUES    <<< "${MAX_NUM_SEQS_VALUES:-16 32 64 128}"
+read -ra REQUEST_RATES          <<< "${REQUEST_RATES:-0 4 16 32 64 128}"
 
-# Optional env overrides (space-separated). Useful for verification sweeps.
-if [[ -n "${MAX_NUM_SEQS_VALUES_OVERRIDE:-}" ]]; then
-  IFS=' ' read -ra MAX_NUM_SEQS_VALUES <<< "${MAX_NUM_SEQS_VALUES_OVERRIDE}"
-fi
-if [[ -n "${REQUEST_RATES_OVERRIDE:-}" ]]; then
-  IFS=' ' read -ra REQUEST_RATES <<< "${REQUEST_RATES_OVERRIDE}"
-fi
-if [[ -n "${MODES_OVERRIDE:-}" ]]; then
-  MODES="${MODES_OVERRIDE}"
-fi
-if [[ -n "${MODEL_OVERRIDE:-}" ]]; then
-  MODEL="${MODEL_OVERRIDE}"
-fi
-if [[ -n "${GENERATION_MAX_TOKENS_OVERRIDE:-}" ]]; then
-  GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS_OVERRIDE}"
-fi
-
-# Manual GPU → rates assignment (one space-separated rate list per GPU).
-# Goal: balance wallclock — rate=4 is the slowest (256/4 = 64s arrival),
-# rate=0 the fastest (instant arrival), the rest scale by 1/rate. Pair so
-# the four GPUs finish around the same time.
+# Manual GPU → rates assignment for PARALLEL=4. Goal: balance wallclock —
+# rate=4 is slowest (256/4 = 64s arrival), rate=0 fastest (instant); pair
+# so the four GPUs finish around the same time.
 GPU_RATE_ASSIGNMENTS=(
   "4"          # GPU 0 (slowest alone)
   "16 128"     # GPU 1
@@ -87,17 +72,16 @@ GPU_READY_TIMEOUT_S=60
 GPU_READY_SLEEP_S=5
 
 # ---------------------------------------------------------------------------
-# gpu_wait_ready <gpu_index>
-# Polls nvidia-smi until free memory > GPU_READY_FREE_FRAC * total, or timeout.
+# gpu_wait_ready <gpu_index> — poll nvidia-smi until free memory exceeds
+# GPU_READY_FREE_FRAC * total or GPU_READY_TIMEOUT_S elapses.
 # ---------------------------------------------------------------------------
 gpu_wait_ready() {
   local gpu_index="${1:-1}"
   local deadline=$(( $(date +%s) + GPU_READY_TIMEOUT_S ))
   while true; do
-    local line
+    local line free total
     line=$(nvidia-smi --query-gpu=memory.free,memory.total \
       --format=csv,noheader,nounits -i "${gpu_index}" 2>/dev/null | head -1) || true
-    local free total
     free=$(echo "${line}" | awk -F',' '{print $1+0}')
     total=$(echo "${line}" | awk -F',' '{print $2+0}')
     if [[ "${total}" -gt 0 ]]; then
@@ -119,29 +103,32 @@ gpu_wait_ready() {
 }
 
 # ---------------------------------------------------------------------------
+# write_run_status <out_dir> <mode:rc> [<mode:rc> ...]  →  out_dir/run_status.json
+# ---------------------------------------------------------------------------
+write_run_status() {
+  local out_dir="$1"; shift
+  local body="" sep=""
+  for pair in "$@"; do
+    body+="${sep}\"${pair%%:*}\": ${pair##*:}"
+    sep=", "
+  done
+  printf '{%s}\n' "${body}" > "${out_dir}/run_status.json"
+}
+
+# ---------------------------------------------------------------------------
 # run_cell <unit> <gpu> <rate> <seqs> <run_index>
 # ---------------------------------------------------------------------------
 run_cell() {
-  local unit="$1"
-  local gpu="$2"
-  local rate="$3"
-  local seqs="$4"
-  local run_index="$5"
-
+  local unit="$1" gpu="$2" rate="$3" seqs="$4" run_index="$5"
   local out_dir="${BASE_OUTPUT}/${unit}/seqs_${seqs}/rate_${rate}/run_${run_index}"
   rm -rf "${out_dir}"
   mkdir -p "${out_dir}"
 
   IFS=',' read -ra modes_arr <<< "${MODES}"
-  # Accumulate "mode:status" pairs for the JSON writer below
-  local status_pairs=()
-  local last_rc=0
-  local early_exit=0
+  local status_pairs=() last_rc=0
 
   for mode in "${modes_arr[@]}"; do
-    if [[ "${mode}" != "baseline" ]]; then
-      gpu_wait_ready "${gpu:-1}"
-    fi
+    [[ "${mode}" != "baseline" ]] && gpu_wait_ready "${gpu:-1}"
 
     last_rc=0
     OUTPUT_DIR="${out_dir}" \
@@ -160,53 +147,14 @@ run_cell() {
 
     status_pairs+=("${mode}:${last_rc}")
     if [[ "${last_rc}" -eq 0 ]]; then
-      _SSLO_OUT_DIR="${out_dir}" _SSLO_MODE="${mode}" python3 - <<'PYEOF'
-import json, os
-out_dir = os.environ['_SSLO_OUT_DIR']
-mode = os.environ['_SSLO_MODE']
-file_map = [
-    (f'requests_{mode}.jsonl',     'requests.jsonl'),
-    (f'chunks_{mode}.jsonl',       'chunks.jsonl'),
-    (f'_stats_{mode}.jsonl',       'scheduler_stats.jsonl'),
-    (f'_offload_log_{mode}.jsonl', 'offload_log.jsonl'),
-]
-for src_name, dst_name in file_map:
-    src = os.path.join(out_dir, src_name)
-    if not os.path.exists(src):
-        continue
-    dst = os.path.join(out_dir, dst_name)
-    with open(src) as f_in, open(dst, 'a') as f_out:
-        for line in f_in:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            merged = {'mode': mode, **row}
-            f_out.write(json.dumps(merged) + '\n')
-    os.remove(src)
-PYEOF
-    fi
-
-    if [[ "${last_rc}" -ne 0 ]]; then
+      python3 exp/sslo_test/_consolidate_mode_outputs.py "${out_dir}" "${mode}"
+    else
       echo "WARNING: mode=${mode} exited ${last_rc}; skipping remaining modes"
-      early_exit=1
       break
     fi
   done
 
-  # Write run_status.json: build a python dict literal from "mode:status" pairs
-  local py_dict="{"
-  local sep=""
-  for pair in "${status_pairs[@]}"; do
-    local k="${pair%%:*}"
-    local v="${pair##*:}"
-    py_dict="${py_dict}${sep}\"${k}\": ${v}"
-    sep=", "
-  done
-  py_dict="${py_dict}}"
-  python3 -c "import json; print(json.dumps(${py_dict}, indent=2))" \
-    > "${out_dir}/run_status.json"
-
+  write_run_status "${out_dir}" "${status_pairs[@]}"
   python3 exp/sslo_test/analyze.py \
     --output-dir "${out_dir}" \
     --max-num-seqs "${seqs}" \
@@ -222,12 +170,9 @@ PYEOF
 # run_subset <unit> <gpu> <rates...>
 # ---------------------------------------------------------------------------
 run_subset() {
-  local unit="$1"
-  local gpu="$2"
+  local unit="$1" gpu="$2"
   shift 2
-  local rates=("$@")
-
-  for rate in "${rates[@]}"; do
+  for rate in "$@"; do
     for seqs in "${MAX_NUM_SEQS_VALUES[@]}"; do
       for (( i=1; i<=NUM_RUNS; i++ )); do
         echo
@@ -242,11 +187,11 @@ run_subset() {
 # Main
 # ---------------------------------------------------------------------------
 if [[ "${PARALLEL}" != "0" && "${PARALLEL}" != "4" ]]; then
-  echo "ERROR: PARALLEL=${PARALLEL} is not supported. Supported values: 0, 4." >&2
+  echo "ERROR: PARALLEL=${PARALLEL} is not supported (use 0 or 4)." >&2
   exit 1
 fi
 
-for unit in "${CHUNK_UNITS[@]}"; do
+for unit in "${CHUNK_UNITS_ARR[@]}"; do
   echo
   echo "=========================================="
   echo "  chunk_unit=${unit}"
@@ -268,15 +213,9 @@ for unit in "${CHUNK_UNITS[@]}"; do
     echo "  pids: ${pids[*]:-<none>}"
     any_failed=0
     for pid in "${pids[@]}"; do
-      wait "${pid}"; rc=$?
-      if [[ "${rc}" -ne 0 ]]; then
-        echo "  WARNING: background sweep pid=${pid} exit=${rc}"
-        any_failed=1
-      fi
+      wait "${pid}" || { echo "  WARNING: pid=${pid} exit=$?"; any_failed=1; }
     done
-    if [[ "${any_failed}" -ne 0 ]]; then
-      echo "  WARNING: one or more GPU streams failed; aggregator will run on whatever is present."
-    fi
+    [[ "${any_failed}" -ne 0 ]] && echo "  WARNING: aggregator will use whatever cells are present."
   fi
 done
 
@@ -284,7 +223,7 @@ echo
 echo "=========================================="
 echo "  Sweep complete. Aggregating..."
 echo "=========================================="
-for unit in "${CHUNK_UNITS[@]}"; do
+for unit in "${CHUNK_UNITS_ARR[@]}"; do
   echo
   echo "--- chunk_unit=${unit} ---"
   python3 exp/sslo_test/analysis/aggregate_sweep.py \
