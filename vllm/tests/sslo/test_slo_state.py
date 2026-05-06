@@ -82,17 +82,35 @@ def test_chunk1_records_real_slack():
     assert rec.stall_s == pytest.approx(1.0)
 
 
-def test_chunk_expected_len_ema_updates():
-    state = RequestSLOState(num_warmup_chunks=1)
+def test_chunk_expected_len_p90_tracks_history():
+    state = RequestSLOState(num_warmup_chunks=1, chunk_len_strategy="p90")
     for _ in range(10):
         state.on_token(0.0, 1)
     state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
-    assert state.chunk_expected_len_ema == pytest.approx(10.0)
-
+    assert state.chunk_expected_len == pytest.approx(10.0)
     for _ in range(20):
         state.on_token(0.2, 1)
     state.on_chunk_boundary(0.3, word_count=4, chunk_consume_time_s=1.0)
-    assert state.chunk_expected_len_ema == pytest.approx(12.0)
+    # p90 over [10, 20] picks the larger one.
+    assert state.chunk_expected_len == pytest.approx(20.0)
+
+
+def test_chunk_expected_len_ema_strategy_smooths():
+    state = RequestSLOState(num_warmup_chunks=1, chunk_len_strategy="ema")
+    for _ in range(10):
+        state.on_token(0.0, 1)
+    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    assert state.chunk_expected_len == pytest.approx(10.0)
+    for _ in range(20):
+        state.on_token(0.2, 1)
+    state.on_chunk_boundary(0.3, word_count=4, chunk_consume_time_s=1.0)
+    # EMA(alpha=0.2): 0.2*20 + 0.8*10 = 12.0
+    assert state.chunk_expected_len == pytest.approx(12.0)
+
+
+def test_chunk_len_strategy_validates():
+    with pytest.raises(ValueError):
+        RequestSLOState(chunk_len_strategy="median")
 
 
 def test_score_formula_and_deadline_sign():
@@ -114,7 +132,7 @@ def test_score_none_during_warmup_or_missing_inputs():
 
     measured = measured_state()
     assert measured.score(0.2, None) is None
-    measured.chunk_expected_len_ema = None
+    measured.chunk_expected_len = None
     assert measured.score(0.2, 0.1) is None
 
 

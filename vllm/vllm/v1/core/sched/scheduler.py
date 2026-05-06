@@ -207,8 +207,18 @@ class Scheduler(SchedulerInterface):
         # step. avg is diagnostic; max drives admission cap.
         self._sslo_avg_score: float | None = None
         self._sslo_max_score: float | None = None
+        # SSLO: per-step waiting admission budget set by _apply_sslo_policy
+        # so the waiting loop knows exactly how many to admit (rather than
+        # checking a gate every iteration).
+        self._sslo_waiting_admission_budget: int = 0
         # SSLO
         self._sslo_active_cap: int = self.max_num_running_reqs
+        # SSLO: dedup for request_done log writes (multiple cleanup paths
+        # call _sslo_log_request_done per request).
+        self._sslo_done_logged: set[str] = set()
+        # SSLO: track whether the SSLO_STATS_LOG_PATH dir has been created
+        # so we don't makedirs() once per scheduler step.
+        self._sslo_log_dir_created: bool = False
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -1087,6 +1097,21 @@ class Scheduler(SchedulerInterface):
         return (0, -score, request_id)
 
     # SSLO
+    def _admit_priority_key(
+        self,
+        req: Request,
+        scores: dict[str, float | None],
+        tiers: dict[str, int],
+    ):
+        # Tier 1 (warmup) goes first, then score-priority within the rest.
+        # Used both for critical-mode admission sort and non-critical
+        # cap-overflow trim.
+        return (
+            0 if tiers[req.request_id] == 1 else 1,
+            self._priority_key(scores[req.request_id], req.request_id),
+        )
+
+    # SSLO
     def _apply_sslo_policy(self, now: float) -> dict[str, float | None]:
         # Reload BEFORE placement so a request whose offloaded_score crossed
         # the reload threshold can compete in this step's placement instead
@@ -1103,16 +1128,14 @@ class Scheduler(SchedulerInterface):
             self._sslo_wall_step_ema_s
             if self._sslo_wall_step_ema_s > 0.0 else None)
         admitted = list(self.running) + list(self.sslo_pending)
-        scores: dict[str, float | None] = {}
-        tiers: dict[str, int] = {}
-        for req in admitted:
-            state = req.slo_state
-            assert state is not None
-            score = state.score(now, base_tpot)
-            scores[req.request_id] = score
-            tiers[req.request_id] = self._classify_tier(req, score)
-
+        scores, tiers = self._score_admitted(admitted, now, base_tpot)
         self._sslo_has_critical = any(tier == 0 for tier in tiers.values())
+
+        # Update aggregate scores BEFORE backfill so admission cap uses the
+        # current step's avg, not the previous step's.
+        self._sslo_avg_score, self._sslo_max_score = self._aggregate_scores(
+            scores)
+
         if self._sslo_has_critical:
             cap = base_n
             if self.sslo_config.adaptive_batching:
@@ -1121,18 +1144,16 @@ class Scheduler(SchedulerInterface):
                 if picked is not None:
                     cap = picked
                     tpot_pick = self.tpot_ema.get(picked)
-                    for req in admitted:
-                        state = req.slo_state
-                        assert state is not None
-                        score = state.score(now, tpot_pick)
-                        scores[req.request_id] = score
-                        tiers[req.request_id] = self._classify_tier(req, score)
+                    scores, tiers = self._score_admitted(
+                        admitted, now, tpot_pick)
             self._sslo_active_cap = cap
+            # SSLO: warmup-protect — Tier 1 (chunks_completed < num_warmup_chunks)
+            # always goes to running first, ahead of priority-sorted measured
+            # requests. Score isn't computable for warmup, so without this
+            # explicit protection critical mode would push them to pending.
             sorted_admitted = sorted(
                 admitted,
-                key=lambda req: self._priority_key(
-                    scores[req.request_id], req.request_id),
-            )
+                key=lambda r: self._admit_priority_key(r, scores, tiers))
             new_running = [
                 req for req in sorted_admitted
                 if req.request_id not in self.sslo_offloaded
@@ -1144,112 +1165,153 @@ class Scheduler(SchedulerInterface):
             ]
         else:
             score_suspend = base_tpot is None
-            cands_running: list[Request] = []
-            cands_pending: list[Request] = []
-            if score_suspend:
-                cands_running = list(self.running)
-                cands_pending = list(self.sslo_pending)
-            else:
-                for req in admitted:
-                    if req.request_id in self.sslo_offloaded:
-                        cands_pending.append(req)
-                        continue
-                    score = scores[req.request_id]
-                    tier = tiers[req.request_id]
-                    in_pending = req.request_id in prev_pending_ids
-                    if tier == 1:
-                        cands_running.append(req)
-                    elif in_pending:
-                        if (
-                            score is not None
-                            and score >= self.sslo_config.pending_out_threshold
-                        ):
-                            cands_running.append(req)
-                        else:
-                            cands_pending.append(req)
-                    elif (
-                        score is not None
-                        and score <= self.sslo_config.pending_in_threshold
-                    ):
-                        cands_pending.append(req)
-                    else:
-                        cands_running.append(req)
+            cands_running, cands_pending = self._classify_non_critical(
+                admitted, scores, tiers, prev_pending_ids, score_suspend)
             cap = self.max_num_running_reqs
             if len(cands_running) > cap:
                 cands_running.sort(
-                    key=lambda req: (
-                        0 if tiers[req.request_id] == 1 else 1,
-                        self._priority_key(
-                            scores[req.request_id], req.request_id),
-                    ))
+                    key=lambda r: self._admit_priority_key(r, scores, tiers))
                 overflow = cands_running[cap:]
                 cands_running = cands_running[:cap]
                 cands_pending.extend(overflow)
             self._sslo_active_cap = cap
-
-            # SSLO: backfill running from pending so this step's batch hits
-            # cap when supply exists. Reserve room for waiting first
-            # (waiting > pending priority per spec). Done BEFORE the running
-            # loop so backfilled requests get tokens THIS step — keeps batch
-            # constant in non-adaptive sslo mode.
-            slack = cap - len(cands_running)
-            waiting_count = len(self.waiting) + len(self.skipped_waiting)
-            backfill_budget = max(0, slack - waiting_count)
-            if backfill_budget > 0 and cands_pending:
-                pending_pool = [
-                    r for r in cands_pending
-                    if r.request_id not in self.sslo_offloaded
-                ]
-                pending_pool.sort(
-                    key=lambda req: self._priority_key(
-                        scores[req.request_id], req.request_id))
-                for pick in pending_pool[:backfill_budget]:
-                    cands_pending.remove(pick)
-                    cands_running.append(pick)
-
+            self._compute_admission_budget_and_backfill(
+                cands_running, cands_pending, scores)
             new_running = cands_running
             new_pending = cands_pending
 
         self.running = new_running
         self.sslo_pending = new_pending
         self._fire_pending_lifecycle(prev_pending_ids, new_running, new_pending, now)
+        self._sslo_dump_step_stats(now)
+        return scores
 
-        # SSLO: per-step stats for offline analysis. Gated by env var so it's
-        # zero overhead when not requested.
-        # Average + max score across admitted. avg drives diagnostics; max
-        # drives the waiting-admission cap combined < max_num_running_reqs
-        # / max_score (admit only when no admitted is near SLO boundary).
-        finite_scores = [
+    # SSLO
+    def _score_admitted(
+        self,
+        admitted: list[Request],
+        now: float,
+        tpot: float | None,
+    ) -> tuple[dict[str, float | None], dict[str, int]]:
+        scores: dict[str, float | None] = {}
+        tiers: dict[str, int] = {}
+        for req in admitted:
+            state = req.slo_state
+            assert state is not None
+            score = state.score(now, tpot)
+            scores[req.request_id] = score
+            tiers[req.request_id] = self._classify_tier(req, score)
+        return scores, tiers
+
+    # SSLO
+    def _aggregate_scores(
+        self,
+        scores: dict[str, float | None],
+    ) -> tuple[float | None, float | None]:
+        finite = [
             s for s in scores.values()
             if s is not None and s != float("inf")
         ]
-        avg_score = (sum(finite_scores) / len(finite_scores)
-                     if finite_scores else None)
-        max_score = max(finite_scores) if finite_scores else None
-        self._sslo_avg_score = avg_score
-        self._sslo_max_score = max_score
+        if not finite:
+            return None, None
+        return sum(finite) / len(finite), max(finite)
 
+    # SSLO
+    def _classify_non_critical(
+        self,
+        admitted: list[Request],
+        scores: dict[str, float | None],
+        tiers: dict[str, int],
+        prev_pending_ids: set[str],
+        score_suspend: bool,
+    ) -> tuple[list[Request], list[Request]]:
+        if score_suspend:
+            return list(self.running), list(self.sslo_pending)
+        cands_running: list[Request] = []
+        cands_pending: list[Request] = []
+        for req in admitted:
+            if req.request_id in self.sslo_offloaded:
+                cands_pending.append(req)
+                continue
+            score = scores[req.request_id]
+            tier = tiers[req.request_id]
+            in_pending = req.request_id in prev_pending_ids
+            if tier == 1:
+                cands_running.append(req)
+            elif in_pending:
+                if (score is not None
+                        and score >= self.sslo_config.pending_out_threshold):
+                    cands_running.append(req)
+                else:
+                    cands_pending.append(req)
+            elif (score is not None
+                  and score <= self.sslo_config.pending_in_threshold):
+                cands_pending.append(req)
+            else:
+                cands_running.append(req)
+        return cands_running, cands_pending
+
+    # SSLO
+    def _compute_admission_budget_and_backfill(
+        self,
+        cands_running: list[Request],
+        cands_pending: list[Request],
+        scores: dict[str, float | None],
+    ) -> None:
+        # Admission cap uses 1/avg_score (Option A): the system can sustain
+        # ~1/avg_score concurrent requests on average. Reserve at most that
+        # many slots for waiting; the rest is backfilled from pending so
+        # this step's batch hits cap when supply exists.
+        cap = self._sslo_active_cap
+        slack = cap - len(cands_running)
+        waiting_count = len(self.waiting) + len(self.skipped_waiting)
+        combined = len(cands_running) + len(cands_pending)
+        avg_s = self._sslo_avg_score
+        if avg_s is not None and avg_s > 0:
+            admission_capacity = max(0, int(1.0 / avg_s) - combined)
+        else:
+            admission_capacity = slack
+        self._sslo_waiting_admission_budget = min(
+            waiting_count, admission_capacity, slack)
+        backfill_budget = max(
+            0, slack - self._sslo_waiting_admission_budget)
+        if backfill_budget <= 0 or not cands_pending:
+            return
+        pending_pool = [
+            r for r in cands_pending
+            if r.request_id not in self.sslo_offloaded
+        ]
+        pending_pool.sort(
+            key=lambda r: self._priority_key(
+                scores[r.request_id], r.request_id))
+        for pick in pending_pool[:backfill_budget]:
+            cands_pending.remove(pick)
+            cands_running.append(pick)
+
+    # SSLO
+    def _sslo_dump_step_stats(self, now: float) -> None:
         log_path = os.environ.get("SSLO_STATS_LOG_PATH")
-        if log_path:
+        if not log_path:
+            return
+        if not self._sslo_log_dir_created:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            stats_row = {
-                "kind": "step",
-                "ts": now,
-                "running": len(self.running),
-                "pending": len(self.sslo_pending),
-                "offloaded": len(self.sslo_offloaded),
-                "combined": len(self.running) + len(self.sslo_pending),
-                "waiting": len(self.waiting) + len(self.skipped_waiting),
-                "active_cap": self._sslo_active_cap,
-                "has_critical": self._sslo_has_critical,
-                "avg_score": avg_score,
-                "max_score": max_score,
-                "wall_step_ema_s": self._sslo_wall_step_ema_s,
-            }
-            with open(log_path, "a") as f:
-                f.write(json.dumps(stats_row) + "\n")
-
-        return scores
+            self._sslo_log_dir_created = True
+        stats_row = {
+            "kind": "step",
+            "ts": now,
+            "running": len(self.running),
+            "pending": len(self.sslo_pending),
+            "offloaded": len(self.sslo_offloaded),
+            "combined": len(self.running) + len(self.sslo_pending),
+            "waiting": len(self.waiting) + len(self.skipped_waiting),
+            "active_cap": self._sslo_active_cap,
+            "has_critical": self._sslo_has_critical,
+            "avg_score": self._sslo_avg_score,
+            "max_score": self._sslo_max_score,
+            "wall_step_ema_s": self._sslo_wall_step_ema_s,
+        }
+        with open(log_path, "a") as f:
+            f.write(json.dumps(stats_row) + "\n")
 
     # SSLO
     def _fire_pending_lifecycle(
@@ -1293,17 +1355,19 @@ class Scheduler(SchedulerInterface):
         # Per-request final state dump for offline analysis. Goes to the same
         # file as per-step scheduler_stats but with kind="request_done" so
         # readers can demux. Idempotent across the multiple cleanup paths
-        # (finish, abort, fail-load) via slo_state.done_logged.
+        # (finish, abort, fail-load) via self._sslo_done_logged.
         log_path = os.environ.get("SSLO_STATS_LOG_PATH")
         if not log_path:
             return
         state = request.slo_state
-        if state is None or state.done_logged:
+        if state is None:
+            return
+        rid = request.request_id
+        if rid in self._sslo_done_logged:
             return
         # request.request_id is the engine-internal "<user_id>-<uuid>" form;
         # split off the user_id prefix for cross-referencing chunks.jsonl
         # which uses the user-side id.
-        rid = request.request_id
         user_id = rid.split("-", 1)[0] if "-" in rid else rid
         row = {
             "kind": "request_done",
@@ -1318,7 +1382,7 @@ class Scheduler(SchedulerInterface):
         try:
             with open(log_path, "a") as f:
                 f.write(json.dumps(row) + "\n")
-            state.done_logged = True
+            self._sslo_done_logged.add(rid)
         except OSError:
             pass
 
@@ -1756,6 +1820,8 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            # SSLO: budget-driven admission (computed in _apply_sslo_policy).
+            sslo_admit_remaining = self._sslo_waiting_admission_budget
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # SSLO
@@ -1763,14 +1829,9 @@ class Scheduler(SchedulerInterface):
                     break
                 if len(self.running) == self.max_num_running_reqs:
                     break
-                # SSLO: cap admitted at max_num_running_reqs / max_score.
-                # The most-at-risk admitted request defines available
-                # capacity; admit only while combined stays under that bound.
-                max_s = self._sslo_max_score
-                if max_s is not None and max_s > 0:
-                    combined = len(self.running) + len(self.sslo_pending)
-                    if combined >= self.max_num_running_reqs / max_s:
-                        break
+                # SSLO: stop when this step's admission budget is exhausted.
+                if sslo_admit_remaining <= 0:
+                    break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
@@ -2027,6 +2088,8 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                # SSLO: count successful admission against this step's budget.
+                sslo_admit_remaining -= 1
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp

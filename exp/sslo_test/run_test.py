@@ -109,9 +109,11 @@ def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
         end_ts = _val(record, "gen_finish_ts")
         if end_ts is None:
             end_ts = _val(record, "end_time_ts")
+        deadline = _val(record, "deadline_ts")
         normalized.append({
             "chunk_idx": _val(record, "chunk_idx"),
             "cumulative_slack": slack,
+            "deadline_ts": deadline,
             "gen_time": _val(record, "gen_time"),
             "pending_time": pending,
             "word_count": _val(record, "word_count"),

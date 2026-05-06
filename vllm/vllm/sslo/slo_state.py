@@ -7,15 +7,63 @@ from enum import IntEnum
 
 _SENTENCE_END_CHARS = frozenset(".!?。！？…")
 _VALID_CHUNK_UNITS = frozenset({"sentence", "paragraph"})
-_CHUNK_LEN_EMA_ALPHA = 0.2  # legacy; retained in case other code reads it
-_CHUNK_LEN_HISTORY_MAX = 64  # cap history size for memory bound
-_CHUNK_LEN_PERCENTILE = 90.0  # p90 used as forward-projection length estimate
+
+_VALID_CHUNK_LEN_STRATEGIES = frozenset({"ema", "p90", "p99"})
+_DEFAULT_CHUNK_LEN_STRATEGY = "p90"
+_CHUNK_LEN_HISTORY_MAX = 64
+_CHUNK_LEN_EMA_ALPHA = 0.2
 
 
 class Phase(IntEnum):
     PREFILL = 0
     WARMUP = 1
     MEASURED = 2
+
+
+class ChunkLengthPredictor:
+    """Predict the next chunk's generated_len from completed chunks.
+
+    Three strategies select different points on the conservatism axis:
+      - "ema": EMA (alpha) — smooth, follows the central tendency.
+      - "p90"/"p99": percentile over a sliding window — conservative
+        upper bound that biases score() toward overestimating remaining
+        work (and therefore admission/preemption pressure).
+    """
+
+    def __init__(
+        self,
+        strategy: str = _DEFAULT_CHUNK_LEN_STRATEGY,
+        history_max: int = _CHUNK_LEN_HISTORY_MAX,
+        alpha: float = _CHUNK_LEN_EMA_ALPHA,
+    ) -> None:
+        if strategy not in _VALID_CHUNK_LEN_STRATEGIES:
+            raise ValueError(
+                f"chunk_len_strategy must be one of "
+                f"{sorted(_VALID_CHUNK_LEN_STRATEGIES)}, got {strategy!r}")
+        self.strategy = strategy
+        self.history_max = history_max
+        self.alpha = alpha
+        self._history: list[int] = []
+        self._ema: float | None = None
+        self.value: float | None = None
+
+    def update(self, generated_len: int) -> None:
+        n = int(generated_len)
+        if self.strategy == "ema":
+            self._ema = float(n) if self._ema is None else (
+                self.alpha * n + (1.0 - self.alpha) * self._ema)
+            self.value = self._ema
+            return
+        self._history.append(n)
+        if len(self._history) > self.history_max:
+            self._history.pop(0)
+        sorted_h = sorted(self._history)
+        percentile = 90.0 if self.strategy == "p90" else 99.0
+        idx = min(
+            len(sorted_h) - 1,
+            int(len(sorted_h) * percentile / 100.0),
+        )
+        self.value = float(sorted_h[idx])
 
 
 @dataclass
@@ -38,7 +86,7 @@ class SsloRequestStats:
     total_offload_time_s: float
     num_offload_intervals: int
     chunks_completed: int
-    final_chunk_expected_len_ema: float | None
+    final_chunk_expected_len: float | None
     # Scheduler-side step accounting. total_step_count = scheduler steps in
     # which this request received any tokens. prefill_step_count = subset
     # that mixed prefill (NOT decoding-only). Ratio reveals how often this
@@ -56,14 +104,6 @@ class RequestSLOState:
     cumulative_consume_time: float = 0.0
     chunks_completed: int = 0
     current_chunk_generated_len: int = 0
-    # P90 of completed chunks' generated_len. Replaces the prior EMA — the
-    # 90th percentile is more conservative than mean for forward
-    # projection (score uses this × tpot to estimate remaining gen time).
-    # Field name kept for backwards-compat with downstream readers.
-    chunk_expected_len_ema: float | None = None
-    # Sliding history of recent chunk gen lens used for the p90 above.
-    # Bounded so memory stays small even on very long requests.
-    _chunk_len_history: list[int] = field(default_factory=list)
 
     # Offload.
     is_offloaded: bool = False
@@ -80,18 +120,19 @@ class RequestSLOState:
     # Scheduler step accounting (incremented by Scheduler each step).
     total_step_count: int = 0
     prefill_step_count: int = 0
-    # Set by Scheduler after the first request_done log to avoid duplicate
-    # dumps from the multiple cleanup paths (finish, abort, fail-load).
-    done_logged: bool = False
 
     # Config constants.
     seconds_per_word: float = 0.28
     num_warmup_chunks: int = 4
     chunk_unit: str = "sentence"
+    # Strategy used to project remaining chunk length. See
+    # ChunkLengthPredictor for semantics. "p90" is the default — biases
+    # score() toward overestimating remaining work.
+    chunk_len_strategy: str = _DEFAULT_CHUNK_LEN_STRATEGY
     # When a sentence/paragraph boundary is found but the unflushed token
     # count since the last flush is below this threshold, the chunk is held
     # back and merged into the next one. Prevents short-utterance noise
-    # (e.g. "Yes.") from skewing the chunk-length EMA.
+    # (e.g. "Yes.") from skewing the chunk-length predictor.
     min_chunk_tokens: int = 16
 
     def __post_init__(self) -> None:
@@ -105,6 +146,8 @@ class RequestSLOState:
             raise ValueError("num_warmup_chunks must be >= 0")
         if self.min_chunk_tokens < 0:
             raise ValueError("min_chunk_tokens must be >= 0")
+        self._chunk_len_predictor = ChunkLengthPredictor(
+            strategy=self.chunk_len_strategy)
         self._pending_text = ""
         self._current_chunk_pending_time_s = 0.0
         # Tokens accumulated since the last flush (used for min_chunk_tokens
@@ -118,10 +161,14 @@ class RequestSLOState:
         self._search_offset = 0
 
     @property
-    def cumulative_slack(self) -> float:
-        if not self.chunk_records:
-            return 0.0
-        return self.chunk_records[-1].slack_s
+    def chunk_expected_len(self) -> float | None:
+        return self._chunk_len_predictor.value
+
+    @chunk_expected_len.setter
+    def chunk_expected_len(self, value: float | None) -> None:
+        # Direct assignment used by tests to inject a value bypassing the
+        # predictor; keeps the predictor's `value` consistent.
+        self._chunk_len_predictor.value = value
 
     def chunk_deadline(self) -> float | None:
         if self.decoding_start_ts is None:
@@ -133,10 +180,10 @@ class RequestSLOState:
         return None if deadline is None else deadline - now
 
     def expected_remaining_len(self) -> float | None:
-        if self.chunk_expected_len_ema is None:
+        predicted = self._chunk_len_predictor.value
+        if predicted is None:
             return None
-        return max(1.0, self.chunk_expected_len_ema -
-                   self.current_chunk_generated_len)
+        return max(1.0, predicted - self.current_chunk_generated_len)
 
     def score(self, now: float, tpot_s: float | None) -> float | None:
         """Forward-looking urgency. Values >= 1.0 project a deadline miss."""
@@ -181,9 +228,11 @@ class RequestSLOState:
         if self.chunks_completed == 0:
             slack = 0.0
             stall = 0.0
+            prev_end = self.decoding_start_ts
         else:
             slack = deadline - now
             stall = max(0.0, now - deadline)
+            prev_end = self.chunk_records[-1].gen_finish_ts
         consume_finish = deadline + chunk_consume_time_s
         generated_len = self.current_chunk_generated_len or max(1, word_count)
 
@@ -199,14 +248,7 @@ class RequestSLOState:
                 word_count=word_count,
             ))
         self.chunk_stall_time_total += stall
-        # EMA over recent chunks.
-        if self.chunk_expected_len_ema is None:
-            self.chunk_expected_len_ema = float(generated_len)
-        else:
-            alpha = _CHUNK_LEN_EMA_ALPHA
-            self.chunk_expected_len_ema = (
-                alpha * generated_len +
-                (1 - alpha) * self.chunk_expected_len_ema)
+        self._chunk_len_predictor.update(int(generated_len))
 
         # Soft deadline propagation: cumulative consume budget grows by
         # max(consume, real_gen) per chunk so a violated chunk doesn't
@@ -214,11 +256,7 @@ class RequestSLOState:
         # clock from the previous chunk's gen_finish_ts (decoding_start
         # for chunk 0) to now — pending time is included since the user
         # was waiting during it.
-        if self.chunks_completed == 0:
-            prev_end = self.decoding_start_ts
-        else:
-            prev_end = self.chunk_records[-2].gen_finish_ts
-        real_gen_time = max(0.0, now - (prev_end if prev_end is not None else now))
+        real_gen_time = max(0.0, now - prev_end)
         self.cumulative_consume_time += max(chunk_consume_time_s, real_gen_time)
         self.chunks_completed += 1
         if self.chunks_completed >= self.num_warmup_chunks:
@@ -304,7 +342,7 @@ class RequestSLOState:
             total_offload_time_s=self.total_offload_time_s,
             num_offload_intervals=self.num_offload_intervals,
             chunks_completed=self.chunks_completed,
-            final_chunk_expected_len_ema=self.chunk_expected_len_ema,
+            final_chunk_expected_len=self._chunk_len_predictor.value,
             total_step_count=self.total_step_count,
             prefill_step_count=self.prefill_step_count,
         )

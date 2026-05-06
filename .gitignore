@@ -52,6 +52,7 @@ exp/sslo_test/output/
 exp/sslo_test/output_repeat/
 exp/sslo_test/output_repeat_*/
 exp/sslo_test/output_sweep/
+exp/sslo_test/output_sweep_*/
 exp/sslo_test/output_smoke/
 
 # Local model/data artifacts

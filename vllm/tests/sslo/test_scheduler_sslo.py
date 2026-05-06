@@ -24,7 +24,7 @@ def make_state(
     state.phase = phase
     state.decoding_start_ts = 0.0
     state.cumulative_consume_time = deadline
-    state.chunk_expected_len_ema = expected_len
+    state.chunk_expected_len = expected_len
     state.current_chunk_generated_len = generated
     return state
 
@@ -94,6 +94,9 @@ def make_scheduler(
     scheduler._sslo_prev_step_start_ts = None
     scheduler._sslo_has_critical = False
     scheduler._sslo_active_cap = max_num_running_reqs
+    scheduler._sslo_waiting_admission_budget = 0
+    scheduler._sslo_done_logged = set()
+    scheduler._sslo_log_dir_created = False
     scheduler.max_num_running_reqs = max_num_running_reqs
     scheduler.max_num_scheduled_tokens = 0
     scheduler._pause_state = PauseState.UNPAUSED
@@ -231,11 +234,13 @@ def test_non_critical_running_to_pending_at_03():
 
 
 def test_non_critical_hysteresis_keeps_state_in_band():
+    # Both reqs have score 0.5 (in band [0.3, 0.7]). With running at cap,
+    # backfill has no slack, so hysteresis governs placement: each stays
+    # where it was.
     pending = make_request("pending", make_state(deadline=10, expected_len=5))
     running = make_request("running", make_state(deadline=10, expected_len=5))
     scheduler = make_scheduler(running=[running], pending=[pending],
-                               max_num_running_reqs=2)
-    scheduler.waiting = [object()]  # block backfill so band placement holds
+                               max_num_running_reqs=1)
 
     scheduler._apply_sslo_policy(0.0)
 
