@@ -66,6 +66,25 @@ class ChunkLengthPredictor:
         self.value = float(sorted_h[idx])
 
 
+class ChunkConsumeEstimator:
+    """Estimate the consumption (audio playback) duration of a chunk.
+
+    The default uses a fixed seconds-per-word rate, matching the legacy
+    behaviour. Subclass and override `estimate()` to plug in a TTS-derived
+    duration or any other model — the chunk text is passed in for that
+    purpose.
+    """
+
+    def __init__(self, seconds_per_word: float = 0.28) -> None:
+        if seconds_per_word < 0:
+            raise ValueError("seconds_per_word must be >= 0")
+        self.seconds_per_word = seconds_per_word
+
+    def estimate(self, chunk_text: str, word_count: int) -> float:
+        del chunk_text  # unused in the default rate-based estimator
+        return word_count * self.seconds_per_word
+
+
 @dataclass
 class ChunkRecord:
     chunk_idx: int
@@ -134,6 +153,10 @@ class RequestSLOState:
     # back and merged into the next one. Prevents short-utterance noise
     # (e.g. "Yes.") from skewing the chunk-length predictor.
     min_chunk_tokens: int = 16
+    # Estimator for a chunk's audio consumption time. Defaults to a
+    # word_count × seconds_per_word estimator; inject a TTS-driven instance
+    # to use measured durations.
+    consume_estimator: ChunkConsumeEstimator | None = None
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
@@ -146,6 +169,9 @@ class RequestSLOState:
             raise ValueError("num_warmup_chunks must be >= 0")
         if self.min_chunk_tokens < 0:
             raise ValueError("min_chunk_tokens must be >= 0")
+        if self.consume_estimator is None:
+            self.consume_estimator = ChunkConsumeEstimator(
+                seconds_per_word=self.seconds_per_word)
         self._chunk_len_predictor = ChunkLengthPredictor(
             strategy=self.chunk_len_strategy)
         self._pending_text = ""
@@ -228,11 +254,9 @@ class RequestSLOState:
         if self.chunks_completed == 0:
             slack = 0.0
             stall = 0.0
-            prev_end = self.decoding_start_ts
         else:
             slack = deadline - now
             stall = max(0.0, now - deadline)
-            prev_end = self.chunk_records[-1].gen_finish_ts
         consume_finish = deadline + chunk_consume_time_s
         generated_len = self.current_chunk_generated_len or max(1, word_count)
 
@@ -250,14 +274,17 @@ class RequestSLOState:
         self.chunk_stall_time_total += stall
         self._chunk_len_predictor.update(int(generated_len))
 
-        # Soft deadline propagation: cumulative consume budget grows by
-        # max(consume, real_gen) per chunk so a violated chunk doesn't
-        # poison every downstream chunk's deadline. real_gen is the WALL
-        # clock from the previous chunk's gen_finish_ts (decoding_start
-        # for chunk 0) to now — pending time is included since the user
-        # was waiting during it.
-        real_gen_time = max(0.0, now - prev_end)
-        self.cumulative_consume_time += max(chunk_consume_time_s, real_gen_time)
+        # Stall-aware deadline propagation. The next chunk's deadline is
+        # max(this chunk's gen_finish_ts, the previous deadline) plus this
+        # chunk's audio (consume) time — i.e., chunk N+1 must be ready by
+        # the time the user finishes consuming chunk N, where consumption
+        # starts no earlier than chunk N's gen_finish_ts. A late chunk
+        # therefore extends the next deadline by exactly the lateness, so
+        # carryover overage doesn't compound across chunks.
+        end_offset = max(0.0, now - self.decoding_start_ts)
+        self.cumulative_consume_time = (max(end_offset,
+                                            self.cumulative_consume_time)
+                                        + chunk_consume_time_s)
         self.chunks_completed += 1
         if self.chunks_completed >= self.num_warmup_chunks:
             self.phase = Phase.MEASURED
@@ -356,7 +383,8 @@ class RequestSLOState:
         self.on_chunk_boundary(
             now=now,
             word_count=word_count,
-            chunk_consume_time_s=word_count * self.seconds_per_word,
+            chunk_consume_time_s=self.consume_estimator.estimate(
+                chunk_text, word_count),
         )
         self._pending_text = self._pending_text[boundary_pos:]
         # Reset both counters — held-back tokens emitted; suffix is fresh.

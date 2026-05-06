@@ -3,6 +3,7 @@
 
 from vllm.sslo.config import SsloConfig, build_slo_state
 from vllm.sslo.slo_state import (
+    ChunkConsumeEstimator,
     ChunkRecord,
     Phase,
     RequestSLOState,
@@ -10,6 +11,7 @@ from vllm.sslo.slo_state import (
 )
 
 __all__ = [
+    "ChunkConsumeEstimator",
     "ChunkRecord",
     "Phase",
     "RequestSLOState",

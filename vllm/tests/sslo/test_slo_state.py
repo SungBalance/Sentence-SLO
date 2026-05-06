@@ -66,20 +66,21 @@ def test_on_step_tracks_total_and_prefill_counts():
 
 
 def test_chunk1_records_real_slack():
-    # Chunk 1+ uses the real slack/stall computation.
+    # Chunk 1+ uses the real slack/stall computation. Stall-aware deadline
+    # propagation: after chunk 0 finishes at t=0.5 with consume_time=1.0,
+    # the next deadline = max(0.5, 0.0) + 1.0 = 1.5 (consumption can't
+    # start before the chunk arrives).
     state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
     state.on_token(0.0)
     state.on_chunk_boundary(0.5, word_count=2, chunk_consume_time_s=1.0)
-    # Now decoding_start=0.0, cumulative_consume=1.0, deadline of chunk 1
-    # is 0.0 + 1.0 = 1.0.
     state.on_token(0.5)
     state.on_chunk_boundary(2.0, word_count=2, chunk_consume_time_s=1.0)
     rec = state.chunk_records[1]
     assert rec.chunk_idx == 1
-    assert rec.deadline_ts == pytest.approx(1.0)
+    assert rec.deadline_ts == pytest.approx(1.5)
     assert rec.gen_finish_ts == pytest.approx(2.0)
-    assert rec.slack_s == pytest.approx(-1.0)  # missed deadline by 1s
-    assert rec.stall_s == pytest.approx(1.0)
+    assert rec.slack_s == pytest.approx(-0.5)  # missed deadline by 0.5s
+    assert rec.stall_s == pytest.approx(0.5)
 
 
 def test_chunk_expected_len_p90_tracks_history():
@@ -118,9 +119,12 @@ def test_score_formula_and_deadline_sign():
     for _ in range(4):
         state.on_token(1.0, 1)
 
-    assert state.time_to_deadline(5.1) == pytest.approx(4.9)
+    # measured_state(): chunk 0 finishes at 0.1 with consume=10.0. Under
+    # stall-aware propagation: cumulative_consume = max(0.1, 0) + 10.0 =
+    # 10.1, so the next deadline is 10.1.
+    assert state.time_to_deadline(5.1) == pytest.approx(5.0)
     assert state.expected_remaining_len() == pytest.approx(1.0)
-    assert state.score(5.1, tpot_s=0.2) == pytest.approx(0.2 / 4.9)
+    assert state.score(5.1, tpot_s=0.2) == pytest.approx(0.2 / 5.0)
     assert state.score(20.0, tpot_s=0.2) == float("inf")
 
 
