@@ -6,7 +6,7 @@ import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -66,6 +66,18 @@ from vllm.v1.utils import record_function_or_nullcontext
 # SSLO
 from vllm.sslo.slo_state import Phase
 
+
+# SSLO: per-step scheduler state. Reset at the top of every
+# `_apply_sslo_policy` call; read by `_compute_admission_budget_and_backfill`,
+# `_sslo_dump_step_stats`, the offload eligibility check, and the waiting-loop
+# admission gate in `schedule_sslo`.
+@dataclass
+class SsloStepState:
+    active_cap: int = 0
+    has_critical: bool = False
+    avg_score: float | None = None
+    max_score: float | None = None
+    waiting_admission_budget: int = 0
 
 
 logger = init_logger(__name__)
@@ -201,18 +213,10 @@ class Scheduler(SchedulerInterface):
         self._sslo_prev_step_start_ts: float | None = None
         # SSLO: pre-step num_computed_tokens snapshot for decoding-only detection
         self._sslo_pre_step_computed: dict[str, int] = {}
-        # SSLO
-        self._sslo_has_critical: bool = False
-        # SSLO: average + max score across admitted, recomputed each policy
-        # step. avg is diagnostic; max drives admission cap.
-        self._sslo_avg_score: float | None = None
-        self._sslo_max_score: float | None = None
-        # SSLO: per-step waiting admission budget set by _apply_sslo_policy
-        # so the waiting loop knows exactly how many to admit (rather than
-        # checking a gate every iteration).
-        self._sslo_waiting_admission_budget: int = 0
-        # SSLO
-        self._sslo_active_cap: int = self.max_num_running_reqs
+        # SSLO: per-step scheduler state (active_cap / has_critical / avg+max
+        # score / waiting_admission_budget). Recomputed at the top of every
+        # _apply_sslo_policy call; see SsloStepState definition above.
+        self._sslo_step = SsloStepState(active_cap=self.max_num_running_reqs)
         # SSLO: dedup for request_done log writes (multiple cleanup paths
         # call _sslo_log_request_done per request).
         self._sslo_done_logged: set[str] = set()
@@ -1118,7 +1122,7 @@ class Scheduler(SchedulerInterface):
         # of waiting for the next one.
         self._update_tpot_ema(now)
         self._reload_check(now)
-        self._sslo_active_cap = self.max_num_running_reqs
+        self._sslo_step = SsloStepState(active_cap=self.max_num_running_reqs)
         prev_pending_ids = {req.request_id for req in self.sslo_pending}
         base_n = self.max_num_running_reqs
         # Score uses the wall-step EMA (prefill-aware) so forward projection
@@ -1129,14 +1133,20 @@ class Scheduler(SchedulerInterface):
             if self._sslo_wall_step_ema_s > 0.0 else None)
         admitted = list(self.running) + list(self.sslo_pending)
         scores, tiers = self._score_admitted(admitted, now, base_tpot)
-        self._sslo_has_critical = any(tier == 0 for tier in tiers.values())
+        self._sslo_step.has_critical = any(tier == 0 for tier in tiers.values())
 
         # Update aggregate scores BEFORE backfill so admission cap uses the
-        # current step's avg, not the previous step's.
-        self._sslo_avg_score, self._sslo_max_score = self._aggregate_scores(
-            scores)
+        # current step's avg, not the previous step's. Inf scores would skew
+        # the average; drop them and treat the bucket as empty if all are inf.
+        finite = [
+            s for s in scores.values()
+            if s is not None and s != float("inf")
+        ]
+        if finite:
+            self._sslo_step.avg_score = sum(finite) / len(finite)
+            self._sslo_step.max_score = max(finite)
 
-        if self._sslo_has_critical:
+        if self._sslo_step.has_critical:
             cap = base_n
             if self.sslo_config.adaptive_batching:
                 picked = self._pick_adaptive_n(
@@ -1146,7 +1156,7 @@ class Scheduler(SchedulerInterface):
                     tpot_pick = self.tpot_ema.get(picked)
                     scores, tiers = self._score_admitted(
                         admitted, now, tpot_pick)
-            self._sslo_active_cap = cap
+            self._sslo_step.active_cap = cap
             # SSLO: warmup-protect — Tier 1 (chunks_completed < num_warmup_chunks)
             # always goes to running first, ahead of priority-sorted measured
             # requests. Score isn't computable for warmup, so without this
@@ -1174,7 +1184,7 @@ class Scheduler(SchedulerInterface):
                 overflow = cands_running[cap:]
                 cands_running = cands_running[:cap]
                 cands_pending.extend(overflow)
-            self._sslo_active_cap = cap
+            self._sslo_step.active_cap = cap
             self._compute_admission_budget_and_backfill(
                 cands_running, cands_pending, scores)
             new_running = cands_running
@@ -1202,19 +1212,6 @@ class Scheduler(SchedulerInterface):
             scores[req.request_id] = score
             tiers[req.request_id] = self._classify_tier(req, score)
         return scores, tiers
-
-    # SSLO
-    def _aggregate_scores(
-        self,
-        scores: dict[str, float | None],
-    ) -> tuple[float | None, float | None]:
-        finite = [
-            s for s in scores.values()
-            if s is not None and s != float("inf")
-        ]
-        if not finite:
-            return None, None
-        return sum(finite) / len(finite), max(finite)
 
     # SSLO
     def _classify_non_critical(
@@ -1262,19 +1259,19 @@ class Scheduler(SchedulerInterface):
         # ~1/avg_score concurrent requests on average. Reserve at most that
         # many slots for waiting; the rest is backfilled from pending so
         # this step's batch hits cap when supply exists.
-        cap = self._sslo_active_cap
+        cap = self._sslo_step.active_cap
         slack = cap - len(cands_running)
         waiting_count = len(self.waiting) + len(self.skipped_waiting)
         combined = len(cands_running) + len(cands_pending)
-        avg_s = self._sslo_avg_score
+        avg_s = self._sslo_step.avg_score
         if avg_s is not None and avg_s > 0:
             admission_capacity = max(0, int(1.0 / avg_s) - combined)
         else:
             admission_capacity = slack
-        self._sslo_waiting_admission_budget = min(
+        self._sslo_step.waiting_admission_budget = min(
             waiting_count, admission_capacity, slack)
         backfill_budget = max(
-            0, slack - self._sslo_waiting_admission_budget)
+            0, slack - self._sslo_step.waiting_admission_budget)
         if backfill_budget <= 0 or not cands_pending:
             return
         pending_pool = [
@@ -1304,10 +1301,10 @@ class Scheduler(SchedulerInterface):
             "offloaded": len(self.sslo_offloaded),
             "combined": len(self.running) + len(self.sslo_pending),
             "waiting": len(self.waiting) + len(self.skipped_waiting),
-            "active_cap": self._sslo_active_cap,
-            "has_critical": self._sslo_has_critical,
-            "avg_score": self._sslo_avg_score,
-            "max_score": self._sslo_max_score,
+            "active_cap": self._sslo_step.active_cap,
+            "has_critical": self._sslo_step.has_critical,
+            "avg_score": self._sslo_step.avg_score,
+            "max_score": self._sslo_step.max_score,
             "wall_step_ema_s": self._sslo_wall_step_ema_s,
         }
         with open(log_path, "a") as f:
@@ -1408,7 +1405,7 @@ class Scheduler(SchedulerInterface):
         now: float,
         score: float | None = None,
     ) -> bool:
-        if not self.sslo_config.offloading or self._sslo_has_critical:
+        if not self.sslo_config.offloading or self._sslo_step.has_critical:
             return False
         state = req.slo_state
         assert state is not None
@@ -1821,11 +1818,11 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
             # SSLO: budget-driven admission (computed in _apply_sslo_policy).
-            sslo_admit_remaining = self._sslo_waiting_admission_budget
+            sslo_admit_remaining = self._sslo_step.waiting_admission_budget
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # SSLO
-                if self._sslo_has_critical:
+                if self._sslo_step.has_critical:
                     break
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -2142,7 +2139,7 @@ class Scheduler(SchedulerInterface):
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
         assert token_budget >= 0
-        assert len(self.running) <= self._sslo_active_cap
+        assert len(self.running) <= self._sslo_step.active_cap
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).

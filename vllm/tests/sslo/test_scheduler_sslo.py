@@ -9,7 +9,7 @@ from vllm.sslo.config import SsloConfig
 from vllm.sslo.slo_state import Phase, RequestSLOState
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler, SsloStepState
 from vllm.v1.core.sched.output import SchedulerOutput
 
 
@@ -92,15 +92,11 @@ def make_scheduler(
     scheduler.sslo_config = cfg or SsloConfig(enabled=True)
     scheduler.tpot_ema = {max_num_running_reqs: 1.0}
     scheduler._sslo_wall_step_ema_s = 1.0
-    scheduler._sslo_avg_score = None
-    scheduler._sslo_max_score = None
     scheduler.sslo_offloaded = set()
     scheduler._sslo_prev_step_batch = None
     scheduler._sslo_prev_step_decoding_only = False
     scheduler._sslo_prev_step_start_ts = None
-    scheduler._sslo_has_critical = False
-    scheduler._sslo_active_cap = max_num_running_reqs
-    scheduler._sslo_waiting_admission_budget = 0
+    scheduler._sslo_step = SsloStepState(active_cap=max_num_running_reqs)
     scheduler._sslo_done_logged = set()
     scheduler._sslo_log_dir_created = False
     scheduler.max_num_running_reqs = max_num_running_reqs
@@ -193,7 +189,7 @@ def test_critical_mode_no_waiting_admission():
 
     scheduler._apply_sslo_policy(0.0)
 
-    assert scheduler._sslo_has_critical is True
+    assert scheduler._sslo_step.has_critical is True
 
 
 def test_critical_mode_priority_fill_cap():
@@ -347,7 +343,7 @@ def test_offload_blocked_in_critical_mode():
     cfg = SsloConfig(enabled=True, offloading=True)
     req = make_request("r", make_state(deadline=10, expected_len=1))
     scheduler = make_scheduler(pending=[req], cfg=cfg)
-    scheduler._sslo_has_critical = True
+    scheduler._sslo_step.has_critical = True
 
     assert scheduler._pick_offload_victim(0.0) is None
 
@@ -375,7 +371,7 @@ def test_offloaded_critical_reloads_before_policy_placement():
 
     assert "r" not in scheduler.sslo_offloaded
     assert scheduler.running == [req]
-    assert scheduler._sslo_has_critical is True
+    assert scheduler._sslo_step.has_critical is True
 
 
 def test_offload_marks_only_phase_a_v2():
