@@ -197,7 +197,16 @@ class Scheduler(SchedulerInterface):
         # SSLO
         self.sslo_pending: list[Request] = []
         # SSLO: per-batch-size decode-only TPOT (used by adaptive batching).
+        # Keys are restricted to CUDA-graph-captured batch sizes — running
+        # an adaptive cap at a non-graph size would fall back to eager
+        # mode and skew the latency sample.
         self.tpot_ema: dict[int, float] = {}
+        capture_sizes = (
+            self.vllm_config.compilation_config.cudagraph_capture_sizes or [])
+        self._sslo_cudagraph_sizes: frozenset[int] = frozenset(capture_sizes)
+        self._sslo_capture_sizes_below_base: tuple[int, ...] = tuple(
+            sorted((n for n in capture_sizes if n < self.max_num_running_reqs),
+                   reverse=True))
         # SSLO: wall-clock-per-step EMA across ALL steps (incl. prefill mix).
         # Used by score() so forward projection reflects the actual rate at
         # which a running request is making progress, not the steady-state
@@ -1038,11 +1047,12 @@ class Scheduler(SchedulerInterface):
             self._sslo_wall_step_ema_s = (
                 alpha * delta + (1 - alpha) * self._sslo_wall_step_ema_s)
 
-        # Per-bucket TPOT EMA: only decoding-only steps at exact bucket
-        # multiples. Used by adaptive batching for n-selection.
+        # Per-bucket TPOT EMA: decoding-only steps whose batch size matches
+        # a CUDA-graph-captured size. Adaptive batching only picks caps
+        # from this set, so we only need latency samples at those sizes.
         if (
             self._sslo_prev_step_decoding_only
-            and prev_batch % self.sslo_config.tpot_bucket_size == 0
+            and prev_batch in self._sslo_cudagraph_sizes
         ):
             prev = self.tpot_ema.get(prev_batch)
             self.tpot_ema[prev_batch] = (
@@ -1520,34 +1530,36 @@ class Scheduler(SchedulerInterface):
         base_n = self.max_num_running_reqs
         if not base_tpot:
             return None
-        bucket = self.sslo_config.tpot_bucket_size
+        if not self._sslo_capture_sizes_below_base:
+            return None  # CUDA graphs disabled — no smaller cap is safe.
         n_critical = sum(1 for tier in tiers.values() if tier == 0)
         base_throughput = base_n / base_tpot
 
-        # Throughput-derived low cap: smallest profiled bucket whose
-        # throughput is still ≥ low_cap_ratio × base_throughput. Below
-        # this point the adaptive cap shouldn't shrink — losing more
-        # than (1 - low_cap_ratio) of the base throughput isn't worth
-        # the latency relief.
+        # Throughput-derived low cap: smallest CUDA-graph-captured size
+        # below base_n whose profiled throughput is still ≥
+        # low_cap_ratio × base_throughput. Below it the adaptive cap
+        # shouldn't shrink — losing more than (1 - low_cap_ratio) of
+        # base throughput isn't worth the latency relief.
         low_cap_ratio = (
             self.sslo_config.adaptive_batching_low_cap_throughput_ratio)
-        low_cap = bucket
-        for n in sorted(self.tpot_ema):
-            if n % bucket != 0 or n >= base_n or self.tpot_ema[n] <= 0:
+        low_cap = self._sslo_capture_sizes_below_base[-1]  # smallest below base
+        for n in reversed(self._sslo_capture_sizes_below_base):
+            tpot = self.tpot_ema.get(n)
+            if tpot is None or tpot <= 0:
                 continue
-            if n / self.tpot_ema[n] >= low_cap_ratio * base_throughput:
+            if n / tpot >= low_cap_ratio * base_throughput:
                 low_cap = n
                 break
 
-        # Cascading lookup: walk from base_n - bucket downward in `bucket`
-        # steps, picking up each profiled bucket that survives the
-        # min-throughput filter. Skipping unprofiled buckets *is* the
-        # 8-step-down cascade — descending iteration in the resolves-all
-        # loop below tries the largest profiled cap first, then the
-        # next-smaller one.
-        floor = max(n_critical, bucket, low_cap)
+        # Cascading lookup over CUDA-graph-captured sizes only — skipping
+        # captured sizes whose latency hasn't been profiled yet *is* the
+        # step-down cascade. Descending iteration in the resolves-all loop
+        # below picks the largest viable cap first.
+        floor = max(n_critical, low_cap)
         candidates: list[int] = []
-        for n in range(base_n - bucket, floor - 1, -bucket):
+        for n in self._sslo_capture_sizes_below_base:  # already descending
+            if n < floor:
+                break
             tpot = self.tpot_ema.get(n, 0.0)
             if tpot <= 0:
                 continue

@@ -100,6 +100,14 @@ def make_scheduler(
     scheduler._sslo_done_logged = set()
     scheduler._sslo_log_dir_created = False
     scheduler.max_num_running_reqs = max_num_running_reqs
+    # Tests treat every multiple of 8 ≤ max_num_running_reqs as a captured
+    # CUDA graph size. Override per-test where needed.
+    capture_sizes = tuple(
+        n for n in range(8, max_num_running_reqs + 1, 8))
+    scheduler._sslo_cudagraph_sizes = frozenset(capture_sizes)
+    scheduler._sslo_capture_sizes_below_base = tuple(
+        sorted((n for n in capture_sizes if n < max_num_running_reqs),
+               reverse=True))
     scheduler.max_num_scheduled_tokens = 0
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler.max_num_encoder_input_tokens = 0
