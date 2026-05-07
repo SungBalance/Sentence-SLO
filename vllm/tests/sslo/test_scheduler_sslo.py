@@ -403,90 +403,117 @@ def test_adaptive_n_disabled_uses_base():
 
 
 def test_adaptive_n_picks_largest_resolving_critical():
-    # Phase A v2 spec: pick the LARGEST n that resolves all critical
-    # (preserves throughput while clearing critical).
+    # Pick the LARGEST profiled bucket below base_n that resolves all
+    # critical. base_n=32, ema covers {8, 16, 24}. Score at each:
+    # remaining*tpot / time_to_deadline = 2*tpot / 1.
     cfg = SsloConfig(enabled=True, adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=2))
-    scheduler = make_scheduler(running=[req], max_num_running_reqs=8, cfg=cfg)
-    scheduler.tpot_ema = {8: 1.0, 16: 0.4, 24: 0.2}
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=32, cfg=cfg)
+    scheduler.tpot_ema = {32: 1.0, 24: 0.2, 16: 0.4, 8: 0.8}
     tiers = {"critical": 0}
 
-    # All of {16, 24} resolve (score < 1). Pick largest: 24.
+    # 24 has tpot=0.2 → score = 2*0.2/1 = 0.4 < 1.0 → resolves. Largest
+    # profiled bucket < base_n that resolves: 24.
     assert scheduler._pick_adaptive_n([req], tiers, 0.0, 1.0) == 24
 
 
 def test_adaptive_n_minimizes_worst_score_when_unresolvable():
     cfg = SsloConfig(enabled=True, adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=20))
-    scheduler = make_scheduler(running=[req], max_num_running_reqs=8, cfg=cfg)
-    scheduler.tpot_ema = {8: 1.0, 16: 0.8, 24: 0.6}
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=32, cfg=cfg)
+    # No bucket can resolve (every score ≥ 1.0). Pick the one with the
+    # smallest worst-case score (lowest tpot).
+    scheduler.tpot_ema = {32: 1.0, 24: 0.6, 16: 0.8}
 
     assert scheduler._pick_adaptive_n(
         [req], {"critical": 0}, 0.0, 1.0) == 24
 
 
 def test_adaptive_n_respects_throughput_floor():
+    # Profiled bucket 16 has throughput 16/100 = 0.16 vs base 32/1.0 = 32.
+    # Ratio 0.005 < 0.9 min_throughput_ratio → bucket 16 excluded from
+    # candidates. No other profiled bucket below base → returns None.
     cfg = SsloConfig(enabled=True, adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=2))
-    scheduler = make_scheduler(running=[req], max_num_running_reqs=8, cfg=cfg)
-    scheduler.tpot_ema = {16: 100.0}
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=32, cfg=cfg)
+    scheduler.tpot_ema = {32: 1.0, 16: 100.0}
 
     assert scheduler._pick_adaptive_n(
         [req], {"critical": 0}, 0.0, 1.0) is None
 
 
 def test_adaptive_n_at_least_num_critical():
+    # 10 critical requests → n_critical=10 floors the cap. Profiled
+    # buckets {8, 16, 24} below base_n=32; 8 < 10 (floor) so excluded.
+    # Largest remaining that resolves: 24 has tpot=0.2 → score=0.4 < 1.
     cfg = SsloConfig(enabled=True, adaptive_batching=True)
     reqs = [
         make_request(f"r{i}", make_state(deadline=1, expected_len=2))
         for i in range(10)
     ]
-    scheduler = make_scheduler(running=reqs, max_num_running_reqs=8, cfg=cfg)
-    scheduler.tpot_ema = {8: 1.0, 16: 0.2}
+    scheduler = make_scheduler(running=reqs, max_num_running_reqs=32, cfg=cfg)
+    scheduler.tpot_ema = {32: 1.0, 8: 0.5, 16: 0.4, 24: 0.2}
     tiers = {req.request_id: 0 for req in reqs}
 
-    assert scheduler._pick_adaptive_n(reqs, tiers, 0.0, 1.0) == 16
+    assert scheduler._pick_adaptive_n(reqs, tiers, 0.0, 1.0) == 24
 
 
-def test_adaptive_n_fallback_when_only_base_bucket_profiled():
-    # Only the base bucket has TPOT data → fall back to 90% of base
-    # rounded down to a multiple of bucket_size (8). 64 * 0.9 = 57.6 → 56.
+def test_adaptive_n_returns_none_when_only_base_profiled():
+    # No sub-base profile data → cascading fallback finds nothing →
+    # returns None (caller falls through to base_n cap).
     cfg = SsloConfig(enabled=True, adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=2))
     scheduler = make_scheduler(running=[req], max_num_running_reqs=64, cfg=cfg)
     scheduler.tpot_ema = {64: 1.0}
     tiers = {"critical": 0}
 
-    assert scheduler._pick_adaptive_n([req], tiers, 0.0, 1.0) == 56
+    assert scheduler._pick_adaptive_n([req], tiers, 0.0, 1.0) is None
 
 
-def test_adaptive_n_fallback_floors_at_n_critical():
-    # Fallback would be 56, but n_critical is 60 → cannot reduce below
-    # critical count, return None.
-    cfg = SsloConfig(enabled=True, adaptive_batching=True)
-    reqs = [
-        make_request(f"r{i}", make_state(deadline=1, expected_len=2))
-        for i in range(60)
-    ]
-    scheduler = make_scheduler(running=reqs, max_num_running_reqs=64, cfg=cfg)
-    scheduler.tpot_ema = {64: 1.0}
-    tiers = {req.request_id: 0 for req in reqs}
-
-    assert scheduler._pick_adaptive_n(reqs, tiers, 0.0, 1.0) is None
-
-
-def test_adaptive_n_fallback_inactive_when_sub_buckets_present():
-    # Sub-base bucket (32) is profiled → existing comparative logic runs,
-    # fallback rule does NOT apply.
+def test_adaptive_n_cascades_through_unprofiled_buckets():
+    # 8-step-down cascade: base_n=64. Only 24 and 48 are profiled below
+    # base. 56, 40, 32, 16 unprofiled — must skip past them and pick the
+    # largest profiled that resolves: 48.
     cfg = SsloConfig(enabled=True, adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=2))
     scheduler = make_scheduler(running=[req], max_num_running_reqs=64, cfg=cfg)
-    # 32 has same throughput (32/0.5 = 64) as base (64/1.0 = 64) → passes 0.9 floor.
-    scheduler.tpot_ema = {64: 1.0, 32: 0.5}
+    scheduler.tpot_ema = {64: 1.0, 48: 0.4, 24: 0.2}
     tiers = {"critical": 0}
 
-    # Sub-bucket logic kicks in: largest resolving n at score < 1.
-    # At n=32, tpot=0.5, score = 2*0.5 / 1 = 1.0 → not < 1, so worst-score min.
-    # Both 32 and 64 give same score = 1.0; min returns smaller (32).
+    assert scheduler._pick_adaptive_n([req], tiers, 0.0, 1.0) == 48
+
+
+def test_adaptive_n_low_cap_throughput_floor():
+    # Bucket 16 has throughput 16/2.0 = 8 vs base 64/1.0 = 64. Ratio
+    # 0.125 < 0.25 low_cap_ratio → low_cap pushes the floor above 16.
+    # Bucket 32 has throughput 32/0.6 ≈ 53.3 vs base 64 → ratio 0.83 ≥
+    # 0.25, so low_cap = 32. Adaptive must not pick anything below 32.
+    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    req = make_request("critical", make_state(deadline=1, expected_len=2))
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=64, cfg=cfg)
+    scheduler.tpot_ema = {64: 1.0, 32: 0.6, 16: 2.0}
+    tiers = {"critical": 0}
+
     picked = scheduler._pick_adaptive_n([req], tiers, 0.0, 1.0)
-    assert picked in (32, 64)  # Existing minimize-worst-score path
+    assert picked is None or picked >= 32
+
+
+def test_active_cap_resets_each_step():
+    # First step shrinks the cap; the second step starts from a freshly
+    # reset SsloStepState (active_cap = max_num_running_reqs) before the
+    # policy logic runs.
+    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    req = make_request("critical", make_state(deadline=1, expected_len=2))
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=32, cfg=cfg)
+    scheduler.tpot_ema = {32: 1.0, 24: 0.2}
+
+    scheduler._apply_sslo_policy(0.0)
+    assert scheduler._sslo_step.active_cap <= 32
+
+    # Force the cap to a known shrunk value, then re-enter policy. The
+    # SsloStepState reset at the top of _apply_sslo_policy must wipe the
+    # previous step's adapted cap before re-deciding.
+    scheduler._sslo_step.active_cap = 8  # stale value from prior step
+    scheduler.tpot_ema = {32: 1.0}  # no sub-base data → adaptive returns None
+    scheduler._apply_sslo_policy(1.0)
+    assert scheduler._sslo_step.active_cap == 32

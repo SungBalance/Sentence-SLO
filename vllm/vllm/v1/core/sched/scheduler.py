@@ -1522,27 +1522,34 @@ class Scheduler(SchedulerInterface):
             return None
         bucket = self.sslo_config.tpot_bucket_size
         n_critical = sum(1 for tier in tiers.values() if tier == 0)
-
-        # Fallback: when only the base bucket has been profiled (no smaller
-        # bucket data available yet), drop to 90% of base rounded DOWN to a
-        # multiple of `bucket`. Gives critical requests immediate headroom
-        # while sub-base profiling warms up. Floor at max(n_critical, bucket).
-        profiled_below_base = [
-            n for n in self.tpot_ema
-            if n != base_n and n % bucket == 0 and self.tpot_ema[n] > 0
-        ]
-        if not profiled_below_base:
-            fallback_n = int(base_n * 0.9) // bucket * bucket
-            if (fallback_n >= max(n_critical, bucket)
-                    and fallback_n < base_n):
-                return fallback_n
-            return None
-
         base_throughput = base_n / base_tpot
-        candidates: list[int] = []
+
+        # Throughput-derived low cap: smallest profiled bucket whose
+        # throughput is still ≥ low_cap_ratio × base_throughput. Below
+        # this point the adaptive cap shouldn't shrink — losing more
+        # than (1 - low_cap_ratio) of the base throughput isn't worth
+        # the latency relief.
+        low_cap_ratio = (
+            self.sslo_config.adaptive_batching_low_cap_throughput_ratio)
+        low_cap = bucket
         for n in sorted(self.tpot_ema):
-            tpot = self.tpot_ema[n]
-            if n % bucket != 0 or n < n_critical or tpot <= 0:
+            if n % bucket != 0 or n >= base_n or self.tpot_ema[n] <= 0:
+                continue
+            if n / self.tpot_ema[n] >= low_cap_ratio * base_throughput:
+                low_cap = n
+                break
+
+        # Cascading lookup: walk from base_n - bucket downward in `bucket`
+        # steps, picking up each profiled bucket that survives the
+        # min-throughput filter. Skipping unprofiled buckets *is* the
+        # 8-step-down cascade — descending iteration in the resolves-all
+        # loop below tries the largest profiled cap first, then the
+        # next-smaller one.
+        floor = max(n_critical, bucket, low_cap)
+        candidates: list[int] = []
+        for n in range(base_n - bucket, floor - 1, -bucket):
+            tpot = self.tpot_ema.get(n, 0.0)
+            if tpot <= 0:
                 continue
             throughput = n / tpot
             if throughput < (
@@ -1556,8 +1563,8 @@ class Scheduler(SchedulerInterface):
 
         # Phase A v2 spec: pick the LARGEST n that resolves all critical
         # (= preserves throughput while still clearing critical) over the
-        # smallest. Iterate descending and return on first resolving n.
-        for n in sorted(candidates, reverse=True):
+        # smallest. Candidates are already in descending order.
+        for n in candidates:
             tpot_n = self.tpot_ema[n]
             all_resolved = True
             for req in admitted:

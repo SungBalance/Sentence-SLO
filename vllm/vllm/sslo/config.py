@@ -21,6 +21,11 @@ class SsloConfig:
     offloading_in_threshold: float = 0.5
     offloading_out_threshold: float = 0.7
     adaptive_batching_min_throughput_ratio: float = 0.9
+    # Hard floor for adaptive batching: the smallest profiled bucket whose
+    # throughput is still ≥ this fraction of `max_num_seqs / base_tpot`.
+    # Below it the cap shouldn't shrink — losing more than (1 - ratio) of
+    # the base throughput isn't worth the latency relief.
+    adaptive_batching_low_cap_throughput_ratio: float = 0.25
     offload_safety_margin_s: float = 0.05
     offload_bandwidth_bytes_per_s: float = 1e10
     seconds_per_word: float = 0.28
@@ -41,7 +46,8 @@ class SsloConfig:
             if value < 1:
                 raise ValueError(f"{name} must be >= 1, got {value}")
         for name in ("tpot_ema_alpha",
-                     "adaptive_batching_min_throughput_ratio"):
+                     "adaptive_batching_min_throughput_ratio",
+                     "adaptive_batching_low_cap_throughput_ratio"):
             value = getattr(self, name)
             if not (0 < value <= 1):
                 raise ValueError(f"{name} must be in (0, 1], got {value}")
