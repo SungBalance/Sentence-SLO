@@ -1364,17 +1364,19 @@ class Scheduler(SchedulerInterface):
         cands_pending: list[Request],
         pressures: dict[str, float | None],
     ) -> None:
-        # Admission cap uses 1/avg_score (Option A): the system can sustain
-        # ~1/avg_score concurrent requests on average. Reserve at most that
-        # many slots for waiting; the rest is backfilled from pending so
-        # this step's batch hits cap when supply exists.
+        # Admission cap uses N / avg_pressure (max_capacity): the system
+        # can sustain that many concurrent admitted requests on average.
+        # Reserve up to (max_capacity - combined) slots for new waiting;
+        # the rest of the slack is backfilled from pending so this
+        # step's batch hits cap when supply exists.
         cap = self._sslo_step.active_cap
         slack = cap - len(cands_running)
         waiting_count = len(self.waiting) + len(self.skipped_waiting)
         combined = len(cands_running) + len(cands_pending)
-        avg_s = self._sslo_step.avg_score
-        if avg_s is not None and avg_s > 0:
-            admission_capacity = max(0, int(1.0 / avg_s) - combined)
+        avg_p = self._sslo_step.avg_score
+        if avg_p is not None and avg_p > 0:
+            max_capacity = int(self.max_num_running_reqs / avg_p)
+            admission_capacity = max(0, max_capacity - combined)
         else:
             admission_capacity = slack
         self._sslo_step.waiting_admission_budget = min(
