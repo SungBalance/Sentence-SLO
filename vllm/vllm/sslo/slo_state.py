@@ -344,8 +344,15 @@ class RequestSLOState:
             return None
         return max(1.0, predicted - self.current_chunk_generated_len)
 
-    def score(self, now: float, tpot_s: float | None) -> float | None:
-        """Forward-looking urgency. Values >= 1.0 project a deadline miss."""
+    def pressure(self, now: float, tpot_s: float | None) -> float | None:
+        """Forward-looking urgency (= remaining_work / time_to_deadline,
+        normalized so 1.0 means "exactly at deadline given current TPOT").
+
+        > 1.0 projects a deadline miss; 0 means lots of slack. Renamed
+        from `score` because the value is dimensioned like load pressure
+        (utilization-of-budget) and the semantics carry through the
+        scheduler.
+        """
         if self.phase != Phase.MEASURED:
             return None
         if tpot_s is None:

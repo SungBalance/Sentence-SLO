@@ -208,7 +208,7 @@ class Scheduler(SchedulerInterface):
             sorted((n for n in capture_sizes if n < self.max_num_running_reqs),
                    reverse=True))
         # SSLO: wall-clock-per-step EMA across ALL steps (incl. prefill mix).
-        # Used by score() so forward projection reflects the actual rate at
+        # Used by pressure() so forward projection reflects the actual rate at
         # which a running request is making progress, not the steady-state
         # decode rate.
         self._sslo_wall_step_ema_s: float = 0.0
@@ -223,7 +223,7 @@ class Scheduler(SchedulerInterface):
         # SSLO: pre-step num_computed_tokens snapshot for decoding-only detection
         self._sslo_pre_step_computed: dict[str, int] = {}
         # SSLO: per-step scheduler state (active_cap / has_critical / avg+max
-        # score / waiting_admission_budget). Recomputed at the top of every
+        # pressure / waiting_admission_budget). Recomputed at the top of every
         # _apply_sslo_policy call; see SsloStepState definition above.
         self._sslo_step = SsloStepState(active_cap=self.max_num_running_reqs)
         # SSLO: dedup for request_done log writes (multiple cleanup paths
@@ -1039,7 +1039,7 @@ class Scheduler(SchedulerInterface):
         alpha = self.sslo_config.tpot_ema_alpha
 
         # Wall-step EMA: every step, regardless of decoding-only or batch
-        # size. Used by score() so forward projection sees the real wall
+        # size. Used by pressure() so forward projection sees the real wall
         # clock per step (prefill cost included).
         if self._sslo_wall_step_ema_s == 0.0:
             self._sslo_wall_step_ema_s = delta
@@ -1093,36 +1093,36 @@ class Scheduler(SchedulerInterface):
                 req.slo_state.on_step(decoding_only)
 
     # SSLO
-    def _classify_tier(self, req: Request, score: float | None) -> int:
+    def _classify_tier(self, req: Request, pressure: float | None) -> int:
         state = req.slo_state
         assert state is not None
         if state.phase == Phase.WARMUP:
             return 1
-        if score is not None and score >= self.sslo_config.critical_threshold:
+        if pressure is not None and pressure >= self.sslo_config.critical_threshold:
             return 0
         return 2
 
     # SSLO
-    def _priority_key(self, score: float | None, request_id: str):
-        if score is None:
+    def _priority_key(self, pressure: float | None, request_id: str):
+        if pressure is None:
             return (1, 0.0, request_id)
-        if score == float("inf"):
+        if pressure == float("inf"):
             return (0, -float("inf"), request_id)
-        return (0, -score, request_id)
+        return (0, -pressure, request_id)
 
     # SSLO
     def _admit_priority_key(
         self,
         req: Request,
-        scores: dict[str, float | None],
+        pressures: dict[str, float | None],
         tiers: dict[str, int],
     ):
-        # Tier 1 (warmup) goes first, then score-priority within the rest.
+        # Tier 1 (warmup) goes first, then pressure-priority within the rest.
         # Used both for critical-mode admission sort and non-critical
         # cap-overflow trim.
         return (
             0 if tiers[req.request_id] == 1 else 1,
-            self._priority_key(scores[req.request_id], req.request_id),
+            self._priority_key(pressures[req.request_id], req.request_id),
         )
 
     # SSLO
@@ -1142,14 +1142,14 @@ class Scheduler(SchedulerInterface):
             self._sslo_wall_step_ema_s
             if self._sslo_wall_step_ema_s > 0.0 else None)
         admitted = list(self.running) + list(self.sslo_pending)
-        scores, tiers = self._score_admitted(admitted, now, base_tpot)
+        pressures, tiers = self._compute_pressures(admitted, now, base_tpot)
         self._sslo_step.has_critical = any(tier == 0 for tier in tiers.values())
 
-        # Update aggregate scores BEFORE backfill so admission cap uses the
-        # current step's avg, not the previous step's. Inf scores would skew
+        # Update aggregate pressures BEFORE backfill so admission cap uses the
+        # current step's avg, not the previous step's. Inf pressures would skew
         # the average; drop them and treat the bucket as empty if all are inf.
         finite = [
-            s for s in scores.values()
+            s for s in pressures.values()
             if s is not None and s != float("inf")
         ]
         if finite:
@@ -1164,7 +1164,7 @@ class Scheduler(SchedulerInterface):
                 if picked is not None:
                     cap = picked
                     tpot_pick = self.tpot_ema.get(picked)
-                    scores, tiers = self._score_admitted(
+                    pressures, tiers = self._compute_pressures(
                         admitted, now, tpot_pick)
             self._sslo_step.active_cap = cap
             # SSLO: warmup-protect — Tier 1 (chunks_completed < num_warmup_chunks)
@@ -1173,7 +1173,7 @@ class Scheduler(SchedulerInterface):
             # explicit protection critical mode would push them to pending.
             sorted_admitted = sorted(
                 admitted,
-                key=lambda r: self._admit_priority_key(r, scores, tiers))
+                key=lambda r: self._admit_priority_key(r, pressures, tiers))
             new_running = [
                 req for req in sorted_admitted
                 if req.request_id not in self.sslo_offloaded
@@ -1186,17 +1186,17 @@ class Scheduler(SchedulerInterface):
         else:
             score_suspend = base_tpot is None
             cands_running, cands_pending = self._classify_non_critical(
-                admitted, scores, tiers, prev_pending_ids, score_suspend)
+                admitted, pressures, tiers, prev_pending_ids, score_suspend)
             cap = self.max_num_running_reqs
             if len(cands_running) > cap:
                 cands_running.sort(
-                    key=lambda r: self._admit_priority_key(r, scores, tiers))
+                    key=lambda r: self._admit_priority_key(r, pressures, tiers))
                 overflow = cands_running[cap:]
                 cands_running = cands_running[:cap]
                 cands_pending.extend(overflow)
             self._sslo_step.active_cap = cap
             self._compute_admission_budget_and_backfill(
-                cands_running, cands_pending, scores)
+                cands_running, cands_pending, pressures)
             new_running = cands_running
             new_pending = cands_pending
 
@@ -1204,29 +1204,29 @@ class Scheduler(SchedulerInterface):
         self.sslo_pending = new_pending
         self._fire_pending_lifecycle(prev_pending_ids, new_running, new_pending, now)
         self._sslo_dump_step_stats(now)
-        return scores
+        return pressures
 
     # SSLO
-    def _score_admitted(
+    def _compute_pressures(
         self,
         admitted: list[Request],
         now: float,
         tpot: float | None,
     ) -> tuple[dict[str, float | None], dict[str, int]]:
-        scores: dict[str, float | None] = {}
+        pressures: dict[str, float | None] = {}
         tiers: dict[str, int] = {}
         for req in admitted:
             state = req.slo_state
             assert state is not None
-            score = state.score(now, tpot)
-            scores[req.request_id] = score
-            tiers[req.request_id] = self._classify_tier(req, score)
-        return scores, tiers
+            pressure = state.pressure(now, tpot)
+            pressures[req.request_id] = pressure
+            tiers[req.request_id] = self._classify_tier(req, pressure)
+        return pressures, tiers
 
     # SSLO
     def _pending_thresholds(
         self,
-        scores: dict[str, float | None],
+        pressures: dict[str, float | None],
     ) -> tuple[float, float]:
         """Resolve per-step (in, out) thresholds.
 
@@ -1234,20 +1234,20 @@ class Scheduler(SchedulerInterface):
         Dynamic mode: tracks a load pressure derived from the running pool
         (combined × avg_score_running / max_num_seqs) and uses it as the
         in threshold; out = in + band. Falls back to the static values
-        when no measured-phase running request has a score yet.
+        when no measured-phase running request has a pressure yet.
         """
         in_static = self.sslo_config.pending_in_threshold
         out_static = self.sslo_config.pending_out_threshold
         if not self.sslo_config.pending_threshold_dynamic:
             return in_static, out_static
-        running_scores = [
-            scores[r.request_id] for r in self.running
-            if scores.get(r.request_id) is not None
-            and scores[r.request_id] != float("inf")
+        running_pressures = [
+            pressures[r.request_id] for r in self.running
+            if pressures.get(r.request_id) is not None
+            and pressures[r.request_id] != float("inf")
         ]
-        if not running_scores:
+        if not running_pressures:
             return in_static, out_static
-        avg_running = sum(running_scores) / len(running_scores)
+        avg_running = sum(running_pressures) / len(running_pressures)
         combined = len(self.running) + len(self.sslo_pending)
         pressure = combined * avg_running / max(1, self.max_num_running_reqs)
         pressure = max(0.0, min(1.0, pressure))
@@ -1262,31 +1262,31 @@ class Scheduler(SchedulerInterface):
     def _classify_non_critical(
         self,
         admitted: list[Request],
-        scores: dict[str, float | None],
+        pressures: dict[str, float | None],
         tiers: dict[str, int],
         prev_pending_ids: set[str],
         score_suspend: bool,
     ) -> tuple[list[Request], list[Request]]:
         if score_suspend:
             return list(self.running), list(self.sslo_pending)
-        in_thr, out_thr = self._pending_thresholds(scores)
+        in_thr, out_thr = self._pending_thresholds(pressures)
         cands_running: list[Request] = []
         cands_pending: list[Request] = []
         for req in admitted:
             if req.request_id in self.sslo_offloaded:
                 cands_pending.append(req)
                 continue
-            score = scores[req.request_id]
+            pressure = pressures[req.request_id]
             tier = tiers[req.request_id]
             in_pending = req.request_id in prev_pending_ids
             if tier == 1:
                 cands_running.append(req)
             elif in_pending:
-                if score is not None and score >= out_thr:
+                if pressure is not None and pressure >= out_thr:
                     cands_running.append(req)
                 else:
                     cands_pending.append(req)
-            elif score is not None and score <= in_thr:
+            elif pressure is not None and pressure <= in_thr:
                 cands_pending.append(req)
             else:
                 cands_running.append(req)
@@ -1297,7 +1297,7 @@ class Scheduler(SchedulerInterface):
         self,
         cands_running: list[Request],
         cands_pending: list[Request],
-        scores: dict[str, float | None],
+        pressures: dict[str, float | None],
     ) -> None:
         # Admission cap uses 1/avg_score (Option A): the system can sustain
         # ~1/avg_score concurrent requests on average. Reserve at most that
@@ -1324,7 +1324,7 @@ class Scheduler(SchedulerInterface):
         ]
         pending_pool.sort(
             key=lambda r: self._priority_key(
-                scores[r.request_id], r.request_id))
+                pressures[r.request_id], r.request_id))
         for pick in pending_pool[:backfill_budget]:
             cands_pending.remove(pick)
             cands_running.append(pick)
@@ -1431,12 +1431,12 @@ class Scheduler(SchedulerInterface):
     def _pick_offload_victim(
         self,
         now: float,
-        scores: dict[str, float | None] | None = None,
+        pressures: dict[str, float | None] | None = None,
     ) -> Request | None:
         candidates = [
             req for req in self.sslo_pending
             if self._is_offload_eligible(
-                req, now, scores.get(req.request_id) if scores else None)
+                req, now, pressures.get(req.request_id) if pressures else None)
         ]
         if not candidates:
             return None
@@ -1447,7 +1447,7 @@ class Scheduler(SchedulerInterface):
         self,
         req: Request,
         now: float,
-        score: float | None = None,
+        pressure: float | None = None,
     ) -> bool:
         if not self.sslo_config.offloading or self._sslo_step.has_critical:
             return False
@@ -1457,24 +1457,24 @@ class Scheduler(SchedulerInterface):
             return False
         if req.request_id in self.sslo_offloaded:
             return False
-        if score is None:
+        if pressure is None:
             base_tpot = (
                 self._sslo_wall_step_ema_s
                 if self._sslo_wall_step_ema_s > 0.0 else None)
-            score = state.score(now, base_tpot)
-        if score is None:
+            pressure = state.pressure(now, base_tpot)
+        if pressure is None:
             return False
-        if score >= self.sslo_config.critical_threshold:
+        if pressure >= self.sslo_config.critical_threshold:
             return False
-        if score >= self.sslo_config.offloading_in_threshold:
+        if pressure >= self.sslo_config.offloading_in_threshold:
             return False
         return self._offloaded_score(req, now) < (
             self.sslo_config.offloading_in_threshold)
 
     # SSLO
     def _offloaded_score(self, req: Request, now: float) -> float:
-        # Cost-adjusted score: replace ttd with effective_ttd that accounts
-        # for offload + reload + safety_margin. Reuse state.score() to keep
+        # Cost-adjusted pressure: replace ttd with effective_ttd that accounts
+        # for offload + reload + safety_margin. Reuse state.pressure() to keep
         # the formula in one place.
         state = req.slo_state
         assert state is not None
@@ -1492,7 +1492,7 @@ class Scheduler(SchedulerInterface):
         base_tpot = (
             self._sslo_wall_step_ema_s
             if self._sslo_wall_step_ema_s > 0.0 else None)
-        base_score = state.score(now, base_tpot)
+        base_score = state.pressure(now, base_tpot)
         if base_score is None or base_score == float("inf"):
             return float("inf")
         return base_score * (time_to_deadline / effective_ttd)
@@ -1618,8 +1618,8 @@ class Scheduler(SchedulerInterface):
                     continue
                 state = req.slo_state
                 assert state is not None
-                score = state.score(now, tpot_n)
-                if score is None or score >= self.sslo_config.critical_threshold:
+                pressure = state.pressure(now, tpot_n)
+                if pressure is None or pressure >= self.sslo_config.critical_threshold:
                     all_resolved = False
                     break
             if all_resolved:
@@ -1633,9 +1633,9 @@ class Scheduler(SchedulerInterface):
                     continue
                 state = req.slo_state
                 assert state is not None
-                score = state.score(now, tpot_n)
-                if score is not None and score != float("inf") and score > worst:
-                    worst = score
+                pressure = state.pressure(now, tpot_n)
+                if pressure is not None and pressure != float("inf") and pressure > worst:
+                    worst = pressure
             return worst
 
         return min(candidates, key=worst_score_at)
@@ -2084,7 +2084,7 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    # SSLO: pass precomputed scores to avoid recomputing them
+                    # SSLO: pass precomputed pressures to avoid recomputing them
                     victim = self._pick_offload_victim(
                         scheduled_timestamp, sslo_scores)
                     # SSLO

@@ -244,7 +244,7 @@ def test_non_critical_running_to_pending_at_03():
 
 
 def test_non_critical_hysteresis_keeps_state_in_band():
-    # Both reqs have score 0.5 (in band [0.3, 0.7]). With running at cap,
+    # Both reqs have pressure 0.5 (in band [0.3, 0.7]). With running at cap,
     # backfill has no slack, so hysteresis governs placement: each stays
     # where it was. The default config now collapses the band to a single
     # point (0.8/0.8), so this test pins the original thresholds.
@@ -295,7 +295,7 @@ def test_cap_overflow_priority_sort():
 
 
 def test_score_suspend_when_tpot_unobserved():
-    # Score-suspend keeps the score-based hysteresis off, but backfill still
+    # Score-suspend keeps the pressure-based hysteresis off, but backfill still
     # runs to keep batch at cap (the "non-adaptive batch is constant" rule).
     # waiting is non-empty here to block backfill so we can verify the
     # placement-preserving aspect of suspend mode.
@@ -431,7 +431,7 @@ def test_adaptive_n_picks_largest_resolving_critical():
     scheduler.tpot_ema = {32: 1.0, 24: 0.2, 16: 0.4, 8: 0.8}
     tiers = {"critical": 0}
 
-    # 24 has tpot=0.2 → score = 2*0.2/1 = 0.4 < 1.0 → resolves. Largest
+    # 24 has tpot=0.2 → pressure = 2*0.2/1 = 0.4 < 1.0 → resolves. Largest
     # profiled bucket < base_n that resolves: 24.
     assert scheduler._pick_adaptive_n([req], tiers, 0.0, 1.0) == 24
 
@@ -440,8 +440,8 @@ def test_adaptive_n_minimizes_worst_score_when_unresolvable():
     cfg = SsloConfig(enabled=True, adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=20))
     scheduler = make_scheduler(running=[req], max_num_running_reqs=32, cfg=cfg)
-    # No bucket can resolve (every score ≥ 1.0). Pick the one with the
-    # smallest worst-case score (lowest tpot).
+    # No bucket can resolve (every pressure ≥ 1.0). Pick the one with the
+    # smallest worst-case pressure (lowest tpot).
     scheduler.tpot_ema = {32: 1.0, 24: 0.6, 16: 0.8}
 
     assert scheduler._pick_adaptive_n(
@@ -464,7 +464,7 @@ def test_adaptive_n_respects_throughput_floor():
 def test_adaptive_n_at_least_num_critical():
     # 10 critical requests → n_critical=10 floors the cap. Profiled
     # buckets {8, 16, 24} below base_n=32; 8 < 10 (floor) so excluded.
-    # Largest remaining that resolves: 24 has tpot=0.2 → score=0.4 < 1.
+    # Largest remaining that resolves: 24 has tpot=0.2 → pressure=0.4 < 1.
     cfg = SsloConfig(enabled=True, adaptive_batching=True)
     reqs = [
         make_request(f"r{i}", make_state(deadline=1, expected_len=2))

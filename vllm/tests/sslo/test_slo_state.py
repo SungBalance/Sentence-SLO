@@ -124,20 +124,20 @@ def test_score_formula_and_deadline_sign():
     # 10.1, so the next deadline is 10.1.
     assert state.time_to_deadline(5.1) == pytest.approx(5.0)
     assert state.expected_remaining_len() == pytest.approx(1.0)
-    assert state.score(5.1, tpot_s=0.2) == pytest.approx(0.2 / 5.0)
-    assert state.score(20.0, tpot_s=0.2) == float("inf")
+    assert state.pressure(5.1, tpot_s=0.2) == pytest.approx(0.2 / 5.0)
+    assert state.pressure(20.0, tpot_s=0.2) == float("inf")
 
 
 def test_score_none_during_warmup_or_missing_inputs():
     warmup = RequestSLOState(num_warmup_chunks=4)
     warmup.on_token(0.0)
     warmup.on_chunk_boundary(0.1, word_count=1, chunk_consume_time_s=1.0)
-    assert warmup.score(0.2, 0.1) is None
+    assert warmup.pressure(0.2, 0.1) is None
 
     measured = measured_state()
-    assert measured.score(0.2, None) is None
+    assert measured.pressure(0.2, None) is None
     measured.chunk_expected_len = None
-    assert measured.score(0.2, 0.1) is None
+    assert measured.pressure(0.2, 0.1) is None
 
 
 def test_offload_lifecycle_counters():
