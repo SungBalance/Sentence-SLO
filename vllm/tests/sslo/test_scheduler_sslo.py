@@ -249,7 +249,8 @@ def test_non_critical_hysteresis_keeps_state_in_band():
     # where it was. The default config now collapses the band to a single
     # point (0.8/0.8), so this test pins the original thresholds.
     cfg = SsloConfig(
-        enabled=True, pending_in_threshold=0.3, pending_out_threshold=0.7)
+        enabled=True, pending_in_threshold=0.3, pending_out_threshold=0.7,
+        pending_threshold_dynamic=False)
     pending = make_request("pending", make_state(deadline=10, expected_len=5))
     running = make_request("running", make_state(deadline=10, expected_len=5))
     scheduler = make_scheduler(running=[running], pending=[pending],
@@ -275,10 +276,17 @@ def test_non_critical_pending_backfills_when_waiting_empty():
 
 
 def test_cap_overflow_priority_sort():
+    # Pin thresholds so this test exercises the overflow-sort branch
+    # (cands_running > cap → priority sort) rather than the exact-edge
+    # case where one request hits in_threshold and gets demoted before
+    # overflow occurs.
+    cfg = SsloConfig(
+        enabled=True, pending_in_threshold=0.3, pending_out_threshold=0.7)
     low = make_request("low", make_state(deadline=10, expected_len=4))
     high = make_request("high", make_state(deadline=10, expected_len=6))
     warm = make_request("warm", make_state(phase=Phase.WARMUP))
-    scheduler = make_scheduler(running=[low, high, warm], max_num_running_reqs=2)
+    scheduler = make_scheduler(running=[low, high, warm], max_num_running_reqs=2,
+                               cfg=cfg)
 
     scheduler._apply_sslo_policy(0.0)
 

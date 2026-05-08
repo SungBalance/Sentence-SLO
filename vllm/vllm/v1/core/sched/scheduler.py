@@ -1224,6 +1224,41 @@ class Scheduler(SchedulerInterface):
         return scores, tiers
 
     # SSLO
+    def _pending_thresholds(
+        self,
+        scores: dict[str, float | None],
+    ) -> tuple[float, float]:
+        """Resolve per-step (in, out) thresholds.
+
+        Static mode: returns the configured constants.
+        Dynamic mode: tracks a load pressure derived from the running pool
+        (combined × avg_score_running / max_num_seqs) and uses it as the
+        in threshold; out = in + band. Falls back to the static values
+        when no measured-phase running request has a score yet.
+        """
+        in_static = self.sslo_config.pending_in_threshold
+        out_static = self.sslo_config.pending_out_threshold
+        if not self.sslo_config.pending_threshold_dynamic:
+            return in_static, out_static
+        running_scores = [
+            scores[r.request_id] for r in self.running
+            if scores.get(r.request_id) is not None
+            and scores[r.request_id] != float("inf")
+        ]
+        if not running_scores:
+            return in_static, out_static
+        avg_running = sum(running_scores) / len(running_scores)
+        combined = len(self.running) + len(self.sslo_pending)
+        pressure = combined * avg_running / max(1, self.max_num_running_reqs)
+        pressure = max(0.0, min(1.0, pressure))
+        band = self.sslo_config.pending_dynamic_band
+        # Floor at static values so dynamic only ever tightens, never
+        # relaxes below the operator-chosen safety margin.
+        in_thr = max(in_static, pressure)
+        out_thr = max(out_static, min(1.0, in_thr + band))
+        return in_thr, out_thr
+
+    # SSLO
     def _classify_non_critical(
         self,
         admitted: list[Request],
@@ -1234,6 +1269,7 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[list[Request], list[Request]]:
         if score_suspend:
             return list(self.running), list(self.sslo_pending)
+        in_thr, out_thr = self._pending_thresholds(scores)
         cands_running: list[Request] = []
         cands_pending: list[Request] = []
         for req in admitted:
@@ -1246,13 +1282,11 @@ class Scheduler(SchedulerInterface):
             if tier == 1:
                 cands_running.append(req)
             elif in_pending:
-                if (score is not None
-                        and score >= self.sslo_config.pending_out_threshold):
+                if score is not None and score >= out_thr:
                     cands_running.append(req)
                 else:
                     cands_pending.append(req)
-            elif (score is not None
-                  and score <= self.sslo_config.pending_in_threshold):
+            elif score is not None and score <= in_thr:
                 cands_pending.append(req)
             else:
                 cands_running.append(req)

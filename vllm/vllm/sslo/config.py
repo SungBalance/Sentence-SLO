@@ -16,8 +16,14 @@ class SsloConfig:
     tpot_bucket_size: int = 8
     tpot_ema_alpha: float = 0.1
     critical_threshold: float = 1.0
-    pending_in_threshold: float = 0.4
+    pending_in_threshold: float = 0.3
     pending_out_threshold: float = 0.7
+    # When True, in/out thresholds are derived per-step from the load
+    # pressure (combined × avg_score_running / max_num_seqs) instead of the
+    # static values above. The static fields become a floor only.
+    pending_threshold_dynamic: bool = True
+    # Hysteresis band width for the dynamic mode: out = in + band.
+    pending_dynamic_band: float = 0.2
     offloading_in_threshold: float = 0.5
     offloading_out_threshold: float = 0.7
     adaptive_batching_min_throughput_ratio: float = 0.9
