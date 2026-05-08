@@ -16,8 +16,8 @@ class SsloConfig:
     tpot_bucket_size: int = 8
     tpot_ema_alpha: float = 0.1
     critical_threshold: float = 1.0
-    pending_in_threshold: float = 0.8
-    pending_out_threshold: float = 0.8
+    pending_in_threshold: float = 0.7
+    pending_out_threshold: float = 0.7
     offloading_in_threshold: float = 0.5
     offloading_out_threshold: float = 0.7
     adaptive_batching_min_throughput_ratio: float = 0.9
