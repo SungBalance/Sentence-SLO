@@ -89,7 +89,12 @@ def make_scheduler(
         req.request_id: req
         for req in scheduler.running + scheduler.sslo_pending
     }
-    scheduler.sslo_config = cfg or SsloConfig(enabled=True)
+    # Default fixture pins pending_policy="hysteresis" so existing tests
+    # exercise the threshold-based placement. Pass cfg explicitly to
+    # opt into other policies (e.g., "llf").
+    scheduler.sslo_config = cfg or SsloConfig(
+        enabled=True, pending_policy="hysteresis",
+        pending_threshold_dynamic=False)
     scheduler.tpot_ema = {max_num_running_reqs: 1.0}
     scheduler._sslo_wall_step_ema_s = 1.0
     scheduler.sslo_offloaded = set()

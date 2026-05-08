@@ -1187,7 +1187,7 @@ class Scheduler(SchedulerInterface):
             score_suspend = base_tpot is None
             cands_running, cands_pending = self._classify_non_critical(
                 admitted, pressures, tiers, prev_pending_ids, score_suspend)
-            cap = self.max_num_running_reqs
+            cap = self._capacity_target(pressures)
             if len(cands_running) > cap:
                 cands_running.sort(
                     key=lambda r: self._admit_priority_key(r, pressures, tiers))
@@ -1257,6 +1257,29 @@ class Scheduler(SchedulerInterface):
         in_thr = max(in_static, pressure)
         out_thr = max(out_static, min(1.0, in_thr + band))
         return in_thr, out_thr
+
+    # SSLO
+    def _capacity_target(self, pressures: dict[str, float | None]) -> int:
+        """Per-step running-pool target. Returns max_num_running_reqs
+        unless capacity-control is enabled, in which case the pool is
+        capped at N / mean(admitted_pressures) so the active count
+        shrinks under overload (mean pressure > 1) and stays at N when
+        the system has slack. Floor at tpot_bucket_size to keep the
+        cap CUDA-graph-aligned.
+        """
+        base_n = self.max_num_running_reqs
+        if not self.sslo_config.pending_capacity_control:
+            return base_n
+        finite = [
+            p for p in pressures.values()
+            if p is not None and p != float("inf") and p > 0
+        ]
+        if not finite:
+            return base_n
+        avg_p = sum(finite) / len(finite)
+        bucket = self.sslo_config.tpot_bucket_size
+        target = int(base_n / avg_p)
+        return max(bucket, min(base_n, target))
 
     # SSLO
     def _classify_non_critical(
