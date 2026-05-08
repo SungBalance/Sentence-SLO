@@ -5,17 +5,17 @@
 #   run_sweep.sh [num_runs=3] [--label NAME]
 #
 # Env-var overrides (all optional; bare names — no _OVERRIDE suffix):
-  MODEL=Qwen/Qwen3.5-35B-A3B
-  NUM_PROMPTS=256
-  GENERATION_MAX_TOKENS=4096
-  MAX_MODEL_LEN=0                 #(0 = auto, vLLM uses model HF config max)
-  TENSOR_PARALLEL_SIZE=1
-  GPU_MEMORY_UTILIZATION=0.95
-  SECONDS_PER_WORD=0.28
-  MODES=baseline,sslo,sslo_adaptive
-  CHUNK_UNITS="sentence paragraph"        # (space-separated)
-  MAX_NUM_SEQS_VALUES="64"
-  REQUEST_RATES="0 4 16 32"
+#   MODEL=Qwen/Qwen3.5-35B-A3B
+#   NUM_PROMPTS=256
+#   GENERATION_MAX_TOKENS=4096
+#   MAX_MODEL_LEN=0                 (0 = auto, vLLM uses model HF config max)
+#   TENSOR_PARALLEL_SIZE=1
+#   GPU_MEMORY_UTILIZATION=0.95
+#   SECONDS_PER_WORD=0.28
+#   MODES=baseline,sslo,sslo_adaptive
+#   CHUNK_UNITS="sentence paragraph"  (space-separated)
+#   MAX_NUM_SEQS_VALUES="64"
+#   REQUEST_RATES="0 4 16 32"
 #   LABEL=                           (default-named subdir if empty)
 #   PARALLEL=0                       (0=sequential, 4=split across 4 GPUs)
 #
@@ -50,9 +50,9 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 SECONDS_PER_WORD="${SECONDS_PER_WORD:-0.28}"
 MODES="${MODES:-baseline,sslo,sslo_adaptive}"
 
-read -ra CHUNK_UNITS_ARR        <<< "${CHUNK_UNITS:-sentence}"
-read -ra MAX_NUM_SEQS_VALUES    <<< "${MAX_NUM_SEQS_VALUES:-16 32 64 128}"
-read -ra REQUEST_RATES          <<< "${REQUEST_RATES:-0 4 16 32 64 128}"
+read -ra CHUNK_UNITS_ARR        <<< "${CHUNK_UNITS:-sentence paragraph}"
+read -ra MAX_NUM_SEQS_VALUES    <<< "${MAX_NUM_SEQS_VALUES:-64}"
+read -ra REQUEST_RATES          <<< "${REQUEST_RATES:-0 4 16 32}"
 
 # Distribute REQUEST_RATES round-robin across NUM_PARALLEL_GPUS for PARALLEL=4
 # so changes to REQUEST_RATES propagate without editing a second list.
