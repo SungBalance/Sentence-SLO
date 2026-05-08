@@ -16,7 +16,7 @@ def test_defaults_match_phase_a_v2_plan():
     assert cfg.tpot_bucket_size == 8
     assert cfg.tpot_ema_alpha == 0.1
     assert cfg.critical_threshold == 1.0
-    assert cfg.pending_in_threshold == 0.4
+    assert cfg.pending_in_threshold == 0.3
     assert cfg.pending_out_threshold == 0.8
     assert cfg.offloading_in_threshold == 0.5
     assert cfg.offloading_out_threshold == 0.7
