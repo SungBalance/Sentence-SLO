@@ -31,7 +31,7 @@ class SsloConfig:
     #     descending, take top max_num_seqs into running, rest park.
     #     Drops hysteresis entirely. Predicted optimal in scheduling-
     #     theory sense when switch cost ≈ 0.
-    pending_policy: str = "hysteresis"
+    pending_policy: str = "llf"
     offloading_in_threshold: float = 0.5
     offloading_out_threshold: float = 0.7
     adaptive_batching_min_throughput_ratio: float = 0.9
