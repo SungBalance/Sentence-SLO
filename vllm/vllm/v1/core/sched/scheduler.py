@@ -1269,6 +1269,9 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[list[Request], list[Request]]:
         if score_suspend:
             return list(self.running), list(self.sslo_pending)
+        if self.sslo_config.pending_policy == "llf":
+            return self._classify_non_critical_llf(
+                admitted, pressures, tiers)
         in_thr, out_thr = self._pending_thresholds(pressures)
         cands_running: list[Request] = []
         cands_pending: list[Request] = []
@@ -1290,6 +1293,45 @@ class Scheduler(SchedulerInterface):
                 cands_pending.append(req)
             else:
                 cands_running.append(req)
+        return cands_running, cands_pending
+
+    # SSLO
+    def _classify_non_critical_llf(
+        self,
+        admitted: list[Request],
+        pressures: dict[str, float | None],
+        tiers: dict[str, int],
+    ) -> tuple[list[Request], list[Request]]:
+        """Least-laxity-first placement: rank admitted by pressure
+        descending and take the top max_num_running_reqs into running.
+        Warmup-tier requests (no pressure yet) go to running ahead of
+        anyone else. Offloaded requests stay parked. No hysteresis.
+        """
+        warm: list[Request] = []
+        ranked: list[tuple[float, Request]] = []
+        offloaded: list[Request] = []
+        for req in admitted:
+            if req.request_id in self.sslo_offloaded:
+                offloaded.append(req)
+                continue
+            tier = tiers[req.request_id]
+            if tier == 1:
+                warm.append(req)
+                continue
+            p = pressures[req.request_id]
+            # Unknown pressure → key 0.0 (lowest priority). +inf naturally
+            # dominates the sort because we negate.
+            key = -float(p) if p is not None else 0.0
+            ranked.append((key, req))
+        ranked.sort(key=lambda kr: kr[0])
+        cap = self.max_num_running_reqs
+        cands_running: list[Request] = list(warm)
+        cands_pending: list[Request] = list(offloaded)
+        for _, req in ranked:
+            if len(cands_running) < cap:
+                cands_running.append(req)
+            else:
+                cands_pending.append(req)
         return cands_running, cands_pending
 
     # SSLO

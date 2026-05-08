@@ -24,6 +24,14 @@ class SsloConfig:
     pending_threshold_dynamic: bool = True
     # Hysteresis band width for the dynamic mode: out = in + band.
     pending_dynamic_band: float = 0.2
+    # Placement policy in non-critical mode:
+    #   "hysteresis" — current rule (pending_in/out thresholds, optionally
+    #     dynamic).
+    #   "llf"        — least-laxity-first: rank admitted by pressure
+    #     descending, take top max_num_seqs into running, rest park.
+    #     Drops hysteresis entirely. Predicted optimal in scheduling-
+    #     theory sense when switch cost ≈ 0.
+    pending_policy: str = "hysteresis"
     offloading_in_threshold: float = 0.5
     offloading_out_threshold: float = 0.7
     adaptive_batching_min_throughput_ratio: float = 0.9
@@ -82,3 +90,7 @@ class SsloConfig:
         if self.offloading_in_threshold > self.offloading_out_threshold:
             raise ValueError(
                 "offloading_in_threshold must be <= offloading_out_threshold")
+        if self.pending_policy not in ("hysteresis", "llf"):
+            raise ValueError(
+                f"pending_policy must be 'hysteresis' or 'llf', "
+                f"got {self.pending_policy!r}")
