@@ -51,11 +51,14 @@ def distribution_stats(
     percentiles: tuple[int, ...] = (50, 90, 99),
     *,
     include_mean: bool = True,
+    include_min: bool = False,
     include_max: bool = True,
 ) -> dict[str, float | int | None]:
     stats: dict[str, float | int | None] = {"count": len(values)}
     if include_mean:
         stats["mean"] = statistics.fmean(values) if values else None
+    if include_min:
+        stats["min"] = min(values, default=None)
     for pct in percentiles:
         stats[f"p{pct}"] = percentile(values, pct)
     if include_max:
@@ -69,11 +72,11 @@ def dist_for_key(rows: list[dict[str, Any]], key: str) -> dict[str, float | int 
 
 
 def slack_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
-    # Exclude chunk_idx == 0: cumulative_slack is fixed at 0.0 for the first
+    # Exclude chunk_idx == 0: chunk_slack is fixed at 0.0 for the first
     # chunk by definition (deadline starts there), so including it dilutes
     # both the violation ratio and the distribution stats.
     rows = [r for r in rows if r.get("chunk_idx") not in (None, 0)]
-    values = numeric_values(rows, "cumulative_slack")
+    values = numeric_values(rows, "chunk_slack")
     neg_count = sum(1 for v in values if v < 0)
     return {
         "count": len(values),
@@ -90,9 +93,9 @@ def slack_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
 
 def neg_slack_magnitude_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
     values = [
-        -float(row["cumulative_slack"])
+        -float(row["chunk_slack"])
         for row in rows
-        if row.get("cumulative_slack") is not None and float(row["cumulative_slack"]) < 0
+        if row.get("chunk_slack") is not None and float(row["chunk_slack"]) < 0
     ]
     return distribution_stats(values, (50, 90, 99))
 
@@ -106,7 +109,7 @@ def request_compliance_stats(rows: list[dict[str, Any]]) -> dict[str, float | in
             continue
         rid = str(rid)
         seen.add(rid)
-        slack = row.get("cumulative_slack")
+        slack = row.get("chunk_slack")
         if slack is not None and float(slack) < 0:
             violated.add(rid)
     total = len(seen)
@@ -121,7 +124,8 @@ def request_compliance_stats(rows: list[dict[str, Any]]) -> dict[str, float | in
 def pending_request_stats(rows: list[dict[str, Any]]) -> dict[str, dict[str, float | int | None]]:
     return {
         "time": dist_for_key(rows, "total_pending_time_s"),
-        "intervals": distribution_stats(numeric_values(rows, "num_pending_intervals"), (50, 90)),
+        "intervals": distribution_stats(
+            numeric_values(rows, "num_pending_iters_per_request"), (50, 90)),
     }
 
 
@@ -213,14 +217,40 @@ def analyze(
     max_model_len: int | None = None,
     label: str | None = None,
 ) -> dict[str, Any]:
-    request_rows_all = read_jsonl(output_dir / "requests.jsonl")
-    chunk_rows_all = read_jsonl(output_dir / "chunks.jsonl")
-    sched_rows_all = read_jsonl(output_dir / "scheduler_stats.jsonl")
-    run_status: dict[str, Any] = {}
-    if (output_dir / "run_status.json").exists():
-        run_status = json.loads((output_dir / "run_status.json").read_text())
+    # New layout: output_dir is a single (mode, run) directory:
+    #   <label>/<chunk>/seqs_<n>/rate_<r>/<mode>/run_<i>/
+    # Each holds requests.jsonl, chunks.jsonl, scheduler_stats.jsonl,
+    # sslo_config.json — all rows already tagged with `mode` by run_test.py.
+    # Mode is detected from the parent directory name.
+    mode = output_dir.parent.name
+    if mode not in ALL_MODES:
+        raise ValueError(
+            f"output_dir parent must be a mode in {ALL_MODES}; "
+            f"got parent={mode!r} for {output_dir}")
 
-    modes_run = sorted({row["mode"] for row in request_rows_all if "mode" in row})
+    request_rows_mode = read_jsonl(output_dir / "requests.jsonl")
+    chunk_rows_mode = read_jsonl(output_dir / "chunks.jsonl")
+    sched_rows_mode = read_jsonl(output_dir / "scheduler_stats.jsonl")
+    # scheduler_stats.jsonl is written by the scheduler with no mode awareness;
+    # tag rows here for the per-mode split downstream.
+    for row in sched_rows_mode:
+        row.setdefault("mode", mode)
+
+    sslo_config_by_mode: dict[str, dict[str, Any]] = {}
+    cfg_path = output_dir / "sslo_config.json"
+    if cfg_path.exists():
+        try:
+            sslo_config_by_mode[mode] = json.loads(cfg_path.read_text()) or {}
+        except json.JSONDecodeError:
+            sslo_config_by_mode[mode] = {}
+
+    run_status: dict[str, Any] = {mode: 0}
+
+    request_rows_all = list(request_rows_mode)
+    chunk_rows_all = list(chunk_rows_mode)
+    sched_rows_all = list(sched_rows_mode)
+
+    modes_run = [mode]
 
     req_by_mode: dict[str, list[dict[str, Any]]] = {m: [] for m in ALL_MODES}
     for row in request_rows_all:
@@ -245,7 +275,7 @@ def analyze(
     queue_stall_available = any(r.get("queue_stall") is not None for r in request_rows_all)
 
     metrics: dict[str, Any] = {
-        "ttft": {}, "tpot": {}, "queue_stall": {}, "slack": {},
+        "ttft": {}, "ttfc": {}, "tpot": {}, "queue_stall": {}, "slack": {},
         "slo_compliance": {}, "scheduler": {}, "pending": {}, "inter_chunk_delay": {},
     }
 
@@ -263,20 +293,26 @@ def analyze(
         ttft_pc = dist_for_key(h2_req, "ttft")
         ttft_pc["cohort"] = cohort
         metrics["ttft"][mode] = {"all": dist_for_key(req_rows, "ttft"), "post_cap": ttft_pc}
+        metrics["ttfc"][mode] = dist_for_key(req_rows, "ttfc")
         metrics["tpot"][mode] = dist_for_key(req_rows, "tpot")
         metrics["queue_stall"][mode] = dist_for_key(req_rows, "queue_stall")
         s = slack_stats(ch_rows)
         mag = neg_slack_magnitude_stats(ch_rows)
-        metrics["slack"][mode] = {**s, "magnitude": mag}
+        metrics["slack"][mode] = {**s, "violated-magnitude": mag}
         metrics["slo_compliance"][mode] = request_compliance_stats(ch_rows)
         metrics["inter_chunk_delay"][mode] = inter_chunk_delay_stats(ch_rows)
         metrics["pending"][mode] = pending_request_stats(req_rows)
 
     for mode in SSLO_MODES:
         sched_rows = sched_by_mode[mode]
+        # Include min in `combined` so summary captures the running+pending
+        # floor alongside mean/max — required for occupancy diagnostics.
+        combined_dist = distribution_stats(
+            numeric_values(sched_rows, "combined"), (50, 90, 99),
+            include_min=True)
         metrics["scheduler"][mode] = {
             "running": dist_for_key(sched_rows, "running"),
-            "combined": dist_for_key(sched_rows, "combined"),
+            "combined": combined_dist,
         }
 
     scheduler_saturation: dict[str, Any] = {}
@@ -315,6 +351,7 @@ def analyze(
             "max_model_len": max_model_len,
             "is_control": is_control,
             "modes_run": modes_run,
+            "sslo_config": sslo_config_by_mode,
         },
         "metrics": metrics,
         "queue_stall_available": queue_stall_available,

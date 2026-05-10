@@ -541,3 +541,125 @@ def test_active_cap_resets_each_step():
     scheduler.tpot_ema = {32: 1.0}  # no sub-base data → adaptive returns None
     scheduler._apply_sslo_policy(1.0)
     assert scheduler._sslo_step.active_cap == 32
+
+
+# ---------------------------------------------------------------------------
+# v2 scheduling path tests
+# ---------------------------------------------------------------------------
+
+def _make_v2_scheduler(**kwargs):
+    """Helper: make_scheduler pre-configured with enable_v2=True.
+    pending_policy is irrelevant when v2 dispatches."""
+    cfg = kwargs.pop("cfg", None) or SsloConfig(
+        enabled=True, enable_v2=True, pending_threshold_dynamic=False)
+    return make_scheduler(cfg=cfg, **kwargs)
+
+
+def test_v2_critical_mode_top_cap_to_running():
+    # 3 admitted reqs, M=2, one with pressure >= 1 → critical mode.
+    # Top-2 by pressure go to running, rest pending, waiting_budget=0.
+    hi = make_request("hi", make_state(deadline=1.0, expected_len=10.0))   # pressure >= 1
+    mid = make_request("mid", make_state(deadline=10.0, expected_len=20.0))
+    lo = make_request("lo", make_state(deadline=10.0, expected_len=5.0))
+    scheduler = _make_v2_scheduler(running=[hi, mid, lo], max_num_running_reqs=2)
+
+    scheduler._apply_sslo_policy_v2(0.0)
+
+    assert scheduler._sslo_step.has_critical is True
+    assert scheduler._sslo_step.waiting_admission_budget == 0
+    assert len(scheduler.running) == 2
+    # hi must be in running (highest pressure)
+    assert any(r.request_id == "hi" for r in scheduler.running)
+    # lo is NOT in running (sorted by _admit_priority_key — hi+mid have higher pressure)
+    assert len(scheduler.sslo_pending) == 1
+
+
+def test_v2_non_critical_demand_room_admission():
+    # 4 reqs at p=0.3 (D=1.2), M=4, waiting=10.
+    # waiting_budget = max(0, int(4 - 1.2)) = 2, cands_running = M - 2 = 2.
+    reqs = [
+        make_request(f"r{i}", make_state(deadline=10.0, expected_len=3.0))  # p≈0.3
+        for i in range(4)
+    ]
+    scheduler = _make_v2_scheduler(running=reqs, max_num_running_reqs=4)
+    scheduler.waiting = [object()] * 10
+
+    scheduler._apply_sslo_policy_v2(0.0)
+
+    assert scheduler._sslo_step.has_critical is False
+    assert scheduler._sslo_step.waiting_admission_budget == 2
+    assert len(scheduler.running) == 2
+    assert len(scheduler.sslo_pending) == 2
+
+
+def test_v2_warmup_contributes_one_to_demand_and_sorts_top():
+    # 2 warmup + 2 measured(p≈0.3), M=4, waiting=10.
+    # D = 2*1 + 2*0.3 = 2.6, waiting_budget = int(4-2.6) = 1.
+    # cands_running = 4-1 = 3 → 2 warmup + 1 measured (top by _admit_priority_key).
+    warmups = [
+        make_request(f"w{i}", make_state(phase=Phase.WARMUP))
+        for i in range(2)
+    ]
+    measured = [
+        make_request(f"m{i}", make_state(deadline=10.0, expected_len=3.0))
+        for i in range(2)
+    ]
+    scheduler = _make_v2_scheduler(
+        running=warmups + measured, max_num_running_reqs=4)
+    scheduler.waiting = [object()] * 10
+
+    scheduler._apply_sslo_policy_v2(0.0)
+
+    assert scheduler._sslo_step.has_critical is False
+    assert scheduler._sslo_step.waiting_admission_budget == 1
+    assert len(scheduler.running) == 3
+    assert len(scheduler.sslo_pending) == 1
+    # Both warmup reqs must be in running (highest priority via _admit_priority_key)
+    running_ids = {r.request_id for r in scheduler.running}
+    assert "w0" in running_ids and "w1" in running_ids
+
+
+def test_v2_score_suspend_keeps_state_when_no_tpot():
+    # When _sslo_wall_step_ema_s=0, policy suspends — running/pending unchanged.
+    # waiting_budget = M - len(running).
+    r1 = make_request("r1", make_state())
+    r2 = make_request("r2", make_state())
+    p1 = make_request("p1", make_state())
+    scheduler = _make_v2_scheduler(
+        running=[r1, r2], pending=[p1], max_num_running_reqs=4)
+    scheduler._sslo_wall_step_ema_s = 0.0
+
+    scheduler._apply_sslo_policy_v2(0.0)
+
+    assert scheduler.running == [r1, r2]
+    assert scheduler.sslo_pending == [p1]
+    # M - len(running) = 4 - 2 = 2; waiting=0 so budget = min(0, 2) = 0.
+    assert scheduler._sslo_step.waiting_admission_budget == 0
+
+
+def test_v2_score_suspend_waiting_budget_limited_by_waiting_count():
+    # Same as above but with actual waiting requests present.
+    r1 = make_request("r1", make_state())
+    scheduler = _make_v2_scheduler(running=[r1], max_num_running_reqs=4)
+    scheduler._sslo_wall_step_ema_s = 0.0
+    scheduler.waiting = [object(), object(), object()]  # 3 waiting
+
+    scheduler._apply_sslo_policy_v2(0.0)
+
+    # M - len(running) = 3 slots; min(3 waiting, 3 slots) = 3
+    assert scheduler._sslo_step.waiting_admission_budget == 3
+
+
+def test_v2_offload_set_unused():
+    # sslo_offloaded populated externally — v2 does NOT exclude them from
+    # placement by offload logic. After _apply_sslo_policy_v2, sslo_offloaded
+    # must still be empty (v2 never populates it).
+    r1 = make_request("r1", make_state(deadline=10.0, expected_len=20.0))
+    r2 = make_request("r2", make_state(deadline=1.0, expected_len=10.0))  # critical
+    scheduler = _make_v2_scheduler(running=[r1, r2], max_num_running_reqs=2)
+    # Simulate stale external population — v2 should ignore for its own logic
+    scheduler.sslo_offloaded = set()  # v2 starts clean; confirm it stays clean
+
+    scheduler._apply_sslo_policy_v2(0.0)
+
+    assert len(scheduler.sslo_offloaded) == 0

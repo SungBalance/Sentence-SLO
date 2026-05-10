@@ -49,25 +49,48 @@ class DistMetric:
     scale: float = 1.0
 
 
-# Distribution metrics: each yields name_mean, name_p50, name_p90, name_p99.
+# Distribution metrics: each yields name_mean, name_p50, name_p99 (+ extras
+# listed in DIST_EXTRA_STATS for that metric). Extras are emitted only when
+# the metric explicitly opts in — keeps the CSV narrow for metrics where the
+# user only asked for {p50, p99, mean}.
 DIST_METRICS: tuple[DistMetric, ...] = (
     DistMetric("ttft_s",                ("ttft", "all"),           1.0),
+    DistMetric("ttfc_s",                ("ttfc",),                 1.0),
     DistMetric("tpot_ms",               ("tpot",),                 1000.0),
     DistMetric("queue_stall_ms",        ("queue_stall",),          1000.0),
     DistMetric("slack_s",               ("slack",),                1.0),
+    DistMetric("violated_magnitude_s",  ("slack", "violated-magnitude"), 1.0),
     DistMetric("running",               ("scheduler", "running"),  1.0),
     DistMetric("combined",              ("scheduler", "combined"), 1.0),
     DistMetric("pending_time_s",        ("pending", "time"),       1.0),
     DistMetric("inter_chunk_delay_ms",  ("inter_chunk_delay",),    1000.0),
 )
-STATS = ("mean", "p50", "p90", "p99")
+STATS = ("mean", "p50", "p99")
+# Per-metric extra stats. `combined` needs min/max (running+pending floor and
+# ceiling for occupancy); other metrics keep the default {mean, p50, p99}.
+DIST_EXTRA_STATS: dict[str, tuple[str, ...]] = {
+    "combined": ("min", "max"),
+}
 
 # Scalar (non-distribution) metrics — emit one column each.
 SCALAR_METRICS: tuple[tuple[str, tuple[str, ...], str, float], ...] = (
-    ("slack_neg_ratio",      ("slack",),          "neg_ratio", 1.0),
-    ("slo_compliance_rate",  ("slo_compliance",), "rate",      1.0),
-    ("slo_compliance_count", ("slo_compliance",), "count",     1.0),
-    ("slo_total_requests",   ("slo_compliance",), "total_requests", 1.0),
+    # chunk-level violation ratio.
+    ("slack_neg_ratio",         ("slack",),          "neg_ratio", 1.0),
+    # request-level: 1 - compliance_rate = ratio of requests with any violation.
+    ("slo_compliance_rate",     ("slo_compliance",), "rate",      1.0),
+    ("slo_compliance_count",    ("slo_compliance",), "count",     1.0),
+    ("slo_total_requests",      ("slo_compliance",), "total_requests", 1.0),
+)
+
+# SSLO config keys to emit as `sslo_*` columns. Pulled from sslo_config[<mode>]
+# in summary.json — present only on sslo* modes (baseline gets blanks).
+SSLO_CONFIG_FIELDS: tuple[str, ...] = (
+    "enabled", "offloading", "adaptive_batching", "enable_v2",
+    "pending_policy", "pending_capacity_control",
+    "pending_threshold_dynamic", "pending_dynamic_band",
+    "pending_in_threshold", "pending_out_threshold",
+    "critical_threshold", "num_warmup_chunks",
+    "seconds_per_word", "chunk_unit",
 )
 
 CONTEXT_COLUMNS = (
@@ -89,8 +112,10 @@ def _metric_node(summary: dict, path: tuple[str, ...], mode: str):
 def _emit_rows(summary_path: Path) -> list[dict]:
     summary = json.loads(summary_path.read_text())
     cfg = summary.get("config", {})
-    # Path layout: <root>/<label>/<unit>/seqs_<n>/rate_<r>/run_<i>/summary.json
-    path_label = summary_path.parents[4].name
+    sslo_cfg_by_mode = cfg.get("sslo_config", {}) or {}
+    # Path layout: <root>/<label>/<unit>/seqs_<n>/rate_<r>/<mode>/run_<i>/summary.json
+    # parents[5] = label.
+    path_label = summary_path.parents[5].name
     run_idx = parse_int_suffix(summary_path.parent.name, "run_")
     rows: list[dict] = []
     for mode in cfg.get("modes_run", []):
@@ -107,9 +132,13 @@ def _emit_rows(summary_path: Path) -> list[dict]:
             "run_idx": run_idx,
             "num_requests": ttft_node.get("count"),
         }
+        sslo_cfg = sslo_cfg_by_mode.get(mode, {}) or {}
+        for field in SSLO_CONFIG_FIELDS:
+            row[f"sslo_{field}"] = sslo_cfg.get(field)
         for dm in DIST_METRICS:
             node = _metric_node(summary, dm.path, mode) or {}
-            for stat in STATS:
+            stats = STATS + DIST_EXTRA_STATS.get(dm.name, ())
+            for stat in stats:
                 value = node.get(stat)
                 row[f"{dm.name}_{stat}"] = (
                     None if value is None else float(value) * dm.scale)
@@ -117,6 +146,10 @@ def _emit_rows(summary_path: Path) -> list[dict]:
             node = _metric_node(summary, path, mode) or {}
             value = node.get(field)
             row[name] = None if value is None else float(value) * scale
+        # request-level violation ratio = 1 - compliance_rate.
+        cr = row.get("slo_compliance_rate")
+        row["slo_request_violation_rate"] = (
+            None if cr is None else 1.0 - float(cr))
         rows.append(row)
     return rows
 
@@ -125,16 +158,20 @@ def cmd_csv(args: argparse.Namespace) -> None:
     sweep_root = Path(args.sweep_root)
     output_path = Path(args.output) if args.output else (
         sweep_root / "summary.csv")
+    # Layout: <root>/<label>/<chunk>/seqs_<n>/rate_<r>/<mode>/run_<i>/summary.json
     summary_paths = (
-        sorted(sweep_root.glob("*/*/seqs_*/rate_*/run_*/summary.json"))
+        sorted(sweep_root.glob("*/*/seqs_*/rate_*/*/run_*/summary.json"))
         if sweep_root.exists() else [])
     rows: list[dict] = []
     for path in summary_paths:
         rows.extend(_emit_rows(path))
     columns = list(CONTEXT_COLUMNS)
+    columns.extend(f"sslo_{field}" for field in SSLO_CONFIG_FIELDS)
     for dm in DIST_METRICS:
-        columns.extend(f"{dm.name}_{stat}" for stat in STATS)
+        stats = STATS + DIST_EXTRA_STATS.get(dm.name, ())
+        columns.extend(f"{dm.name}_{stat}" for stat in stats)
     columns.extend(name for name, *_ in SCALAR_METRICS)
+    columns.append("slo_request_violation_rate")
     df = pd.DataFrame(rows, columns=columns)
     if df.empty:
         print(f"  no summary.json found under {sweep_root}")
@@ -172,9 +209,10 @@ def _collect_unit(unit_dir: Path, modes: tuple[str, ...]):
     seqs_set: set[int] = set()
     rates_set: set[int] = set()
     complete = 0
-    for path in sorted(unit_dir.glob("seqs_*/rate_*/run_*/summary.json")):
-        seqs = parse_int_suffix(path.parents[2].name, "seqs_")
-        rate = parse_int_suffix(path.parents[1].name, "rate_")
+    # New layout: seqs_*/rate_*/<mode>/run_*/summary.json
+    for path in sorted(unit_dir.glob("seqs_*/rate_*/*/run_*/summary.json")):
+        seqs = parse_int_suffix(path.parents[3].name, "seqs_")
+        rate = parse_int_suffix(path.parents[2].name, "rate_")
         if seqs is None or rate is None:
             continue
         try:
@@ -280,14 +318,15 @@ def _load_cell(base: Path, seqs: int, rate: int, num_runs: int,
             if key not in cell:
                 cell[key] = {m: [] for m in modes}
     for i in range(1, num_runs + 1):
-        path = base / f"seqs_{seqs}" / f"rate_{rate}" / f"run_{i}" / "summary.json"
-        if not path.exists():
-            continue
-        s = json.loads(path.read_text())
-        for _group_name, specs in DISPLAY_GROUPS:
-            for spec in specs:
-                key = (spec.path, spec.field)
-                for mode in modes:
+        for mode in modes:
+            path = (base / f"seqs_{seqs}" / f"rate_{rate}"
+                    / mode / f"run_{i}" / "summary.json")
+            if not path.exists():
+                continue
+            s = json.loads(path.read_text())
+            for _group_name, specs in DISPLAY_GROUPS:
+                for spec in specs:
+                    key = (spec.path, spec.field)
                     v = lookup(s, spec.path, spec.field, mode)
                     if v is not None:
                         cell[key][mode].append(float(v))

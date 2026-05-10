@@ -57,10 +57,10 @@ export CUDA_VISIBLE_DEVICES
 export SSLO_KV_OFFLOAD_EXTRA
 
 if [[ "${run_kind}" == sslo* ]]; then
-  export SSLO_STATS_LOG_PATH="${OUTPUT_DIR}/_stats_${run_kind}.jsonl"
+  export SSLO_STATS_LOG_PATH="${OUTPUT_DIR}/scheduler_stats.jsonl"
 fi
 if [[ "${run_kind}" == *offload* ]]; then
-  export SSLO_OFFLOAD_LOG_PATH="${OUTPUT_DIR}/_offload_log_${run_kind}.jsonl"
+  export SSLO_OFFLOAD_LOG_PATH="${OUTPUT_DIR}/offload_log.jsonl"
 fi
 
 python3 exp/run_sslo/run_test.py \

@@ -124,18 +124,18 @@ write_run_status() {
 # ---------------------------------------------------------------------------
 run_cell() {
   local unit="$1" gpu="$2" rate="$3" seqs="$4" run_index="$5"
-  local out_dir="${BASE_OUTPUT}/${unit}/seqs_${seqs}/rate_${rate}/run_${run_index}"
-  rm -rf "${out_dir}"
-  mkdir -p "${out_dir}"
+  local cell_root="${BASE_OUTPUT}/${unit}/seqs_${seqs}/rate_${rate}"
 
   IFS=',' read -ra modes_arr <<< "${MODES}"
-  local status_pairs=() last_rc=0
 
   for mode in "${modes_arr[@]}"; do
     [[ "${mode}" != "baseline" ]] && gpu_wait_ready "${gpu:-1}"
+    local mode_run_dir="${cell_root}/${mode}/run_${run_index}"
+    rm -rf "${mode_run_dir}"
+    mkdir -p "${mode_run_dir}"
 
-    last_rc=0
-    OUTPUT_DIR="${out_dir}" \
+    local last_rc=0
+    OUTPUT_DIR="${mode_run_dir}" \
     CUDA_VISIBLE_DEVICES="${gpu:-1}" \
     CHUNK_UNIT="${unit}" \
     REQUEST_RATE="${rate}" \
@@ -149,29 +149,24 @@ run_cell() {
     bash exp/run_sslo/run_test.sh "${mode}" "${seqs}" "${MODEL}" \
       || last_rc=$?
 
-    status_pairs+=("${mode}:${last_rc}")
-    if [[ "${last_rc}" -eq 0 ]]; then
-      python3 exp/run_sslo/_consolidate_mode_outputs.py "${out_dir}" "${mode}"
-    else
-      echo "WARNING: mode=${mode} exited ${last_rc}; skipping remaining modes"
-      break
+    if [[ "${last_rc}" -ne 0 ]]; then
+      echo "WARNING: ${mode} run_${run_index} exited ${last_rc}; skipping analyze"
+      continue
     fi
+
+    python3 exp/run_sslo/analyze.py \
+      --output-dir "${mode_run_dir}" \
+      --max-num-seqs "${seqs}" \
+      --chunk-unit "${unit}" \
+      --request-rate "${rate}" \
+      --model "${MODEL}" \
+      --generation-max-tokens "${GENERATION_MAX_TOKENS}" \
+      --max-model-len "${MAX_MODEL_LEN}" \
+      ${LABEL:+--label "${LABEL}"}
   done
 
-  write_run_status "${out_dir}" "${status_pairs[@]}"
-  python3 exp/run_sslo/analyze.py \
-    --output-dir "${out_dir}" \
-    --max-num-seqs "${seqs}" \
-    --chunk-unit "${unit}" \
-    --request-rate "${rate}" \
-    --model "${MODEL}" \
-    --generation-max-tokens "${GENERATION_MAX_TOKENS}" \
-    --max-model-len "${MAX_MODEL_LEN}" \
-    ${LABEL:+--label "${LABEL}"}
-
-  # Refresh the sweep-wide summary.csv after every cell so partial sweeps
-  # are inspectable. Last writer wins under PARALLEL=4 — the file holds
-  # whatever set of summary.json files existed at its emit time.
+  # Refresh the sweep-wide summary.csv after each cell so partial sweeps
+  # are inspectable.
   python3 exp/run_sslo/analysis/sweep_analysis.py csv \
     --sweep-root "${SWEEP_ROOT}" \
     --output "${SWEEP_ROOT}/summary.csv"

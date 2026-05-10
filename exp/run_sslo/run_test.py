@@ -95,29 +95,27 @@ def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
     def _val(r, k):
         return r.get(k) if isinstance(r, dict) else getattr(r, k, None)
 
-    # Map Phase A v2 ChunkRecord fields (slack_s, pending_time_s,
-    # gen_finish_ts, ...) to the analyze.py-stable schema below. Fall back
-    # to v1 field names when present for backward compatibility.
+    # Map vLLM ChunkRecord fields onto the chunks.jsonl schema.
     normalized = []
     for record in records:
         slack = _val(record, "slack_s")
-        if slack is None:
-            slack = _val(record, "cumulative_slack")
         pending = _val(record, "pending_time_s")
-        if pending is None:
-            pending = _val(record, "pending_time")
         end_ts = _val(record, "gen_finish_ts")
-        if end_ts is None:
-            end_ts = _val(record, "end_time_ts")
+        start_ts = _val(record, "start_time_ts")
         deadline = _val(record, "deadline_ts")
         normalized.append({
             "chunk_idx": _val(record, "chunk_idx"),
-            "cumulative_slack": slack,
+            "chunk_slack": slack,
             "deadline_ts": deadline,
-            "gen_time": _val(record, "gen_time"),
-            "pending_time": pending,
-            "word_count": _val(record, "word_count"),
+            "start_time_ts": start_ts,
             "end_time_ts": end_ts,
+            "pending_time": pending,
+            "num_words": _val(record, "word_count"),
+            "num_token": _val(record, "num_token"),
+            "num_iters": _val(record, "num_iters"),
+            "num_running_iters": _val(record, "num_running_iters"),
+            "num_pending_iters_per_chunk":
+                _val(record, "num_pending_iters_per_chunk"),
         })
     return normalized
 
@@ -181,11 +179,17 @@ async def collect_request(
     )
 
     slo_chunk_records = extract_chunk_records(last_output)
+    # ttfc — time to first chunk, from queue entry to first chunk completion.
+    ttfc = None
+    if queued and slo_chunk_records:
+        first_chunk_end = slo_chunk_records[0].get("end_time_ts")
+        if first_chunk_end is not None and first_chunk_end >= queued:
+            ttfc = float(first_chunk_end) - float(queued)
     sslo_metrics = getattr(last_output, "sslo_metrics", None)
     total_pending_time_s = (
         getattr(sslo_metrics, "total_pending_time_s", None) if sslo_metrics else None
     )
-    num_pending_intervals = (
+    num_pending_iters_per_request = (
         getattr(sslo_metrics, "num_pending_intervals", 0) if sslo_metrics else 0
     )
     max_consecutive_pending = (
@@ -196,13 +200,15 @@ async def collect_request(
         "request_id": request_id,
         "request_idx": request_idx,
         "num_output_tokens": num_gen,
+        "num_chunks": len(slo_chunk_records),
         "ttft": ttft,
+        "ttfc": ttfc,
         "tpot": tpot,
         "queue_stall": queue_stall,
         "decoding_start_ts": first_ts,
         "slo_chunk_records": slo_chunk_records,
         "total_pending_time_s": total_pending_time_s,
-        "num_pending_intervals": num_pending_intervals,
+        "num_pending_iters_per_request": num_pending_iters_per_request,
         "max_consecutive_pending": max_consecutive_pending,
     }
 
@@ -233,6 +239,9 @@ async def run_one(args: argparse.Namespace) -> None:
             sslo_params["adaptive_batching"] = True
         if "offload" in args.run_kind:
             sslo_params["offloading"] = True
+        # SSLO env-var toggle for the v2 pressure-budget scheduling path.
+        if os.environ.get("SSLO_ENABLE_V2") in ("1", "true", "True"):
+            sslo_params["enable_v2"] = True
 
     # KV transfer config: only enable the CPU-offload connector for the two
     # offload SSLO modes. Non-offload modes (baseline, sslo, sslo_adaptive)
@@ -299,21 +308,34 @@ async def run_one(args: argparse.Namespace) -> None:
         ]
         rows = await asyncio.gather(*tasks)
         elapsed = time.monotonic() - t0
-        request_rows = [{k: v for k, v in row.items() if k != "slo_chunk_records"} for row in rows]
-        write_jsonl(output_dir / f"requests_{args.run_kind}.jsonl", request_rows)
+        request_rows = [
+            {"mode": args.run_kind,
+             **{k: v for k, v in row.items() if k != "slo_chunk_records"}}
+            for row in rows
+        ]
+        write_jsonl(output_dir / "requests.jsonl", request_rows)
         chunk_rows = [
-            {"request_id": str(row["request_id"]), **chunk}
+            {
+                "mode": args.run_kind,
+                "request_id": str(row["request_id"]),
+                "request_idx": row.get("request_idx"),
+                **chunk,
+            }
             for row in rows
             for chunk in (row.get("slo_chunk_records") or [])
         ]
-        write_jsonl(output_dir / f"chunks_{args.run_kind}.jsonl", chunk_rows)
+        write_jsonl(output_dir / "chunks.jsonl", chunk_rows)
+        # Sidecar for analyze.py: SSLO config options (per-mode) to embed in
+        # summary.config. Only emitted for sslo* modes; baseline gets {}.
+        sslo_config_path = output_dir / "sslo_config.json"
+        sslo_config_path.write_text(json.dumps(sslo_params) + "\n")
         print(
             f"{args.run_kind}: completed {len(rows)} requests in {elapsed:.1f}s; "
-            f"wrote {output_dir / f'requests_{args.run_kind}.jsonl'}"
+            f"wrote {output_dir / 'requests.jsonl'}"
         )
         print(
             f"{args.run_kind}: wrote {len(chunk_rows)} chunks to "
-            f"{output_dir / f'chunks_{args.run_kind}.jsonl'}"
+            f"{output_dir / 'chunks.jsonl'}"
         )
     finally:
         engine.shutdown()

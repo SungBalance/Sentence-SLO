@@ -32,6 +32,10 @@ class SsloConfig:
     #     Drops hysteresis entirely. Predicted optimal in scheduling-
     #     theory sense when switch cost ≈ 0.
     pending_policy: str = "llf"
+    # When True, dispatch to schedule_sslo_v2 (pressure-budget admission,
+    # no offload). When False (default), use the existing schedule_sslo
+    # path governed by pending_policy / pending_threshold_dynamic / etc.
+    enable_v2: bool = False
     # Capacity control on top of the placement policy: cap target_n
     # for the non-critical step at min(max_num_seqs, N / avg(pressure))
     # so the running pool shrinks under overload. Lowest-pressure

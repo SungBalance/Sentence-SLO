@@ -180,6 +180,16 @@ class ChunkRecord:
     stall_s: float
     pending_time_s: float
     word_count: int
+    # SSLO: chunk start wall-clock — prev chunk's gen_finish_ts, or
+    # decoding_start_ts for chunk 0.
+    start_time_ts: float
+    # SSLO: tokens generated within this chunk window.
+    num_token: int
+    # SSLO: scheduler-step accounting per chunk window. num_iters =
+    # num_running_iters + num_pending_iters_per_chunk.
+    num_iters: int
+    num_running_iters: int
+    num_pending_iters_per_chunk: int
 
 
 class ChunkStatCollector:
@@ -194,6 +204,9 @@ class ChunkStatCollector:
         self.records: list[ChunkRecord] = []
         self.stall_time_total: float = 0.0
         self._current_pending_s: float = 0.0
+        # SSLO: per-chunk scheduler-step tallies, reset at each record().
+        self._current_running_iters: int = 0
+        self._current_pending_iters: int = 0
 
     def record(
         self,
@@ -204,7 +217,11 @@ class ChunkStatCollector:
         slack_s: float,
         stall_s: float,
         word_count: int,
+        start_time_ts: float,
+        num_token: int,
     ) -> None:
+        running_iters = self._current_running_iters
+        pending_iters = self._current_pending_iters
         self.records.append(
             ChunkRecord(
                 chunk_idx=chunk_idx,
@@ -214,12 +231,27 @@ class ChunkStatCollector:
                 stall_s=stall_s,
                 pending_time_s=self._current_pending_s,
                 word_count=word_count,
+                start_time_ts=start_time_ts,
+                num_token=num_token,
+                num_iters=running_iters + pending_iters,
+                num_running_iters=running_iters,
+                num_pending_iters_per_chunk=pending_iters,
             ))
         self.stall_time_total += stall_s
         self._current_pending_s = 0.0
+        self._current_running_iters = 0
+        self._current_pending_iters = 0
 
     def accumulate_pending(self, interval_s: float) -> None:
         self._current_pending_s += interval_s
+
+    # SSLO
+    def accumulate_running_step(self) -> None:
+        self._current_running_iters += 1
+
+    # SSLO
+    def accumulate_pending_step(self) -> None:
+        self._current_pending_iters += 1
 
     def asdict(self) -> list[dict]:
         return [asdict(record) for record in self.records]
@@ -390,10 +422,16 @@ class RequestSLOState:
         if self.chunks_completed == 0:
             slack = 0.0
             stall = 0.0
+            # SSLO: chunk 0 starts at decoding_start_ts.
+            start_time_ts = self.decoding_start_ts
         else:
             slack = deadline - now
             stall = max(0.0, now - deadline)
+            # SSLO: subsequent chunks start where the previous one ended.
+            start_time_ts = self.chunk_stats.records[-1].gen_finish_ts
         generated_len = self.current_chunk_generated_len or max(1, word_count)
+        # SSLO: capture the actual generated-token count before reset.
+        num_token = self.current_chunk_generated_len
 
         self.chunk_stats.record(
             chunk_idx=self.chunks_completed,
@@ -402,6 +440,8 @@ class RequestSLOState:
             slack_s=slack,
             stall_s=stall,
             word_count=word_count,
+            start_time_ts=start_time_ts,
+            num_token=num_token,
         )
         self._chunk_len_predictor.update(int(generated_len))
 
