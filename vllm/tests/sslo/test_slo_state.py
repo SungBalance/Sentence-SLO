@@ -42,10 +42,9 @@ def test_chunk_record_and_diagnostics_append():
     assert record.chunk_idx == 0
     assert record.deadline_ts == pytest.approx(5.0)
     assert record.gen_finish_ts == pytest.approx(5.5)
-    # Chunk 0 has no preceding consumption budget — slack and stall are
-    # forced to 0 so the first chunk doesn't auto-violate request SLO.
+    # Chunk 0 has no preceding consumption budget — slack is forced to 0
+    # so the first chunk doesn't auto-violate request SLO.
     assert record.slack_s == 0.0
-    assert record.stall_s == 0.0
     assert record.pending_time_s == pytest.approx(0.3)
     assert state.chunk_stall_time_total == 0.0
     assert state.total_pending_time_s == pytest.approx(0.3)
@@ -80,7 +79,8 @@ def test_chunk1_records_real_slack():
     assert rec.deadline_ts == pytest.approx(1.5)
     assert rec.gen_finish_ts == pytest.approx(2.0)
     assert rec.slack_s == pytest.approx(-0.5)  # missed deadline by 0.5s
-    assert rec.stall_s == pytest.approx(0.5)
+    # stall = max(0, -slack); aggregated into chunk_stall_time_total.
+    assert state.chunk_stall_time_total == pytest.approx(0.5)
 
 
 def test_chunk_expected_len_p90_tracks_history():
@@ -143,10 +143,10 @@ def test_score_none_during_warmup_or_missing_inputs():
 def test_offload_lifecycle_counters():
     state = RequestSLOState()
     state.on_offload_enter(2.0)
-    assert state.is_offloaded is True
+    assert state.offload_enter_ts is not None
     assert state.num_offload_intervals == 1
     state.on_offload_exit(2.25)
-    assert state.is_offloaded is False
+    assert state.offload_enter_ts is None
     assert state.total_offload_time_s == pytest.approx(0.25)
 
 

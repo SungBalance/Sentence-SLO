@@ -59,17 +59,35 @@ DIST_METRICS: tuple[DistMetric, ...] = (
     DistMetric("tpot_ms",               ("tpot",),                 1000.0),
     DistMetric("queue_stall_ms",        ("queue_stall",),          1000.0),
     DistMetric("slack_s",               ("slack",),                1.0),
-    DistMetric("violated_magnitude_s",  ("slack", "violated-magnitude"), 1.0),
+    DistMetric("stall_time",            ("stall_time",),           1.0),
     DistMetric("running",               ("scheduler", "running"),  1.0),
-    DistMetric("combined",              ("scheduler", "combined"), 1.0),
+    DistMetric("num_handling_users",    ("scheduler", "num_handling_users"), 1.0),
     DistMetric("pending_time_s",        ("pending", "time"),       1.0),
     DistMetric("inter_chunk_delay_ms",  ("inter_chunk_delay",),    1000.0),
+    DistMetric("prediction_ratio",      ("prediction_ratio",),     1.0),
+    # ProgressServe per-request derivation
+    DistMetric("total_stall_s",         ("progress_request", "total_stall_time"), 1.0),
+    DistMetric("max_stall_s",           ("progress_request", "max_stall_time"),   1.0),
+    DistMetric("num_stall_intervals",   ("progress_request", "num_stall_intervals"), 1.0),
+    DistMetric("stall_fraction_pct",    ("progress_request", "stall_fraction"),   100.0),
+    DistMetric("completion_latency_s",  ("progress_request", "completion_latency"), 1.0),
+    DistMetric("demand_duration_s",     ("progress_request", "demand_duration"),  1.0),
+    # Workload distributions
+    DistMetric("prompt_tokens",         ("workload", "num_prompt_tokens"), 1.0),
+    DistMetric("output_tokens",         ("workload", "num_output_tokens"), 1.0),
+    DistMetric("chunks_per_req",        ("workload", "num_chunks"),        1.0),
 )
 STATS = ("mean", "p50", "p99")
 # Per-metric extra stats. `combined` needs min/max (running+pending floor and
 # ceiling for occupancy); other metrics keep the default {mean, p50, p99}.
 DIST_EXTRA_STATS: dict[str, tuple[str, ...]] = {
-    "combined": ("min", "max"),
+    "num_handling_users":    ("min", "max"),
+    "stall_time":            ("p90",),
+    "total_stall_s":         ("p95", "max"),
+    "max_stall_s":           ("p95", "max"),
+    "stall_fraction_pct":    ("p95",),
+    "completion_latency_s":  ("p95", "max"),
+    "demand_duration_s":     ("p95",),
 }
 
 # Scalar (non-distribution) metrics — emit one column each.
@@ -80,14 +98,27 @@ SCALAR_METRICS: tuple[tuple[str, tuple[str, ...], str, float], ...] = (
     ("slo_compliance_rate",     ("slo_compliance",), "rate",      1.0),
     ("slo_compliance_count",    ("slo_compliance",), "count",     1.0),
     ("slo_total_requests",      ("slo_compliance",), "total_requests", 1.0),
+    # stall_time_mean = average over violated chunks (DistMetric handles
+    # this via "mean"); add the with_0 variant explicitly here.
+    ("stall_time_mean_with_0",  ("stall_time",),     "mean_with_0", 1.0),
+    # ProgressServe run-level
+    ("tokens_per_second",        ("throughput",), "tokens_per_second",   1.0),
+    ("completed_req_per_s",      ("throughput",), "completed_req_per_s", 1.0),
+    ("measurement_duration_s",   ("throughput",), "duration_s",          1.0),
+    ("handling_users_time_avg",  ("handling_users",), "time_avg", 1.0),
+    ("handling_users_p95",       ("handling_users",), "p95",      1.0),
+    ("handling_users_max",       ("handling_users",), "max",      1.0),
+    # CP-SLO violation rate per tau
+    ("cp_slo_viol_tau_0_5",      ("cp_slo_violation", "tau_0.5"), "rate", 1.0),
+    ("cp_slo_viol_tau_1",        ("cp_slo_violation", "tau_1"),   "rate", 1.0),
+    ("cp_slo_viol_tau_2",        ("cp_slo_violation", "tau_2"),   "rate", 1.0),
+    ("cp_slo_viol_tau_5",        ("cp_slo_violation", "tau_5"),   "rate", 1.0),
 )
 
 # SSLO config keys to emit as `sslo_*` columns. Pulled from sslo_config[<mode>]
 # in summary.json — present only on sslo* modes (baseline gets blanks).
 SSLO_CONFIG_FIELDS: tuple[str, ...] = (
-    "enabled", "offloading", "adaptive_batching", "enable_v2",
-    "pending_policy", "pending_capacity_control",
-    "pending_threshold_dynamic", "pending_dynamic_band",
+    "method", "policy", "offloading", "adaptive_batching",
     "pending_in_threshold", "pending_out_threshold",
     "critical_threshold", "num_warmup_chunks",
     "seconds_per_word", "chunk_unit",
@@ -99,15 +130,23 @@ CONTEXT_COLUMNS = (
 )
 
 
-def _metric_node(summary: dict, path: tuple[str, ...], mode: str):
-    """Return summary['metrics'][path[0]][mode][path[1]]... or None."""
-    node = summary.get("metrics", {}).get(path[0], {}).get(mode)
-    for segment in path[1:]:
-        if not isinstance(node, dict):
-            return None
-        node = node.get(segment)
-    return node
 
+
+def _context_row(summary: dict, path_label: str, run_idx: "int | None", mode: str) -> dict:
+    cfg = summary.get("config", {})
+    ttft_node = lookup(summary, ("ttft", "all"), None, mode) or {}
+    return {
+        "Model": cfg.get("model"),
+        "Label": cfg.get("label") or path_label,
+        "mode": mode,
+        "chunk_unit": cfg.get("chunk_unit"),
+        "req/s": cfg.get("request_rate"),
+        "max_num_seqs": cfg.get("max_num_seqs"),
+        "generation_max_tokens": cfg.get("generation_max_tokens"),
+        "max_model_len": cfg.get("max_model_len"),
+        "run_idx": run_idx,
+        "num_requests": ttft_node.get("count"),
+    }
 
 def _emit_rows(summary_path: Path) -> list[dict]:
     summary = json.loads(summary_path.read_text())
@@ -119,31 +158,19 @@ def _emit_rows(summary_path: Path) -> list[dict]:
     run_idx = parse_int_suffix(summary_path.parent.name, "run_")
     rows: list[dict] = []
     for mode in cfg.get("modes_run", []):
-        ttft_node = _metric_node(summary, ("ttft", "all"), mode) or {}
-        row: dict = {
-            "Model": cfg.get("model"),
-            "Label": cfg.get("label") or path_label,
-            "mode": mode,
-            "chunk_unit": cfg.get("chunk_unit"),
-            "req/s": cfg.get("request_rate"),
-            "max_num_seqs": cfg.get("max_num_seqs"),
-            "generation_max_tokens": cfg.get("generation_max_tokens"),
-            "max_model_len": cfg.get("max_model_len"),
-            "run_idx": run_idx,
-            "num_requests": ttft_node.get("count"),
-        }
+        row: dict = _context_row(summary, path_label, run_idx, mode)
         sslo_cfg = sslo_cfg_by_mode.get(mode, {}) or {}
         for field in SSLO_CONFIG_FIELDS:
             row[f"sslo_{field}"] = sslo_cfg.get(field)
         for dm in DIST_METRICS:
-            node = _metric_node(summary, dm.path, mode) or {}
+            node = lookup(summary, dm.path, None, mode) or {}
             stats = STATS + DIST_EXTRA_STATS.get(dm.name, ())
             for stat in stats:
                 value = node.get(stat)
                 row[f"{dm.name}_{stat}"] = (
                     None if value is None else float(value) * dm.scale)
         for name, path, field, scale in SCALAR_METRICS:
-            node = _metric_node(summary, path, mode) or {}
+            node = lookup(summary, path, None, mode) or {}
             value = node.get(field)
             row[name] = None if value is None else float(value) * scale
         # request-level violation ratio = 1 - compliance_rate.
@@ -179,6 +206,30 @@ def cmd_csv(args: argparse.Namespace) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False)
     print(f"  wrote {len(df)} rows to {output_path}")
+
+    # Slim measurement-window sidecar (summary.csv unchanged). One row per
+    # (cell, mode), with the absolute monotonic ts of the 1st request finish
+    # and the (num_requests − max_num_seqs)-th request finish, plus the
+    # duration. Definition matches progress_metrics.measurement_window.
+    warmup_cols = list(CONTEXT_COLUMNS) + [
+        "measurement_start_ts", "measurement_end_ts", "measurement_duration_s",
+    ]
+    warmup_rows: list[dict] = []
+    for path in summary_paths:
+        summary = json.loads(path.read_text())
+        cfg = summary.get("config", {})
+        path_label = path.parents[5].name
+        run_idx = parse_int_suffix(path.parent.name, "run_")
+        for mode in cfg.get("modes_run", []):
+            mw = lookup(summary, ("measurement_window",), None, mode) or {}
+            warmup_rows.append(_context_row(summary, path_label, run_idx, mode) | {
+                "measurement_start_ts": mw.get("start_ts"),
+                "measurement_end_ts": mw.get("end_ts"),
+                "measurement_duration_s": mw.get("duration_s"),
+            })
+    warmup_path = output_path.parent / "summary_warmup.csv"
+    pd.DataFrame(warmup_rows, columns=warmup_cols).to_csv(warmup_path, index=False)
+    print(f"  wrote {len(warmup_rows)} rows to {warmup_path}")
 
 
 # ---------------------------------------------------------------------------

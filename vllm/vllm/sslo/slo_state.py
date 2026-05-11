@@ -177,7 +177,6 @@ class ChunkRecord:
     deadline_ts: float
     gen_finish_ts: float
     slack_s: float
-    stall_s: float
     pending_time_s: float
     word_count: int
     # SSLO: chunk start wall-clock — prev chunk's gen_finish_ts, or
@@ -190,6 +189,11 @@ class ChunkRecord:
     num_iters: int
     num_running_iters: int
     num_pending_iters_per_chunk: int
+    # SSLO: predictor's estimate (in tokens) at chunk start — i.e. value
+    # used by pressure() during this chunk's generation. None for chunk 0
+    # (no history yet) and any time before the predictor has a value.
+    # Compare to num_token to measure prediction accuracy.
+    expected_len: float | None
 
 
 class ChunkStatCollector:
@@ -215,10 +219,10 @@ class ChunkStatCollector:
         deadline_ts: float,
         gen_finish_ts: float,
         slack_s: float,
-        stall_s: float,
         word_count: int,
         start_time_ts: float,
         num_token: int,
+        expected_len: float | None,
     ) -> None:
         running_iters = self._current_running_iters
         pending_iters = self._current_pending_iters
@@ -228,7 +232,6 @@ class ChunkStatCollector:
                 deadline_ts=deadline_ts,
                 gen_finish_ts=gen_finish_ts,
                 slack_s=slack_s,
-                stall_s=stall_s,
                 pending_time_s=self._current_pending_s,
                 word_count=word_count,
                 start_time_ts=start_time_ts,
@@ -236,8 +239,10 @@ class ChunkStatCollector:
                 num_iters=running_iters + pending_iters,
                 num_running_iters=running_iters,
                 num_pending_iters_per_chunk=pending_iters,
+                expected_len=expected_len,
             ))
-        self.stall_time_total += stall_s
+        # SSLO: aggregate stall = max(0, -slack); positive only when late.
+        self.stall_time_total += max(0.0, -slack_s)
         self._current_pending_s = 0.0
         self._current_running_iters = 0
         self._current_pending_iters = 0
@@ -279,7 +284,11 @@ class SsloRequestStats:
 class RequestSLOState:
     # Lifecycle.
     decoding_start_ts: float | None = None
-    cumulative_consume_time: float = 0.0
+    # Absolute wall-clock deadline for the chunk currently being generated.
+    # Updated at each chunk boundary by the stall-aware recurrence
+    #   deadline(t) = max(deadline(t-1), finish(t-1)) + consume(t-1)
+    # so the next chunk must arrive before this timestamp to be on-time.
+    next_deadline_ts: float | None = None
     chunks_completed: int = 0
     current_chunk_generated_len: int = 0
 
@@ -340,10 +349,6 @@ class RequestSLOState:
         return Phase.WARMUP
 
     @property
-    def is_offloaded(self) -> bool:
-        return self.offload_enter_ts is not None
-
-    @property
     def chunk_records(self) -> list[ChunkRecord]:
         return self.chunk_stats.records
 
@@ -362,9 +367,10 @@ class RequestSLOState:
         self._chunk_len_predictor.value = value
 
     def chunk_deadline(self) -> float | None:
-        if self.decoding_start_ts is None:
-            return None
-        return self.decoding_start_ts + self.cumulative_consume_time
+        # next_deadline_ts is initialized to decoding_start_ts on the first
+        # on_token / on_chunk_boundary call, then advanced by the recurrence
+        # at each chunk boundary.
+        return self.next_deadline_ts
 
     def time_to_deadline(self, now: float) -> float | None:
         deadline = self.chunk_deadline()
@@ -402,6 +408,10 @@ class RequestSLOState:
     def on_token(self, now: float) -> None:
         if self.decoding_start_ts is None:
             self.decoding_start_ts = now
+            # SSLO: deadline(0) = decoding_start_ts (chunk 0 due immediately;
+            # slack is forced to 0 at chunk 0's boundary anyway).
+            if self.next_deadline_ts is None:
+                self.next_deadline_ts = now
         self.current_chunk_generated_len += 1
 
     def on_chunk_boundary(
@@ -412,50 +422,49 @@ class RequestSLOState:
     ) -> None:
         if self.decoding_start_ts is None:
             self.decoding_start_ts = now
+            self.next_deadline_ts = now
 
         deadline = self.chunk_deadline()
         assert deadline is not None
         # Chunk 0 has no preceding consumption budget — its deadline is the
-        # decoding start itself, so slack/stall are not meaningful. Treat
-        # chunk 0 as always on-time (slack=0) so request-level compliance
-        # measures only chunks 1+ where the consumer has a real budget.
+        # decoding start itself, so slack is not meaningful. Treat chunk 0
+        # as always on-time (slack=0) so request-level compliance measures
+        # only chunks 1+ where the consumer has a real budget.
         if self.chunks_completed == 0:
             slack = 0.0
-            stall = 0.0
             # SSLO: chunk 0 starts at decoding_start_ts.
             start_time_ts = self.decoding_start_ts
         else:
             slack = deadline - now
-            stall = max(0.0, now - deadline)
             # SSLO: subsequent chunks start where the previous one ended.
             start_time_ts = self.chunk_stats.records[-1].gen_finish_ts
         generated_len = self.current_chunk_generated_len or max(1, word_count)
         # SSLO: capture the actual generated-token count before reset.
         num_token = self.current_chunk_generated_len
+        # SSLO: predictor's value BEFORE this chunk's update — i.e. the
+        # estimate that pressure() used during this chunk's generation.
+        expected_len = self._chunk_len_predictor.value
 
         self.chunk_stats.record(
             chunk_idx=self.chunks_completed,
             deadline_ts=deadline,
             gen_finish_ts=now,
             slack_s=slack,
-            stall_s=stall,
             word_count=word_count,
             start_time_ts=start_time_ts,
             num_token=num_token,
+            expected_len=expected_len,
         )
         self._chunk_len_predictor.update(int(generated_len))
 
-        # Stall-aware deadline propagation. The next chunk's deadline is
-        # max(this chunk's gen_finish_ts, the previous deadline) plus this
-        # chunk's audio (consume) time — i.e., chunk N+1 must be ready by
-        # the time the user finishes consuming chunk N, where consumption
-        # starts no earlier than chunk N's gen_finish_ts. A late chunk
-        # therefore extends the next deadline by exactly the lateness, so
-        # carryover overage doesn't compound across chunks.
-        end_offset = max(0.0, now - self.decoding_start_ts)
-        self.cumulative_consume_time = (max(end_offset,
-                                            self.cumulative_consume_time)
-                                        + chunk_consume_time_s)
+        # Stall-aware deadline recurrence (t = chunk index just completed):
+        #   deadline(t+1) = max(deadline(t), finish(t)) + consume(t)
+        # An early arrival (finish < deadline) does not buy buffer time —
+        # consumption starts at deadline. A late arrival (finish > deadline)
+        # pushes the next deadline back by exactly the lateness so a single
+        # stall doesn't propagate as cumulative violation.
+        self.next_deadline_ts = (
+            max(deadline, now) + chunk_consume_time_s)
         self.chunks_completed += 1
         self.current_chunk_generated_len = 0
 

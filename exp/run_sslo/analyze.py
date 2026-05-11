@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from jsonl_utils import read_jsonl
+from metrics_utils import distribution_stats, numeric_values, percentile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent / "analysis"))
+import progress_metrics as pm
 
 MAX_NUM_SEQS = 64
 DEFAULT_OUTPUT_DIR = "exp/run_sslo/output"
@@ -27,43 +31,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--label", default=None)
     return parser.parse_args()
-
-
-def percentile(values: list[float], pct: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    rank = pct / 100.0 * (len(ordered) - 1)
-    lower = int(rank)
-    upper = min(lower + 1, len(ordered) - 1)
-    fraction = rank - lower
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
-
-
-def numeric_values(rows: list[dict[str, Any]], key: str) -> list[float]:
-    return [float(row[key]) for row in rows if row.get(key) is not None]
-
-
-def distribution_stats(
-    values: list[float],
-    percentiles: tuple[int, ...] = (50, 90, 99),
-    *,
-    include_mean: bool = True,
-    include_min: bool = False,
-    include_max: bool = True,
-) -> dict[str, float | int | None]:
-    stats: dict[str, float | int | None] = {"count": len(values)}
-    if include_mean:
-        stats["mean"] = statistics.fmean(values) if values else None
-    if include_min:
-        stats["min"] = min(values, default=None)
-    for pct in percentiles:
-        stats[f"p{pct}"] = percentile(values, pct)
-    if include_max:
-        stats["max"] = max(values, default=None)
-    return stats
 
 
 def dist_for_key(rows: list[dict[str, Any]], key: str) -> dict[str, float | int | None]:
@@ -91,12 +58,58 @@ def slack_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
     }
 
 
-def neg_slack_magnitude_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
-    values = [
-        -float(row["chunk_slack"])
-        for row in rows
-        if row.get("chunk_slack") is not None and float(row["chunk_slack"]) < 0
-    ]
+def stall_time_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    """Per-chunk stall = max(0, -slack) statistics over chunks (idx >= 1).
+
+    Returns:
+      - mean        : average stall over chunks where stall > 0 (violated).
+      - mean_with_0 : average stall over ALL chunks (idx >= 1), counting
+                      on-time chunks as 0. Reflects overall slack burn.
+      - p50, p90, p99 : percentiles of stall across ALL chunks (idx >= 1),
+                        with on-time chunks contributing 0.
+    """
+    rows = [r for r in rows if r.get("chunk_idx") not in (None, 0)
+            and r.get("chunk_slack") is not None]
+    stalls_all = [max(0.0, -float(row["chunk_slack"])) for row in rows]
+    stalls_violated = [s for s in stalls_all if s > 0]
+    mean_violated = (
+        statistics.fmean(stalls_violated) if stalls_violated else None)
+    mean_with_0 = (
+        statistics.fmean(stalls_all) if stalls_all else None)
+    return {
+        "count": len(stalls_all),
+        "violated_count": len(stalls_violated),
+        "mean": mean_violated,
+        "mean_with_0": mean_with_0,
+        "p50": percentile(stalls_all, 50),
+        "p90": percentile(stalls_all, 90),
+        "p99": percentile(stalls_all, 99),
+    }
+
+
+def prediction_ratio_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    """Per-chunk ratio of actual / predicted token count.
+
+    Skips chunk_idx == 0 (predictor has no history yet) and rows where
+    expected_len is None or non-positive. ratio == 1 means perfect
+    prediction; > 1 means actual exceeded prediction (under-estimate).
+    """
+    values: list[float] = []
+    for row in rows:
+        if row.get("chunk_idx") in (None, 0):
+            continue
+        actual = row.get("num_token")
+        expected = row.get("expected_len")
+        if actual is None or expected is None:
+            continue
+        try:
+            actual_f = float(actual)
+            expected_f = float(expected)
+        except (TypeError, ValueError):
+            continue
+        if expected_f <= 0:
+            continue
+        values.append(actual_f / expected_f)
     return distribution_stats(values, (50, 90, 99))
 
 
@@ -167,7 +180,7 @@ def scheduler_saturation_stats(rows: list[dict[str, Any]], max_num_seqs: int) ->
         return int(v) if v is not None else default
 
     def combined_field(row: dict[str, Any]) -> int:
-        v = row.get("combined")
+        v = row.get("num_handling_users")
         if v is not None:
             return int(v)
         return int_field(row, "running") + int_field(row, "pending")
@@ -264,7 +277,10 @@ def analyze(
         if m in chunk_by_mode:
             chunk_by_mode[m].append(row)
 
-    sched_by_mode: dict[str, list[dict[str, Any]]] = {m: [] for m in SSLO_MODES}
+    # SSLO diagnostics (`scheduler` key) only fill for SSLO_MODES, but
+    # handling_users / measurement_window are needed for baseline too
+    # (capacity comparison), so bucket scheduler rows for ALL_MODES.
+    sched_by_mode: dict[str, list[dict[str, Any]]] = {m: [] for m in ALL_MODES}
     for row in sched_rows_all:
         m = row.get("mode")
         if m in sched_by_mode:
@@ -277,6 +293,9 @@ def analyze(
     metrics: dict[str, Any] = {
         "ttft": {}, "ttfc": {}, "tpot": {}, "queue_stall": {}, "slack": {},
         "slo_compliance": {}, "scheduler": {}, "pending": {}, "inter_chunk_delay": {},
+        "prediction_ratio": {}, "stall_time": {},
+        "progress_request": {}, "workload": {}, "throughput": {},
+        "cp_slo_violation": {}, "measurement_window": {}, "handling_users": {},
     }
 
     for mode in ALL_MODES:
@@ -296,24 +315,65 @@ def analyze(
         metrics["ttfc"][mode] = dist_for_key(req_rows, "ttfc")
         metrics["tpot"][mode] = dist_for_key(req_rows, "tpot")
         metrics["queue_stall"][mode] = dist_for_key(req_rows, "queue_stall")
-        s = slack_stats(ch_rows)
-        mag = neg_slack_magnitude_stats(ch_rows)
-        metrics["slack"][mode] = {**s, "violated-magnitude": mag}
+        metrics["slack"][mode] = slack_stats(ch_rows)
+        metrics["stall_time"][mode] = stall_time_stats(ch_rows)
         metrics["slo_compliance"][mode] = request_compliance_stats(ch_rows)
         metrics["inter_chunk_delay"][mode] = inter_chunk_delay_stats(ch_rows)
         metrics["pending"][mode] = pending_request_stats(req_rows)
+        metrics["prediction_ratio"][mode] = prediction_ratio_stats(ch_rows)
 
-    for mode in SSLO_MODES:
+    # Scheduler stats (running / num_handling_users) emit for ALL modes,
+    # including baseline (which now also routes through schedule_sslo via
+    # method="baseline" so scheduler_stats.jsonl is populated).
+    for mode in ALL_MODES:
         sched_rows = sched_by_mode[mode]
-        # Include min in `combined` so summary captures the running+pending
-        # floor alongside mean/max — required for occupancy diagnostics.
-        combined_dist = distribution_stats(
-            numeric_values(sched_rows, "combined"), (50, 90, 99),
+        # Include min in `num_handling_users` so summary captures the
+        # running+pending floor alongside mean/max.
+        nhu_dist = distribution_stats(
+            numeric_values(sched_rows, "num_handling_users"), (50, 90, 99),
             include_min=True)
         metrics["scheduler"][mode] = {
             "running": dist_for_key(sched_rows, "running"),
-            "combined": combined_dist,
+            "num_handling_users": nhu_dist,
         }
+
+    windows: dict[str, tuple] = {}
+    for mode in ALL_MODES:
+        req_rows = req_by_mode[mode]
+        ch_rows = chunk_by_mode[mode]
+        per_req = pm.per_request_progress(req_rows, ch_rows)
+        window = pm.measurement_window(req_rows, ch_rows, max_num_seqs)
+
+        def vals(key):
+            return [p[key] for p in per_req if p.get(key) is not None]
+
+        metrics["progress_request"][mode] = {
+            "total_stall_time":    distribution_stats(vals("total_stall_time"), (50, 95, 99)),
+            "max_stall_time":      distribution_stats(vals("max_stall_time"), (50, 95, 99)),
+            "num_stall_intervals": distribution_stats(vals("num_stall_intervals"), (50, 95, 99)),
+            "stall_fraction":      distribution_stats(vals("stall_fraction"), (50, 95, 99)),
+            "completion_latency":  distribution_stats(vals("completion_latency"), (50, 95, 99)),
+            "demand_duration":     distribution_stats(vals("demand_duration"), (50, 95, 99)),
+        }
+        metrics["workload"][mode] = {
+            "num_prompt_tokens": dist_for_key(req_rows, "num_prompt_tokens"),
+            "num_output_tokens": dist_for_key(req_rows, "num_output_tokens"),
+            "num_chunks":        dist_for_key(req_rows, "num_chunks"),
+        }
+        metrics["throughput"][mode] = pm.throughput_stats(req_rows, per_req, window)
+        metrics["cp_slo_violation"][mode] = pm.cp_slo_violation_rates(per_req, list(pm.DEFAULT_TAUS))
+        duration = (window[1] - window[0]) if (window[0] is not None and window[1] is not None) else None
+        metrics["measurement_window"][mode] = {
+            "start_ts":   window[0],
+            "end_ts":     window[1],
+            "duration_s": duration,
+        }
+        windows[mode] = window
+
+    for mode in ALL_MODES:
+        sched_rows = sched_by_mode[mode]
+        window = windows[mode]
+        metrics["handling_users"][mode] = pm.handling_users_stats(sched_rows, window)
 
     scheduler_saturation: dict[str, Any] = {}
     for mode in SSLO_MODES:

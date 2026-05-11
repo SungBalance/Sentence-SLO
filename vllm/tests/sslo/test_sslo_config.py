@@ -9,17 +9,15 @@ from vllm.sslo.slo_state import RequestSLOState
 
 def test_defaults_match_phase_a_v2_plan():
     cfg = SsloConfig()
-    assert cfg.enabled is False
+    assert cfg.method == "baseline"
+    assert cfg.policy == "threshold"
     assert cfg.offloading is False
     assert cfg.adaptive_batching is False
     assert cfg.num_warmup_chunks == 4
-    assert cfg.tpot_bucket_size == 8
     assert cfg.tpot_ema_alpha == 0.1
     assert cfg.critical_threshold == 1.0
     assert cfg.pending_in_threshold == 0.3
     assert cfg.pending_out_threshold == 0.7
-    assert cfg.pending_threshold_dynamic is True
-    assert cfg.pending_dynamic_band == 0.2
     assert cfg.offloading_in_threshold == 0.5
     assert cfg.offloading_out_threshold == 0.7
     assert cfg.adaptive_batching_min_throughput_ratio == 0.9
@@ -37,7 +35,6 @@ def test_defaults_match_phase_a_v2_plan():
     ("field", "value"),
     [
         ("num_warmup_chunks", 0),
-        ("tpot_bucket_size", 0),
         ("tpot_ema_alpha", 0.0),
         ("tpot_ema_alpha", 1.1),
         ("critical_threshold", -0.1),

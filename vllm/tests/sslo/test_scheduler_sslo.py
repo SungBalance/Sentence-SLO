@@ -25,11 +25,14 @@ def make_state(
     # underlying state to land in the requested phase.
     if phase == Phase.PREFILL:
         state.decoding_start_ts = None
+        state.next_deadline_ts = None
     else:
         state.decoding_start_ts = 0.0
+        # next_deadline_ts is absolute; with decoding_start_ts=0.0,
+        # passing `deadline=10` means deadline_ts = 10.
+        state.next_deadline_ts = float(deadline)
         if phase == Phase.MEASURED:
             state.chunks_completed = max(state.num_warmup_chunks, 1)
-    state.cumulative_consume_time = deadline
     state.chunk_expected_len = expected_len
     state.current_chunk_generated_len = generated
     return state
@@ -89,12 +92,9 @@ def make_scheduler(
         req.request_id: req
         for req in scheduler.running + scheduler.sslo_pending
     }
-    # Default fixture pins pending_policy="hysteresis" so existing tests
-    # exercise the threshold-based placement. Pass cfg explicitly to
-    # opt into other policies (e.g., "llf").
-    scheduler.sslo_config = cfg or SsloConfig(
-        enabled=True, pending_policy="hysteresis",
-        pending_threshold_dynamic=False)
+    # Default fixture: SsloConfig with hysteresis placement (in/out
+    # thresholds 0.3 / 0.7). Pass `cfg=...` to override.
+    scheduler.sslo_config = cfg or SsloConfig(method="sslo")
     scheduler.tpot_ema = {max_num_running_reqs: 1.0}
     scheduler._sslo_wall_step_ema_s = 1.0
     scheduler.sslo_offloaded = set()
@@ -134,6 +134,9 @@ def make_scheduler(
     scheduler.log_stats = False
     scheduler.scheduler_config = SimpleNamespace(async_scheduling=False)
     scheduler._update_after_schedule = lambda output: None
+    # SSLO: __init__ normally patches _apply_sslo_policy based on
+    # (method, policy); tests bypass __init__ via __new__, so do it here.
+    scheduler._apply_sslo_policy = scheduler._resolve_sslo_policy_dispatch()
     return scheduler
 
 
@@ -143,7 +146,7 @@ def request_ids(reqs):
 
 def test_tpot_ema_update_only_multiple_bucket_and_decoding_only():
     scheduler = make_scheduler(max_num_running_reqs=8)
-    scheduler.sslo_config = SsloConfig(enabled=True, tpot_ema_alpha=0.5)
+    scheduler.sslo_config = SsloConfig(method="sslo", tpot_ema_alpha=0.5)
     scheduler._sslo_prev_step_batch = 7
     scheduler._sslo_prev_step_decoding_only = True
     scheduler._sslo_prev_step_start_ts = 1.0
@@ -254,8 +257,7 @@ def test_non_critical_hysteresis_keeps_state_in_band():
     # where it was. The default config now collapses the band to a single
     # point (0.8/0.8), so this test pins the original thresholds.
     cfg = SsloConfig(
-        enabled=True, pending_in_threshold=0.3, pending_out_threshold=0.7,
-        pending_threshold_dynamic=False)
+        method="sslo", pending_in_threshold=0.3, pending_out_threshold=0.7)
     pending = make_request("pending", make_state(deadline=10, expected_len=5))
     running = make_request("running", make_state(deadline=10, expected_len=5))
     scheduler = make_scheduler(running=[running], pending=[pending],
@@ -286,7 +288,7 @@ def test_cap_overflow_priority_sort():
     # case where one request hits in_threshold and gets demoted before
     # overflow occurs.
     cfg = SsloConfig(
-        enabled=True, pending_in_threshold=0.3, pending_out_threshold=0.7)
+        method="sslo", pending_in_threshold=0.3, pending_out_threshold=0.7)
     low = make_request("low", make_state(deadline=10, expected_len=4))
     high = make_request("high", make_state(deadline=10, expected_len=6))
     warm = make_request("warm", make_state(phase=Phase.WARMUP))
@@ -330,7 +332,7 @@ def test_no_waiting_backfills_pending_by_priority():
 
 
 def test_offload_eligibility_excludes_warmup_critical_offloaded():
-    cfg = SsloConfig(enabled=True, offloading=True)
+    cfg = SsloConfig(method="sslo", offloading=True)
     warm = make_request("warm", make_state(phase=Phase.WARMUP))
     critical = make_request("critical", make_state(deadline=1, expected_len=10))
     offloaded = make_request("offloaded", make_state(deadline=10, expected_len=1))
@@ -351,7 +353,7 @@ def test_offloaded_score_includes_transfer_cost():
 
 
 def test_reload_trigger_at_offloading_out_threshold():
-    cfg = SsloConfig(enabled=True, offloading=True,
+    cfg = SsloConfig(method="sslo", offloading=True,
                      offloading_out_threshold=0.7)
     req = make_request("r", make_state(deadline=10, expected_len=7))
     scheduler = make_scheduler(pending=[req], cfg=cfg)
@@ -360,11 +362,11 @@ def test_reload_trigger_at_offloading_out_threshold():
     scheduler._reload_check(0.0)
 
     assert "r" not in scheduler.sslo_offloaded
-    assert req.slo_state.is_offloaded is False
+    assert req.slo_state.offload_enter_ts is None
 
 
 def test_offload_blocked_in_critical_mode():
-    cfg = SsloConfig(enabled=True, offloading=True)
+    cfg = SsloConfig(method="sslo", offloading=True)
     req = make_request("r", make_state(deadline=10, expected_len=1))
     scheduler = make_scheduler(pending=[req], cfg=cfg)
     scheduler._sslo_step.has_critical = True
@@ -384,7 +386,7 @@ def test_offloaded_pending_not_promoted_before_reload():
 
 
 def test_offloaded_critical_reloads_before_policy_placement():
-    cfg = SsloConfig(enabled=True, offloading=True,
+    cfg = SsloConfig(method="sslo", offloading=True,
                      offloading_out_threshold=0.7)
     req = make_request("r", make_state(deadline=1, expected_len=2))
     req.slo_state.on_offload_enter(0.0)
@@ -400,7 +402,7 @@ def test_offloaded_critical_reloads_before_policy_placement():
 
 def test_offload_marks_only_phase_a_v2():
     # Phase A v2: offload is bookkeeping only. No KV transfer, no recompute.
-    cfg = SsloConfig(enabled=True, offloading=True)
+    cfg = SsloConfig(method="sslo", offloading=True)
     req = make_request("r", make_state(deadline=10, expected_len=1))
     req.num_computed_tokens = 5
     scheduler = make_scheduler(pending=[req], cfg=cfg)
@@ -408,7 +410,7 @@ def test_offload_marks_only_phase_a_v2():
     scheduler._offload(req, 1.0)
 
     assert "r" in scheduler.sslo_offloaded
-    assert req.slo_state.is_offloaded is True
+    assert req.slo_state.offload_enter_ts is not None
     # Marking only — original KV / num_computed_tokens preserved.
     assert req.num_computed_tokens == 5
     assert scheduler.slo_state_offload_enter_ts_set if False else True
@@ -430,7 +432,7 @@ def test_adaptive_n_picks_largest_resolving_critical():
     # Pick the LARGEST profiled bucket below base_n that resolves all
     # critical. base_n=32, ema covers {8, 16, 24}. Score at each:
     # remaining*tpot / time_to_deadline = 2*tpot / 1.
-    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    cfg = SsloConfig(method="sslo", adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=2))
     scheduler = make_scheduler(running=[req], max_num_running_reqs=32, cfg=cfg)
     scheduler.tpot_ema = {32: 1.0, 24: 0.2, 16: 0.4, 8: 0.8}
@@ -442,7 +444,7 @@ def test_adaptive_n_picks_largest_resolving_critical():
 
 
 def test_adaptive_n_minimizes_worst_score_when_unresolvable():
-    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    cfg = SsloConfig(method="sslo", adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=20))
     scheduler = make_scheduler(running=[req], max_num_running_reqs=32, cfg=cfg)
     # No bucket can resolve (every pressure ≥ 1.0). Pick the one with the
@@ -457,7 +459,7 @@ def test_adaptive_n_respects_throughput_floor():
     # Profiled bucket 16 has throughput 16/100 = 0.16 vs base 32/1.0 = 32.
     # Ratio 0.005 < 0.9 min_throughput_ratio → bucket 16 excluded from
     # candidates. No other profiled bucket below base → returns None.
-    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    cfg = SsloConfig(method="sslo", adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=2))
     scheduler = make_scheduler(running=[req], max_num_running_reqs=32, cfg=cfg)
     scheduler.tpot_ema = {32: 1.0, 16: 100.0}
@@ -470,7 +472,7 @@ def test_adaptive_n_at_least_num_critical():
     # 10 critical requests → n_critical=10 floors the cap. Profiled
     # buckets {8, 16, 24} below base_n=32; 8 < 10 (floor) so excluded.
     # Largest remaining that resolves: 24 has tpot=0.2 → pressure=0.4 < 1.
-    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    cfg = SsloConfig(method="sslo", adaptive_batching=True)
     reqs = [
         make_request(f"r{i}", make_state(deadline=1, expected_len=2))
         for i in range(10)
@@ -485,7 +487,7 @@ def test_adaptive_n_at_least_num_critical():
 def test_adaptive_n_returns_none_when_only_base_profiled():
     # No sub-base profile data → cascading fallback finds nothing →
     # returns None (caller falls through to base_n cap).
-    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    cfg = SsloConfig(method="sslo", adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=2))
     scheduler = make_scheduler(running=[req], max_num_running_reqs=64, cfg=cfg)
     scheduler.tpot_ema = {64: 1.0}
@@ -498,7 +500,7 @@ def test_adaptive_n_cascades_through_unprofiled_buckets():
     # 8-step-down cascade: base_n=64. Only 24 and 48 are profiled below
     # base. 56, 40, 32, 16 unprofiled — must skip past them and pick the
     # largest profiled that resolves: 48.
-    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    cfg = SsloConfig(method="sslo", adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=2))
     scheduler = make_scheduler(running=[req], max_num_running_reqs=64, cfg=cfg)
     scheduler.tpot_ema = {64: 1.0, 48: 0.4, 24: 0.2}
@@ -512,7 +514,7 @@ def test_adaptive_n_low_cap_throughput_floor():
     # 0.125 < 0.25 low_cap_ratio → low_cap pushes the floor above 16.
     # Bucket 32 has throughput 32/0.6 ≈ 53.3 vs base 64 → ratio 0.83 ≥
     # 0.25, so low_cap = 32. Adaptive must not pick anything below 32.
-    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    cfg = SsloConfig(method="sslo", adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=2))
     scheduler = make_scheduler(running=[req], max_num_running_reqs=64, cfg=cfg)
     scheduler.tpot_ema = {64: 1.0, 32: 0.6, 16: 2.0}
@@ -526,7 +528,7 @@ def test_active_cap_resets_each_step():
     # First step shrinks the cap; the second step starts from a freshly
     # reset SsloStepState (active_cap = max_num_running_reqs) before the
     # policy logic runs.
-    cfg = SsloConfig(enabled=True, adaptive_batching=True)
+    cfg = SsloConfig(method="sslo", adaptive_batching=True)
     req = make_request("critical", make_state(deadline=1, expected_len=2))
     scheduler = make_scheduler(running=[req], max_num_running_reqs=32, cfg=cfg)
     scheduler.tpot_ema = {32: 1.0, 24: 0.2}
@@ -548,10 +550,9 @@ def test_active_cap_resets_each_step():
 # ---------------------------------------------------------------------------
 
 def _make_v2_scheduler(**kwargs):
-    """Helper: make_scheduler pre-configured with enable_v2=True.
-    pending_policy is irrelevant when v2 dispatches."""
+    """Helper: make_scheduler pre-configured with policy="pressure"."""
     cfg = kwargs.pop("cfg", None) or SsloConfig(
-        enabled=True, enable_v2=True, pending_threshold_dynamic=False)
+        method="sslo", policy="pressure")
     return make_scheduler(cfg=cfg, **kwargs)
 
 
@@ -563,7 +564,7 @@ def test_v2_critical_mode_top_cap_to_running():
     lo = make_request("lo", make_state(deadline=10.0, expected_len=5.0))
     scheduler = _make_v2_scheduler(running=[hi, mid, lo], max_num_running_reqs=2)
 
-    scheduler._apply_sslo_policy_v2(0.0)
+    scheduler._apply_sslo_policy(0.0)
 
     assert scheduler._sslo_step.has_critical is True
     assert scheduler._sslo_step.waiting_admission_budget == 0
@@ -584,7 +585,7 @@ def test_v2_non_critical_demand_room_admission():
     scheduler = _make_v2_scheduler(running=reqs, max_num_running_reqs=4)
     scheduler.waiting = [object()] * 10
 
-    scheduler._apply_sslo_policy_v2(0.0)
+    scheduler._apply_sslo_policy(0.0)
 
     assert scheduler._sslo_step.has_critical is False
     assert scheduler._sslo_step.waiting_admission_budget == 2
@@ -608,7 +609,7 @@ def test_v2_warmup_contributes_one_to_demand_and_sorts_top():
         running=warmups + measured, max_num_running_reqs=4)
     scheduler.waiting = [object()] * 10
 
-    scheduler._apply_sslo_policy_v2(0.0)
+    scheduler._apply_sslo_policy(0.0)
 
     assert scheduler._sslo_step.has_critical is False
     assert scheduler._sslo_step.waiting_admission_budget == 1
@@ -629,7 +630,7 @@ def test_v2_score_suspend_keeps_state_when_no_tpot():
         running=[r1, r2], pending=[p1], max_num_running_reqs=4)
     scheduler._sslo_wall_step_ema_s = 0.0
 
-    scheduler._apply_sslo_policy_v2(0.0)
+    scheduler._apply_sslo_policy(0.0)
 
     assert scheduler.running == [r1, r2]
     assert scheduler.sslo_pending == [p1]
@@ -644,7 +645,7 @@ def test_v2_score_suspend_waiting_budget_limited_by_waiting_count():
     scheduler._sslo_wall_step_ema_s = 0.0
     scheduler.waiting = [object(), object(), object()]  # 3 waiting
 
-    scheduler._apply_sslo_policy_v2(0.0)
+    scheduler._apply_sslo_policy(0.0)
 
     # M - len(running) = 3 slots; min(3 waiting, 3 slots) = 3
     assert scheduler._sslo_step.waiting_admission_budget == 3
@@ -652,7 +653,7 @@ def test_v2_score_suspend_waiting_budget_limited_by_waiting_count():
 
 def test_v2_offload_set_unused():
     # sslo_offloaded populated externally — v2 does NOT exclude them from
-    # placement by offload logic. After _apply_sslo_policy_v2, sslo_offloaded
+    # placement by offload logic. After _apply_sslo_policy, sslo_offloaded
     # must still be empty (v2 never populates it).
     r1 = make_request("r1", make_state(deadline=10.0, expected_len=20.0))
     r2 = make_request("r2", make_state(deadline=1.0, expected_len=10.0))  # critical
@@ -660,6 +661,6 @@ def test_v2_offload_set_unused():
     # Simulate stale external population — v2 should ignore for its own logic
     scheduler.sslo_offloaded = set()  # v2 starts clean; confirm it stays clean
 
-    scheduler._apply_sslo_policy_v2(0.0)
+    scheduler._apply_sslo_policy(0.0)
 
     assert len(scheduler.sslo_offloaded) == 0

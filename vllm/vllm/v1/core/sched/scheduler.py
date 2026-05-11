@@ -127,11 +127,10 @@ class Scheduler(SchedulerInterface):
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
 
-        if self.sslo_config.enabled:
-            if self.sslo_config.enable_v2:
-                self.schedule = self.schedule_sslo_v2
-            else:
-                self.schedule = self.schedule_sslo
+        # SSLO: always wire schedule_sslo. method="baseline" routes to a
+        # metric-only short-circuit; method="sslo" dispatches by policy.
+        self.schedule = self.schedule_sslo
+        self._apply_sslo_policy = self._resolve_sslo_policy_dispatch()
 
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
@@ -1129,7 +1128,8 @@ class Scheduler(SchedulerInterface):
         )
 
     # SSLO
-    def _apply_sslo_policy(self, now: float) -> dict[str, float | None]:
+    def _apply_sslo_threshold(self, now: float) -> dict[str, float | None]:
+        """SSLO placement using hysteresis (in/out thresholds). Legacy v1."""
         # Reload BEFORE placement so a request whose offloaded_score crossed
         # the reload threshold can compete in this step's placement instead
         # of waiting for the next one.
@@ -1190,7 +1190,7 @@ class Scheduler(SchedulerInterface):
             score_suspend = base_tpot is None
             cands_running, cands_pending = self._classify_non_critical(
                 admitted, pressures, tiers, prev_pending_ids, score_suspend)
-            cap = self._capacity_target(pressures)
+            cap = base_n
             if len(cands_running) > cap:
                 cands_running.sort(
                     key=lambda r: self._admit_priority_key(r, pressures, tiers))
@@ -1212,7 +1212,85 @@ class Scheduler(SchedulerInterface):
         return pressures
 
     # SSLO
-    def _apply_sslo_policy_v2(self, now: float) -> dict[str, float | None]:
+    def _apply_sslo_baseline(
+        self, now: float
+    ) -> dict[str, float | None]:
+        """Baseline mode: emit stats only, skip all SSLO scheduling.
+
+        Keeps self.running / self.sslo_pending as-is and lets the engine's
+        normal admission loop fill running up to max_num_running_reqs.
+        Pressures are computed and recorded for parity with sslo runs.
+        """
+        self._update_tpot_ema(now)
+        self._sslo_step = SsloStepState(active_cap=self.max_num_running_reqs)
+        prev_pending_ids = {req.request_id for req in self.sslo_pending}
+        base_n = self.max_num_running_reqs
+        base_tpot = (
+            self._sslo_wall_step_ema_s
+            if self._sslo_wall_step_ema_s > 0.0 else None)
+        admitted = list(self.running) + list(self.sslo_pending)
+        pressures, tiers = self._compute_pressures(admitted, now, base_tpot)
+        finite = [
+            s for s in pressures.values()
+            if s is not None and s != float("inf")
+        ]
+        if finite:
+            self._sslo_step.avg_score = sum(finite) / len(finite)
+            self._sslo_step.max_score = max(finite)
+        self._sslo_step.has_critical = False
+        self._sslo_step.active_cap = base_n
+        # Vanilla admission: just fill the gap up to max_num_running_reqs.
+        waiting_count = len(self.waiting) + len(self.skipped_waiting)
+        self._sslo_step.waiting_admission_budget = min(
+            waiting_count, max(0, base_n - len(self.running)))
+        new_running = list(self.running)
+        new_pending = list(self.sslo_pending)
+        self.running = new_running
+        self.sslo_pending = new_pending
+        self._fire_pending_lifecycle(prev_pending_ids, new_running, new_pending, now)
+        self._account_per_chunk_step(new_running, new_pending)
+        self._sslo_dump_step_stats(now)
+        return pressures
+
+    # SSLO
+    def _apply_sslo_buffer(self, now: float) -> dict[str, float | None]:
+        """Buffer-based admission policy (placeholder, not yet implemented)."""
+        raise NotImplementedError(
+            "policy='buffer' is reserved but not implemented yet")
+
+    # SSLO
+    def _apply_sslo_combined(self, now: float) -> dict[str, float | None]:
+        """Combined admission policy (placeholder, not yet implemented)."""
+        raise NotImplementedError(
+            "policy='combined' is reserved but not implemented yet")
+
+    # SSLO
+    def _resolve_sslo_policy_dispatch(self):
+        """Pick the per-step placement function once at construction time.
+
+        method=='baseline' → _apply_sslo_baseline (placement skipped).
+        method=='sslo'     → policy chooses the algorithm:
+            'threshold' → _apply_sslo_threshold (legacy v1 hysteresis)
+            'pressure'  → _apply_sslo_pressure  (legacy v2)
+            'buffer'    → _apply_sslo_buffer    (placeholder)
+            'combined'  → _apply_sslo_combined  (placeholder)
+        """
+        if self.sslo_config.method == "baseline":
+            return self._apply_sslo_baseline
+        policy = self.sslo_config.policy
+        dispatch = {
+            "threshold": self._apply_sslo_threshold,
+            "pressure": self._apply_sslo_pressure,
+            "buffer": self._apply_sslo_buffer,
+            "combined": self._apply_sslo_combined,
+        }
+        if policy not in dispatch:
+            raise ValueError(
+                f"unsupported policy={policy!r} for method='sslo'")
+        return dispatch[policy]
+
+    # SSLO
+    def _apply_sslo_pressure(self, now: float) -> dict[str, float | None]:
         """Pressure-budget admission policy (no offload). Three branches:
         score-suspend, critical, and non-critical."""
         self._update_tpot_ema(now)
@@ -1330,64 +1408,6 @@ class Scheduler(SchedulerInterface):
         return pressures, tiers
 
     # SSLO
-    def _pending_thresholds(
-        self,
-        pressures: dict[str, float | None],
-    ) -> tuple[float, float]:
-        """Resolve per-step (in, out) thresholds.
-
-        Static mode: returns the configured constants.
-        Dynamic mode: tracks a load pressure derived from the running pool
-        (combined × avg_score_running / max_num_seqs) and uses it as the
-        in threshold; out = in + band. Falls back to the static values
-        when no measured-phase running request has a pressure yet.
-        """
-        in_static = self.sslo_config.pending_in_threshold
-        out_static = self.sslo_config.pending_out_threshold
-        if not self.sslo_config.pending_threshold_dynamic:
-            return in_static, out_static
-        running_pressures = [
-            pressures[r.request_id] for r in self.running
-            if pressures.get(r.request_id) is not None
-            and pressures[r.request_id] != float("inf")
-        ]
-        if not running_pressures:
-            return in_static, out_static
-        avg_running = sum(running_pressures) / len(running_pressures)
-        combined = len(self.running) + len(self.sslo_pending)
-        pressure = combined * avg_running / max(1, self.max_num_running_reqs)
-        pressure = max(0.0, min(1.0, pressure))
-        band = self.sslo_config.pending_dynamic_band
-        # Floor at static values so dynamic only ever tightens, never
-        # relaxes below the operator-chosen safety margin.
-        in_thr = max(in_static, pressure)
-        out_thr = max(out_static, min(1.0, in_thr + band))
-        return in_thr, out_thr
-
-    # SSLO
-    def _capacity_target(self, pressures: dict[str, float | None]) -> int:
-        """Per-step running-pool target. Returns max_num_running_reqs
-        unless capacity-control is enabled, in which case the pool is
-        capped at N / mean(admitted_pressures) so the active count
-        shrinks under overload (mean pressure > 1) and stays at N when
-        the system has slack. Floor at tpot_bucket_size to keep the
-        cap CUDA-graph-aligned.
-        """
-        base_n = self.max_num_running_reqs
-        if not self.sslo_config.pending_capacity_control:
-            return base_n
-        finite = [
-            p for p in pressures.values()
-            if p is not None and p != float("inf") and p > 0
-        ]
-        if not finite:
-            return base_n
-        avg_p = sum(finite) / len(finite)
-        bucket = self.sslo_config.tpot_bucket_size
-        target = int(base_n / avg_p)
-        return max(bucket, min(base_n, target))
-
-    # SSLO
     def _classify_non_critical(
         self,
         admitted: list[Request],
@@ -1398,10 +1418,8 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[list[Request], list[Request]]:
         if score_suspend:
             return list(self.running), list(self.sslo_pending)
-        if self.sslo_config.pending_policy == "llf":
-            return self._classify_non_critical_llf(
-                admitted, pressures, tiers)
-        in_thr, out_thr = self._pending_thresholds(pressures)
+        in_thr = self.sslo_config.pending_in_threshold
+        out_thr = self.sslo_config.pending_out_threshold
         cands_running: list[Request] = []
         cands_pending: list[Request] = []
         for req in admitted:
@@ -1422,45 +1440,6 @@ class Scheduler(SchedulerInterface):
                 cands_pending.append(req)
             else:
                 cands_running.append(req)
-        return cands_running, cands_pending
-
-    # SSLO
-    def _classify_non_critical_llf(
-        self,
-        admitted: list[Request],
-        pressures: dict[str, float | None],
-        tiers: dict[str, int],
-    ) -> tuple[list[Request], list[Request]]:
-        """Least-laxity-first placement: rank admitted by pressure
-        descending and take the top max_num_running_reqs into running.
-        Warmup-tier requests (no pressure yet) go to running ahead of
-        anyone else. Offloaded requests stay parked. No hysteresis.
-        """
-        warm: list[Request] = []
-        ranked: list[tuple[float, Request]] = []
-        offloaded: list[Request] = []
-        for req in admitted:
-            if req.request_id in self.sslo_offloaded:
-                offloaded.append(req)
-                continue
-            tier = tiers[req.request_id]
-            if tier == 1:
-                warm.append(req)
-                continue
-            p = pressures[req.request_id]
-            # Unknown pressure → key 0.0 (lowest priority). +inf naturally
-            # dominates the sort because we negate.
-            key = -float(p) if p is not None else 0.0
-            ranked.append((key, req))
-        ranked.sort(key=lambda kr: kr[0])
-        cap = self.max_num_running_reqs
-        cands_running: list[Request] = list(warm)
-        cands_pending: list[Request] = list(offloaded)
-        for _, req in ranked:
-            if len(cands_running) < cap:
-                cands_running.append(req)
-            else:
-                cands_pending.append(req)
         return cands_running, cands_pending
 
     # SSLO
@@ -1516,7 +1495,7 @@ class Scheduler(SchedulerInterface):
             "running": len(self.running),
             "pending": len(self.sslo_pending),
             "offloaded": len(self.sslo_offloaded),
-            "combined": len(self.running) + len(self.sslo_pending),
+            "num_handling_users": len(self.running) + len(self.sslo_pending),
             "waiting": len(self.waiting) + len(self.skipped_waiting),
             "active_cap": self._sslo_step.active_cap,
             "has_critical": self._sslo_step.has_critical,
@@ -1854,658 +1833,8 @@ class Scheduler(SchedulerInterface):
             for req in self.running + self.sslo_pending
         }
 
-        # SSLO
+        # SSLO: dispatcher patched in __init__ based on (method, policy).
         sslo_scores = self._apply_sslo_policy(scheduled_timestamp)
-
-        self.kv_cache_manager.new_step_starts()
-
-        # First, schedule the RUNNING requests.
-        req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
-            request = self.running[req_index]
-            # SSLO: request.slo_state.cumulative_slack is available here if slo_state is set
-
-            if (
-                request.num_output_placeholders > 0
-                # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
-                # Since output placeholders are also included in the computed tokens
-                # count, we subtract (num_output_placeholders - 1) to remove any draft
-                # tokens, so that we can be sure no further steps are needed even if
-                # they are all rejected.
-                and request.num_computed_tokens + 2 - request.num_output_placeholders
-                >= request.num_prompt_tokens + request.max_tokens
-            ):
-                # Async scheduling: Avoid scheduling an extra step when we are sure that
-                # the previous step has reached request.max_tokens. We don't schedule
-                # partial draft tokens since this prevents uniform decode optimizations.
-                req_index += 1
-                continue
-
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
-
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
-            )
-
-            # Schedule encoder inputs.
-            encoder_inputs_to_schedule = None
-            external_load_encoder_input: list[int] = []
-            new_encoder_compute_budget = encoder_compute_budget
-            if request.has_encoder_inputs:
-                (
-                    encoder_inputs_to_schedule,
-                    num_new_tokens,
-                    new_encoder_compute_budget,
-                    external_load_encoder_input,
-                ) = self._try_schedule_encoder_inputs(
-                    request,
-                    request.num_computed_tokens,
-                    num_new_tokens,
-                    encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
-                )
-
-            if self.need_mamba_block_aligned_split:
-                num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
-                )
-
-            if num_new_tokens == 0:
-                # The request cannot be scheduled because one of the following
-                # reasons:
-                # 1. No new tokens to schedule. This may happen when
-                #    (1) PP>1 and we have already scheduled all prompt tokens
-                #    but they are not finished yet.
-                #    (2) Async scheduling and the request has reached to either
-                #    its max_total_tokens or max_model_len.
-                # 2. The encoder budget is exhausted.
-                # 3. The encoder cache is exhausted.
-                # 4. Insufficient budget for a block-aligned chunk in hybrid
-                #    models with mamba cache mode \"align\".
-                # NOTE(woosuk): Here, by doing `continue` instead of `break`,
-                # we do not strictly follow the FCFS scheduling policy and
-                # allow the lower-priority requests to be scheduled.
-                req_index += 1
-                continue
-
-            # Schedule newly needed KV blocks for the request.
-            with record_function_or_nullcontext("schedule: allocate_slots"):
-                while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
-                    )
-
-                    if new_blocks is not None:
-                        # The request can be scheduled.
-                        break
-
-                    # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                        self.running.remove(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
-                            )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
-                    else:
-                        preempted_req = self.running.pop()
-
-                    self._preempt_request(preempted_req, scheduled_timestamp)
-                    preempted_reqs.append(preempted_req)
-                    if preempted_req == request:
-                        # No more request to preempt. Cannot schedule this request.
-                        break
-
-            if new_blocks is None:
-                # Cannot schedule this request.
-                break
-
-            # Schedule the request.
-            scheduled_running_reqs.append(request)
-            request_id = request.request_id
-            req_to_new_blocks[request_id] = new_blocks
-            num_scheduled_tokens[request_id] = num_new_tokens
-            token_budget -= num_new_tokens
-            req_index += 1
-
-            # Speculative decode related.
-            if request.spec_token_ids:
-                num_scheduled_spec_tokens = (
-                    num_new_tokens
-                    + request.num_computed_tokens
-                    - request.num_tokens
-                    - request.num_output_placeholders
-                )
-                if num_scheduled_spec_tokens > 0:
-                    spec_token_ids = request.spec_token_ids
-                    if len(spec_token_ids) > num_scheduled_spec_tokens:
-                        spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
-                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
-
-                # New spec tokens will be set in `update_draft_token_ids` before the
-                # next step when applicable.
-                request.spec_token_ids = []
-
-            # Encoder-related.
-            if encoder_inputs_to_schedule:
-                scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
-                # Allocate the encoder cache.
-                for i in encoder_inputs_to_schedule:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
-                encoder_compute_budget = new_encoder_compute_budget
-            if external_load_encoder_input:
-                for i in external_load_encoder_input:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
-
-        # Record the LoRAs in scheduled_running_reqs
-        scheduled_loras: set[int] = set()
-        if self.lora_config:
-            scheduled_loras = set(
-                req.lora_request.lora_int_id
-                for req in scheduled_running_reqs
-                if req.lora_request and req.lora_request.lora_int_id > 0
-            )
-            assert len(scheduled_loras) <= self.lora_config.max_loras
-
-        # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
-            # SSLO: budget-driven admission (computed in _apply_sslo_policy).
-            sslo_admit_remaining = self._sslo_step.waiting_admission_budget
-
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                # SSLO
-                if self._sslo_step.has_critical:
-                    break
-                if len(self.running) == self.max_num_running_reqs:
-                    break
-                # SSLO: stop when this step's admission budget is exhausted.
-                if sslo_admit_remaining <= 0:
-                    break
-
-                request_queue = self._select_waiting_queue_for_scheduling()
-                assert request_queue is not None
-
-                request = request_queue.peek_request()
-                request_id = request.request_id
-
-                # try to promote blocked statuses while traversing skipped queue.
-                if self._is_blocked_waiting_status(
-                    request.status
-                ) and not self._try_promote_blocked_waiting_request(request):
-                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                        logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request_id,
-                        )
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
-
-                # Check that adding the request still respects the max_loras
-                # constraint.
-                if (
-                    self.lora_config
-                    and request.lora_request
-                    and (
-                        len(scheduled_loras) == self.lora_config.max_loras
-                        and request.lora_request.lora_int_id not in scheduled_loras
-                    )
-                ):
-                    # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
-
-                num_external_computed_tokens = 0
-                load_kv_async = False
-                connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
-
-                # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
-                    # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
-
-                    # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, num_new_local_computed_tokens
-                            )
-                        )
-
-                        if ext_tokens is None:
-                            # The request cannot be scheduled because
-                            # the KVConnector couldn't determine
-                            # the number of matched tokens.
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
-                            continue
-
-                        num_external_computed_tokens = ext_tokens
-
-                        connector_prefix_cache_queries = (
-                            request.num_tokens - num_new_local_computed_tokens
-                        )
-                        connector_prefix_cache_hits = num_external_computed_tokens
-
-                    # Total computed tokens (local + external).
-                    num_computed_tokens = (
-                        num_new_local_computed_tokens + num_external_computed_tokens
-                    )
-                    assert num_computed_tokens <= request.num_tokens
-
-                    # Track first scheduled prefill, not post-preemption repeat prefills
-                    if request.prefill_stats is not None:
-                        assert num_computed_tokens <= request.num_prompt_tokens
-                        request.prefill_stats.set(
-                            num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
-                        )
-                else:
-                    # KVTransfer: WAITING reqs have num_computed_tokens > 0
-                    # after async KV recvs are completed.
-                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
-                    num_new_local_computed_tokens = 0
-                    num_computed_tokens = request.num_computed_tokens
-
-                encoder_inputs_to_schedule = None
-                external_load_encoder_input = []
-                new_encoder_compute_budget = encoder_compute_budget
-
-                if load_kv_async:
-                    # KVTransfer: loading remote KV, do not allocate for new work.
-                    assert num_external_computed_tokens > 0
-                    num_new_tokens = 0
-                else:
-                    # Number of tokens to be scheduled.
-                    # We use `request.num_tokens` instead of
-                    # `request.num_prompt_tokens` to consider the resumed
-                    # requests, which have output tokens.
-                    num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
-
-                    # chunked prefill has to be enabled explicitly to allow
-                    # pooling requests to be chunked
-                    if (
-                        not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens > token_budget
-                    ):
-                        # If chunked_prefill is disabled,
-                        # we can stop the scheduling here.
-                        break
-
-                    num_new_tokens = min(num_new_tokens, token_budget)
-                    assert num_new_tokens > 0
-
-                    # Schedule encoder inputs.
-                    if request.has_encoder_inputs:
-                        (
-                            encoder_inputs_to_schedule,
-                            num_new_tokens,
-                            new_encoder_compute_budget,
-                            external_load_encoder_input,
-                        ) = self._try_schedule_encoder_inputs(
-                            request,
-                            num_computed_tokens,
-                            num_new_tokens,
-                            encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
-                        )
-                        if num_new_tokens == 0:
-                            # The request cannot be scheduled.
-                            break
-
-                if self.need_mamba_block_aligned_split:
-                    num_new_tokens = self._mamba_block_aligned_split(
-                        request,
-                        num_new_tokens,
-                        num_new_local_computed_tokens,
-                        num_external_computed_tokens,
-                    )
-                    if num_new_tokens == 0:
-                        break
-
-                # Handles an edge case when P/D Disaggregation
-                # is used with Spec Decoding where an
-                # extra block gets allocated which
-                # creates a mismatch between the number
-                # of local and remote blocks.
-                effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
-                )
-
-                # Determine if we need to allocate cross-attention blocks.
-                num_encoder_tokens = 0
-                if (
-                    self.is_encoder_decoder
-                    and request.has_encoder_inputs
-                    and encoder_inputs_to_schedule
-                ):
-                    num_encoder_tokens = sum(
-                        request.get_num_encoder_embeds(i)
-                        for i in encoder_inputs_to_schedule
-                    )
-
-                if (
-                    self.scheduler_reserve_full_isl
-                    and not self.kv_cache_manager.can_fit_full_sequence(
-                        request,
-                        num_new_computed_tokens=num_new_local_computed_tokens,
-                        new_computed_blocks=new_computed_blocks,
-                        num_external_computed_tokens=num_external_computed_tokens,
-                        num_encoder_tokens=num_encoder_tokens,
-                    )
-                ):
-                    if request.has_encoder_inputs:
-                        self.encoder_cache_manager.free(request)
-                    break
-
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                )
-
-                if new_blocks is None:
-                    # The request cannot be scheduled.
-
-                    # NOTE: we need to untouch the request from the encode cache
-                    # manager
-                    if request.has_encoder_inputs:
-                        self.encoder_cache_manager.free(request)
-                    # SSLO: pass precomputed pressures to avoid recomputing them
-                    victim = self._pick_offload_victim(
-                        scheduled_timestamp, sslo_scores)
-                    # SSLO
-                    if victim is not None:
-                        # SSLO
-                        self._offload(victim, scheduled_timestamp)
-                        # SSLO
-                        continue
-                    break
-
-                # KVTransfer: the connector uses this info to determine
-                # if a load is needed. Note that
-                # This information is used to determine if a load is
-                # needed for this request.
-                if self.connector is not None:
-                    self.connector.update_state_after_alloc(
-                        request,
-                        self.kv_cache_manager.get_blocks(request_id),
-                        num_external_computed_tokens,
-                    )
-                    if (
-                        self.connector_prefix_cache_stats is not None
-                        and connector_prefix_cache_queries != 0
-                    ):
-                        self.connector_prefix_cache_stats.record(
-                            num_tokens=connector_prefix_cache_queries,
-                            num_hits=connector_prefix_cache_hits,
-                            preempted=request.num_preemptions > 0,
-                        )
-
-                request = request_queue.pop_request()
-                if load_kv_async:
-                    # If loading async, allocate memory and put request
-                    # into the WAITING_FOR_REMOTE_KV state.
-                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-                    step_skipped_waiting.prepend_request(request)
-                    # Set num_computed_tokens even though KVs are not yet loaded.
-                    # request.num_computed_tokens will not be used anywhere until
-                    # the request finished the KV transfer.
-                    #
-                    # If a transfer error is reported by the connector,
-                    # request.num_computed_tokens will be re-set accordingly in
-                    # _update_requests_with_invalid_blocks.
-                    #
-                    # When the transfer is finished, either successfully or not,
-                    # request.num_computed_tokens will correctly reflect the number
-                    # of computed tokens.
-                    # _update_waiting_for_remote_kv will then cache
-                    # only the successfully loaded tokens.
-                    request.num_computed_tokens = num_computed_tokens
-                    continue
-
-                self.running.append(request)
-                # SSLO: count successful admission against this step's budget.
-                sslo_admit_remaining -= 1
-                if self.log_stats:
-                    request.record_event(
-                        EngineCoreEventType.SCHEDULED, scheduled_timestamp
-                    )
-                if request.status == RequestStatus.WAITING:
-                    scheduled_new_reqs.append(request)
-                elif request.status == RequestStatus.PREEMPTED:
-                    scheduled_resumed_reqs.append(request)
-                else:
-                    raise RuntimeError(f"Invalid request status: {request.status}")
-
-                if self.lora_config and request.lora_request:
-                    scheduled_loras.add(request.lora_request.lora_int_id)
-                req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
-                    request_id
-                )
-                num_scheduled_tokens[request_id] = num_new_tokens
-                token_budget -= num_new_tokens
-                request.status = RequestStatus.RUNNING
-                request.num_computed_tokens = num_computed_tokens
-                # Encoder-related.
-                if encoder_inputs_to_schedule:
-                    scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
-                    # Allocate the encoder cache.
-                    for i in encoder_inputs_to_schedule:
-                        self.encoder_cache_manager.allocate(request, i)
-                        if self.ec_connector is not None:
-                            self.ec_connector.update_state_after_alloc(request, i)
-                    encoder_compute_budget = new_encoder_compute_budget
-                # Allocate for external load encoder cache
-                if external_load_encoder_input:
-                    for i in external_load_encoder_input:
-                        self.encoder_cache_manager.allocate(request, i)
-                        if self.ec_connector is not None:
-                            self.ec_connector.update_state_after_alloc(request, i)
-
-            # re-queue requests skipped in this pass ahead of older skipped items.
-            if step_skipped_waiting:
-                self.skipped_waiting.prepend_requests(step_skipped_waiting)
-
-        # SSLO: pending-backfill happens inside _apply_sslo_policy (BEFORE
-        # the running loop) so backfilled requests get tokens this step and
-        # batch size stays at cap in non-adaptive mode.
-
-        # SSLO: _reload_check already runs at the head of _apply_sslo_policy
-        # so reloaded requests participate in this step's placement.
-
-        # Check if the scheduling constraints are satisfied.
-        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
-
-        assert token_budget >= 0
-        assert len(self.running) <= self._sslo_step.active_cap
-        # Since some requests in the RUNNING queue may not be scheduled in
-        # this step, the total number of scheduled requests can be smaller than
-        # len(self.running).
-        assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
-            scheduled_running_reqs
-        ) <= len(self.running)
-
-        # Get the longest common prefix among all requests in the running queue.
-        # This can be potentially used for cascade attention.
-        num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
-        with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
-            if self.running:
-                any_request_id = self.running[0].request_id
-                num_common_prefix_blocks = (
-                    self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
-                )
-
-        # Construct the scheduler output.
-        if self.use_v2_model_runner:
-            scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
-            scheduled_resumed_reqs = []
-            new_reqs_data = [
-                NewRequestData.from_request(
-                    req,
-                    req_to_new_blocks[req.request_id].get_block_ids(),
-                    req._all_token_ids,
-                )
-                for req in scheduled_new_reqs
-            ]
-        else:
-            new_reqs_data = [
-                NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
-                )
-                for req in scheduled_new_reqs
-            ]
-
-        with record_function_or_nullcontext("schedule: make_cached_request_data"):
-            cached_reqs_data = self._make_cached_request_data(
-                scheduled_running_reqs,
-                scheduled_resumed_reqs,
-                num_scheduled_tokens,
-                scheduled_spec_decode_tokens,
-                req_to_new_blocks,
-            )
-
-        # Record the request ids that were scheduled in this step.
-        self.prev_step_scheduled_req_ids.clear()
-        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
-
-        new_block_ids_to_zero = (
-            (self.kv_cache_manager.take_new_block_ids() or None)
-            if self.needs_kv_cache_zeroing
-            else None
-        )
-
-        scheduler_output = SchedulerOutput(
-            scheduled_new_reqs=new_reqs_data,
-            scheduled_cached_reqs=cached_reqs_data,
-            num_scheduled_tokens=num_scheduled_tokens,
-            total_num_scheduled_tokens=total_num_scheduled_tokens,
-            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-            scheduled_encoder_inputs=scheduled_encoder_inputs,
-            num_common_prefix_blocks=num_common_prefix_blocks,
-            preempted_req_ids={req.request_id for req in preempted_reqs},
-            # finished_req_ids is an existing state in the scheduler,
-            # instead of being newly scheduled in this step.
-            # It contains the request IDs that are finished in between
-            # the previous and the current steps.
-            finished_req_ids=self.finished_req_ids,
-            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
-            new_block_ids_to_zero=new_block_ids_to_zero,
-        )
-
-        # NOTE(Kuntai): this function is designed for multiple purposes:
-        # 1. Plan the KV cache store
-        # 2. Wrap up all the KV cache load / save ops into an opaque object
-        # 3. Clear the internal states of the connector
-        if self.connector is not None:
-            meta = self._build_kv_connector_meta(self.connector, scheduler_output)
-            scheduler_output.kv_connector_metadata = meta
-
-        # Build the connector meta for ECConnector
-        if self.ec_connector is not None:
-            ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
-                scheduler_output
-            )
-            scheduler_output.ec_connector_metadata = ec_meta
-
-        # SSLO
-        self._record_step_for_next_ema(scheduler_output, scheduled_timestamp)
-
-        with record_function_or_nullcontext("schedule: update_after_schedule"):
-            self._update_after_schedule(scheduler_output)
-        return scheduler_output
-
-    # SSLO
-    def schedule_sslo_v2(self) -> SchedulerOutput:
-        """schedule_sslo variant that uses _apply_sslo_policy_v2 for placement."""
-        # NOTE(woosuk) on the scheduling algorithm:
-        # There's no "decoding phase" nor "prefill phase" in the scheduler.
-        # Each request just has the num_computed_tokens and
-        # num_tokens_with_spec. num_tokens_with_spec =
-        # len(prompt_token_ids) + len(output_token_ids) + len(spec_token_ids).
-        # At each step, the scheduler tries to assign tokens to the requests
-        # so that each request's num_computed_tokens can catch up its
-        # num_tokens_with_spec. This is general enough to cover
-        # chunked prefills, prefix caching, speculative decoding,
-        # and the "jump decoding" optimization in the future.
-
-        scheduled_new_reqs: list[Request] = []
-        scheduled_resumed_reqs: list[Request] = []
-        scheduled_running_reqs: list[Request] = []
-        preempted_reqs: list[Request] = []
-
-        req_to_new_blocks: dict[str, KVCacheBlocks] = {}
-        num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
-        if self._pause_state == PauseState.PAUSED_ALL:
-            # Do not schedule any requests when paused.
-            token_budget = 0
-
-        # Encoder-related.
-        scheduled_encoder_inputs: dict[str, list[int]] = {}
-        encoder_compute_budget = self.max_num_encoder_input_tokens
-        # Spec decode-related.
-        scheduled_spec_decode_tokens: dict[str, list[int]] = {}
-
-        # For logging.
-        scheduled_timestamp = time.monotonic()
-
-        # SSLO: snapshot pre-step num_computed_tokens for decoding-only detection.
-        # Must happen before any scheduling logic mutates the field.
-        self._sslo_pre_step_computed = {
-            req.request_id: getattr(req, "num_computed_tokens", 0)
-            for req in self.running + self.sslo_pending
-        }
-
-        # SSLO
-        sslo_scores = self._apply_sslo_policy_v2(scheduled_timestamp)
 
         self.kv_cache_manager.new_step_starts()
 

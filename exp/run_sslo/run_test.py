@@ -116,6 +116,7 @@ def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
             "num_running_iters": _val(record, "num_running_iters"),
             "num_pending_iters_per_chunk":
                 _val(record, "num_pending_iters_per_chunk"),
+            "expected_len": _val(record, "expected_len"),
         })
     return normalized
 
@@ -153,6 +154,7 @@ async def collect_request(
             "tpot": None,
             "queue_stall": None,
             "num_output_tokens": 0,
+            "num_prompt_tokens": None,
             "slo_chunk_records": [],
             "total_pending_time_s": None,
             "num_pending_intervals": 0,
@@ -160,6 +162,9 @@ async def collect_request(
         }
 
     metrics = getattr(last_output, "metrics", None)
+    num_prompt_tokens = getattr(metrics, "num_prompt_tokens", None) if metrics else None
+    if num_prompt_tokens is None:
+        num_prompt_tokens = len(getattr(last_output, "prompt_token_ids", []) or []) or None
     ttft = getattr(metrics, "first_token_latency", None) if metrics else None
     if ttft == 0.0:
         ttft = None
@@ -200,6 +205,7 @@ async def collect_request(
         "request_id": request_id,
         "request_idx": request_idx,
         "num_output_tokens": num_gen,
+        "num_prompt_tokens": num_prompt_tokens,
         "num_chunks": len(slo_chunk_records),
         "ttft": ttft,
         "ttfc": ttfc,
@@ -224,24 +230,24 @@ async def run_one(args: argparse.Namespace) -> None:
     prompts = load_workload(args.dataset_name, args.num_prompts)
     print(f"{args.run_kind}: loaded {len(prompts)} prompts from {args.dataset_name}")
 
-    # Build sslo_params incrementally: start with the base SSLO config used by
-    # all sslo* modes, then add flags per mode suffix. Field names match the
-    # Phase A v2 SsloConfig (vllm/vllm/sslo/config.py).
-    if args.run_kind == "baseline":
-        sslo_params = {"enabled": False}
-    else:
-        sslo_params = {
-            "enabled": True,
-            "chunk_unit": args.chunk_unit,
-            "seconds_per_word": args.seconds_per_word,
-        }
+    # Build sslo_params. Both baseline and sslo modes run through
+    # schedule_sslo() so chunk records / scheduler_stats / tpot EMA are
+    # collected uniformly; method="baseline" skips the SSLO placement
+    # logic so admission is equivalent to vanilla vLLM.
+    sslo_params = {
+        "chunk_unit": args.chunk_unit,
+        "seconds_per_word": args.seconds_per_word,
+        "method": "baseline" if args.run_kind == "baseline" else "sslo",
+    }
+    if args.run_kind != "baseline":
+        # SSLO_POLICY env selects placement algorithm:
+        #   threshold (default) | pressure | buffer | combined.
+        sslo_params["policy"] = os.environ.get(
+            "SSLO_POLICY", "threshold")
         if "adaptive" in args.run_kind:
             sslo_params["adaptive_batching"] = True
         if "offload" in args.run_kind:
             sslo_params["offloading"] = True
-        # SSLO env-var toggle for the v2 pressure-budget scheduling path.
-        if os.environ.get("SSLO_ENABLE_V2") in ("1", "true", "True"):
-            sslo_params["enable_v2"] = True
 
     # KV transfer config: only enable the CPU-offload connector for the two
     # offload SSLO modes. Non-offload modes (baseline, sslo, sslo_adaptive)
@@ -337,6 +343,11 @@ async def run_one(args: argparse.Namespace) -> None:
             f"{args.run_kind}: wrote {len(chunk_rows)} chunks to "
             f"{output_dir / 'chunks.jsonl'}"
         )
+        prompt_counts = [r["num_prompt_tokens"] for r in rows if r and r.get("num_prompt_tokens") is not None]
+        output_counts = [r["num_output_tokens"] for r in rows if r and r.get("num_output_tokens") is not None]
+        prompt_mean = f"{sum(prompt_counts)/len(prompt_counts):.1f}" if prompt_counts else "n/a"
+        output_mean = f"{sum(output_counts)/len(output_counts):.1f}" if output_counts else "n/a"
+        print(f"{args.run_kind}: workload mean num_prompt_tokens={prompt_mean}, num_output_tokens={output_mean}")
     finally:
         engine.shutdown()
         del engine

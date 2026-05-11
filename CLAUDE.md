@@ -52,12 +52,8 @@ docker exec sk-sslo bash -lc '
 
 ### SSLO vLLM package (`vllm/vllm/sslo/`)
 
-`chunk_timer.py` implements an alternative in-engine chunk timing path:
-- `ChunkTimingCollector` — per-output-stream collector, supports both CUMULATIVE and DELTA `RequestOutputKind`.
-- `ChunkTimer` — request-level helper that wraps collectors for all output indices; attaches `chunk_timings` and `generation_start_time` to `RequestOutput` objects.
-- `get_detector(spec)` — factory for `SentenceChunkDetector`, `ParagraphChunkDetector`, `TokenCountChunkDetector`, or any custom `ChunkBoundaryDetector`.
-
-**Note:** `benchmark.py` uses its own `StreamingChunkCollector` (timestamps from the benchmark's stream receive path, not from inside vLLM), so `ChunkTimer` is available for vLLM-internal use but is not wired into the current experiment launcher.
+- `config.py` — `SsloConfig` dataclass: scheduling-mode (`enabled`, `method ∈ {"baseline","sslo"}`, `enable_v2`), hysteresis thresholds, adaptive-batching ratios, offload knobs, chunk-unit / words-per-second.
+- `slo_state.py` — `RequestSLOState` per-request state: pressure / deadline math, chunk records (with predicted vs actual length), pending/offload lifecycle counters, chunk-length predictor (`p90` / `ema`).
 
 ### Output layout
 

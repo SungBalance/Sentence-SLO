@@ -56,9 +56,7 @@ export CHUNK_UNIT
 export CUDA_VISIBLE_DEVICES
 export SSLO_KV_OFFLOAD_EXTRA
 
-if [[ "${run_kind}" == sslo* ]]; then
-  export SSLO_STATS_LOG_PATH="${OUTPUT_DIR}/scheduler_stats.jsonl"
-fi
+export SSLO_STATS_LOG_PATH="${OUTPUT_DIR}/scheduler_stats.jsonl"
 if [[ "${run_kind}" == *offload* ]]; then
   export SSLO_OFFLOAD_LOG_PATH="${OUTPUT_DIR}/offload_log.jsonl"
 fi

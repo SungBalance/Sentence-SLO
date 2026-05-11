@@ -9,39 +9,34 @@ _VALID_CHUNK_UNITS = frozenset({"sentence", "paragraph"})
 
 @dataclass
 class SsloConfig:
-    enabled: bool = False
+    # Top-level scheduling mode:
+    #   "baseline" — schedule_sslo() runs (so chunk_records, tpot EMA, and
+    #                scheduler_stats are emitted for fair comparison) but
+    #                the SSLO placement decisions (critical/non-critical,
+    #                pending pool, waiting throttle, offload) are SKIPPED.
+    #                Equivalent to vanilla vLLM admission, with metrics.
+    #   "sslo"     — full SSLO scheduling, algorithm chosen by `policy`.
+    method: str = "baseline"
+    # SSLO placement algorithm (only meaningful when method=="sslo"):
+    #   None        — placeholder; raises if method=="sslo".
+    #   "threshold" — hysteresis (in/out thresholds); legacy v1.
+    #   "pressure"  — pressure-budget admission; legacy v2.
+    #   "buffer"    — buffer-based admission (placeholder, not yet
+    #                 implemented).
+    #   "combined"  — combined policy (placeholder, not yet implemented).
+    policy: str | None = "threshold"
     offloading: bool = False
     adaptive_batching: bool = False
     num_warmup_chunks: int = 4
-    tpot_bucket_size: int = 8
     tpot_ema_alpha: float = 0.1
     critical_threshold: float = 1.0
+    # Hysteresis thresholds for non-critical placement under
+    # policy="threshold":
+    #   pressure ≤ in  → park to pending
+    #   pressure ≥ out → resume to running
+    #   in (0.3, 0.7) → keep current state (hysteresis band)
     pending_in_threshold: float = 0.3
     pending_out_threshold: float = 0.7
-    # When True, in/out thresholds are derived per-step from the load
-    # pressure (combined × avg_score_running / max_num_seqs) instead of the
-    # static values above. The static fields become a floor only.
-    pending_threshold_dynamic: bool = True
-    # Hysteresis band width for the dynamic mode: out = in + band.
-    pending_dynamic_band: float = 0.2
-    # Placement policy in non-critical mode:
-    #   "hysteresis" — current rule (pending_in/out thresholds, optionally
-    #     dynamic).
-    #   "llf"        — least-laxity-first: rank admitted by pressure
-    #     descending, take top max_num_seqs into running, rest park.
-    #     Drops hysteresis entirely. Predicted optimal in scheduling-
-    #     theory sense when switch cost ≈ 0.
-    pending_policy: str = "llf"
-    # When True, dispatch to schedule_sslo_v2 (pressure-budget admission,
-    # no offload). When False (default), use the existing schedule_sslo
-    # path governed by pending_policy / pending_threshold_dynamic / etc.
-    enable_v2: bool = False
-    # Capacity control on top of the placement policy: cap target_n
-    # for the non-critical step at min(max_num_seqs, N / avg(pressure))
-    # so the running pool shrinks under overload. Lowest-pressure
-    # running requests are demoted to pending; waiting admission is
-    # gated by the same cap.
-    pending_capacity_control: bool = False
     offloading_in_threshold: float = 0.5
     offloading_out_threshold: float = 0.7
     adaptive_batching_min_throughput_ratio: float = 0.9
@@ -65,10 +60,10 @@ class SsloConfig:
             raise ValueError(
                 f"chunk_unit must be one of {sorted(_VALID_CHUNK_UNITS)}, "
                 f"got {self.chunk_unit!r}")
-        for name in ("num_warmup_chunks", "tpot_bucket_size"):
-            value = getattr(self, name)
-            if value < 1:
-                raise ValueError(f"{name} must be >= 1, got {value}")
+        if self.num_warmup_chunks < 1:
+            raise ValueError(
+                f"num_warmup_chunks must be >= 1, "
+                f"got {self.num_warmup_chunks}")
         for name in ("tpot_ema_alpha",
                      "adaptive_batching_min_throughput_ratio",
                      "adaptive_batching_low_cap_throughput_ratio"):
@@ -100,7 +95,15 @@ class SsloConfig:
         if self.offloading_in_threshold > self.offloading_out_threshold:
             raise ValueError(
                 "offloading_in_threshold must be <= offloading_out_threshold")
-        if self.pending_policy not in ("hysteresis", "llf"):
+        if self.method not in ("baseline", "sslo"):
             raise ValueError(
-                f"pending_policy must be 'hysteresis' or 'llf', "
-                f"got {self.pending_policy!r}")
+                f"method must be 'baseline' or 'sslo', "
+                f"got {self.method!r}")
+        valid_policies = (None, "threshold", "pressure", "buffer", "combined")
+        if self.policy not in valid_policies:
+            raise ValueError(
+                f"policy must be one of {valid_policies}, "
+                f"got {self.policy!r}")
+        if self.method == "sslo" and self.policy is None:
+            raise ValueError(
+                "policy must be set (not None) when method='sslo'")
