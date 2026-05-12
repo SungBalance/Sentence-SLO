@@ -269,32 +269,71 @@ def handling_users_stats(
 def throughput_stats(
     req_rows: list[dict[str, Any]],
     per_req_progress: list[dict[str, Any]],
-    window: tuple[float | None, float | None],
+    window: tuple[float | None, float | None] = (None, None),
+    run_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    w0, w1 = window
+    """Tokens generated per second over the full run wall-time.
+
+    Canonical basis (post-Phase 5 follow-up): tokens summed over ALL
+    requests, divided by the wall-time from the first request entering
+    the engine to the last request completing. Earlier versions used a
+    windowed slice `completion_times[0..N-M-1]` which biased against
+    schedulers that wave-pattern admission (the "first M completions"
+    window stretched for SSLO because requests sat in the pending pool
+    before running).
+
+    Window source priority:
+      1. run_meta.measurement_start_ts / measurement_end_ts
+         (stamped by run_test.py around the asyncio.gather loop).
+      2. Derived: min(arrival_ts) → max(completion_ts) across
+         per_req_progress when run_meta is unavailable.
+      3. The `window` arg is accepted only as a final fallback so
+         existing callers that don't yet pass `run_meta` keep working.
+    """
+    w0: float | None = None
+    w1: float | None = None
+    if run_meta:
+        w0 = run_meta.get("measurement_start_ts")
+        w1 = run_meta.get("measurement_end_ts")
     if w0 is None or w1 is None:
-        return {"count": 0, "duration_s": None, "tokens_per_second": None, "completed_req_per_s": None}
+        arrivals = [
+            float(p["arrival_ts"]) for p in per_req_progress
+            if p.get("arrival_ts") is not None
+        ]
+        completions = [
+            float(p["completion_ts"]) for p in per_req_progress
+            if p.get("completion_ts") is not None
+        ]
+        if arrivals and completions:
+            w0 = min(arrivals)
+            w1 = max(completions)
+    if w0 is None or w1 is None:
+        w0, w1 = window
+    if w0 is None or w1 is None:
+        return {"count": 0, "duration_s": None, "tokens_per_second": None,
+                "completed_req_per_s": None, "basis": "unknown"}
 
     duration = w1 - w0
     if duration <= 0:
-        return {"count": 0, "duration_s": duration, "tokens_per_second": None, "completed_req_per_s": None}
+        return {"count": 0, "duration_s": duration, "tokens_per_second": None,
+                "completed_req_per_s": None, "basis": "full_run"}
 
-    in_window = [
-        p for p in per_req_progress
-        if p.get("completion_ts") is not None and w0 <= p["completion_ts"] <= w1
-    ]
     tokens = sum(
         int(p["num_output_tokens"])
-        for p in in_window
+        for p in per_req_progress
         if p.get("num_output_tokens") is not None
     )
-    count = len(in_window)
+    count = sum(
+        1 for p in per_req_progress
+        if p.get("completion_ts") is not None
+    )
 
     return {
         "count": count,
         "duration_s": duration,
-        "tokens_per_second": tokens / duration if duration > 0 else None,
-        "completed_req_per_s": count / duration if duration > 0 else None,
+        "tokens_per_second": tokens / duration,
+        "completed_req_per_s": count / duration,
+        "basis": "full_run",
     }
 
 

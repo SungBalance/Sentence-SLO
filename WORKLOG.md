@@ -410,3 +410,36 @@ sweep outputs:
 
 Bump `summary.json` schema_version when dropping legacy alias keys
 (planned follow-up).
+
+## 2026-05-13 — throughput basis switched to full-run wall-time
+
+`progress_metrics.throughput_stats` previously used the "first N-M
+completions" window. That window stretched for SSLO modes whose
+admission pattern is wave-shaped (admit → run → admit next wave),
+producing apparent 30-50% throughput regression that was a
+measurement artifact, not a real effect.
+
+Canonical basis is now:
+  duration_s = run_meta.measurement_end_ts - run_meta.measurement_start_ts
+  tokens    = Σ num_output_tokens over ALL requests
+  tok/s     = tokens / duration_s
+
+`run_meta` is loaded once at the top of `analyze.analyze()` and
+passed through to throughput_stats. Fallback chain: run_meta →
+derived min/max of per_req arrival/completion → legacy window arg.
+The result dict gains a `basis` field ("full_run" / "unknown").
+
+Verified on cpslo_smoke_128 sweep (re-running analyze.py on the
+existing outputs):
+
+| mode/rate | old tok/s | new tok/s |
+|---|---|---|
+| baseline 16 | 6168 | 4454 |
+| sslo 16     | 4363 | 4840 |
+| sslo_adapt16| 5537 | 4340 |
+| baseline 32 | 12605 | 5060 |
+| sslo 32     |  5972 | 5338 |
+| sslo_adapt32|  5863 | 5307 |
+
+Under the new basis SSLO modes are within ±10% of baseline at this
+load, matching the per-step Δts evidence (mode-independent ~21 ms).

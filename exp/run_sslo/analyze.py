@@ -301,6 +301,16 @@ def analyze(
         "cpslo": {},
     }
 
+    # SSLO Phase 6: load run_meta.json early so throughput_stats can use
+    # the canonical full-run wall-time (measurement_start_ts / _end_ts).
+    run_meta: dict[str, Any] = {}
+    meta_path = output_dir / "run_meta.json"
+    if meta_path.exists():
+        try:
+            run_meta = json.loads(meta_path.read_text()) or {}
+        except json.JSONDecodeError:
+            run_meta = {}
+
     for mode in ALL_MODES:
         req_rows = req_by_mode[mode]
         ch_rows = chunk_by_mode[mode]
@@ -370,7 +380,8 @@ def analyze(
             "num_output_tokens": dist_for_key(req_rows, "num_output_tokens"),
             "num_chunks":        dist_for_key(req_rows, "num_chunks"),
         }
-        metrics["throughput"][mode] = pm.throughput_stats(req_rows, per_req, window)
+        metrics["throughput"][mode] = pm.throughput_stats(
+            req_rows, per_req, window, run_meta=run_meta)
         # SSLO Phase 6: scalar run-level workload counts consumed by
         # validate_run (drop/timeout/throughput predicates).
         num_total = len(req_rows)
@@ -457,16 +468,6 @@ def analyze(
             queue_stalls, (50, 90, 99))
         metrics["cpslo"][mode]["pending_time_distribution"] = distribution_stats(
             pending_times, (50, 90, 99))
-
-    # SSLO Phase 6: best-effort load of run_meta.json sidecar produced by
-    # run_test.py for run-level identifiers and F3 counters.
-    run_meta: dict[str, Any] = {}
-    meta_path = output_dir / "run_meta.json"
-    if meta_path.exists():
-        try:
-            run_meta = json.loads(meta_path.read_text()) or {}
-        except json.JSONDecodeError:
-            run_meta = {}
 
     summary: dict[str, Any] = {
         "config": {
