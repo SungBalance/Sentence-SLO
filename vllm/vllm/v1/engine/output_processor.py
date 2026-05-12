@@ -706,6 +706,23 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
+            # SSLO: scheduler-side slo_state mutations (admitted_ts,
+            # pending lifecycle, step counters) live in a separate
+            # RequestSLOState inside the engine subprocess. The engine
+            # ships a snapshot of those scalars on the finishing output;
+            # merge them into the output-side slo_state BEFORE
+            # make_request_output calls compute_stats so the client sees
+            # the combined view.
+            snap = engine_core_output.sslo_scheduler_state
+            if snap is not None and req_state.slo_state is not None:
+                s = req_state.slo_state
+                if snap.admitted_ts is not None:
+                    s.admitted_ts = snap.admitted_ts
+                s.num_pending_intervals = snap.num_pending_intervals
+                s.total_pending_time_s = snap.total_pending_time_s
+                s.total_step_count = snap.total_step_count
+                s.prefill_step_count = snap.prefill_step_count
+
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
                 new_token_ids,

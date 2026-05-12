@@ -151,6 +151,26 @@ class EngineCoreEvent(msgspec.Struct):
         return cls(event_type, timestamp)
 
 
+# SSLO: scheduler-side slo_state snapshot. The async engine path keeps
+# scheduler-side RequestSLOState (mutated by admission/pending lifecycle
+# hooks) and output_processor-side RequestSLOState (mutated by text
+# deltas / chunk boundaries) as separate objects in different processes;
+# this snapshot carries the scheduler-side scalars across the IPC
+# boundary so OutputProcessor can merge them into the final
+# SsloRequestStats at finish.
+class SsloSchedulerSnapshot(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    admitted_ts: float | None = None
+    num_pending_intervals: int = 0
+    total_pending_time_s: float = 0.0
+    total_step_count: int = 0
+    prefill_step_count: int = 0
+
+
 class EngineCoreOutput(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -178,6 +198,9 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+
+    # SSLO
+    sslo_scheduler_state: SsloSchedulerSnapshot | None = None
 
     @property
     def finished(self) -> bool:

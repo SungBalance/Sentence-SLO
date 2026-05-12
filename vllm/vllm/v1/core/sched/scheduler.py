@@ -54,7 +54,12 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    SsloSchedulerSnapshot,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -3072,6 +3077,22 @@ class Scheduler(SchedulerInterface):
                 or kv_transfer_params
                 or stopped
             ):
+                # SSLO: at finish, snapshot the scheduler-side slo_state
+                # scalars so OutputProcessor can merge them into the
+                # output-side slo_state. Without this, async-path runs
+                # see admitted_ts / num_pending_intervals etc. as zero
+                # because scheduler and output_processor hold separate
+                # RequestSLOState objects.
+                sslo_snapshot: SsloSchedulerSnapshot | None = None
+                if stopped and request.slo_state is not None:
+                    s = request.slo_state
+                    sslo_snapshot = SsloSchedulerSnapshot(
+                        admitted_ts=s.admitted_ts,
+                        num_pending_intervals=s.num_pending_intervals,
+                        total_pending_time_s=s.total_pending_time_s,
+                        total_step_count=s.total_step_count,
+                        prefill_step_count=s.prefill_step_count,
+                    )
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -3088,6 +3109,7 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        sslo_scheduler_state=sslo_snapshot,
                     )
                 )
             else:
