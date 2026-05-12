@@ -732,9 +732,13 @@ class RequestSLOState:
     def on_finish(self, now: float) -> None:
         # Force-flush any held-back text on request completion so the last
         # chunk's diagnostics aren't lost even if it's shorter than
-        # min_chunk_tokens.
+        # min_chunk_tokens. The chunk_separator can carry trailing
+        # whitespace after a yield (e.g. " " left after "Hello."), in
+        # which case flush() returns text but no tokens were accumulated
+        # since the previous boundary — skip the on_chunk_boundary call
+        # so the assertion (num_token > 0) doesn't trip.
         remaining = self.chunk_separator.flush()
-        if remaining:
+        if remaining and self.current_chunk_generated_len > 0:
             word_count = len(remaining.split())
             self.on_chunk_boundary(
                 now=now,
