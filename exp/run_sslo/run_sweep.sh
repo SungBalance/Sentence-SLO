@@ -243,3 +243,7 @@ echo "--- writing summary.csv across all labels under ${SWEEP_ROOT}/ ---"
 python3 exp/run_sslo/analysis/sweep_analysis.py csv \
   --sweep-root "${SWEEP_ROOT}" \
   --output "${SWEEP_ROOT}/summary.csv"
+
+echo
+echo "--- writing validity_checks.csv across all summaries under ${SWEEP_ROOT}/ ---"
+python3 exp/run_sslo/_consolidate_mode_outputs.py --validity-csv "${SWEEP_ROOT}"

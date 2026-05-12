@@ -594,18 +594,17 @@ def test_admitted_ts_set_on_first_admission_via_mark():
     assert stats.admitted_ts == pytest.approx(t1)
 
 
-def test_terminal_outcome_completed_on_free():
-    # _free_blocks calls mark_terminal("completed") before _sslo_clear_pending_state.
-    # Simulate: build a minimal request with slo_state, call _free_blocks on it.
-    state = make_state()
-    req = make_request("r1", state)
-
-    # _free_blocks asserts request.is_finished(); attach that method.
-    req.is_finished = lambda: True
-
-    scheduler = make_scheduler(running=[req])
-    scheduler._free_blocks(req)
-
+def test_terminal_outcome_completed_on_finish():
+    # state.on_finish marks terminal_outcome="completed" so the value
+    # rides on RequestOutput.sslo_metrics (output_processor calls
+    # on_finish during _new_completion_output, before the client sees
+    # the final output). The scheduler-side _free_blocks runs later
+    # and would mark too late.
+    state = RequestSLOState(num_warmup_chunks=1)
+    state.on_token(0.0)
+    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=10.0)
+    assert state.terminal_outcome == "in_progress"
+    state.on_finish(now=1.0)
     assert state.terminal_outcome == "completed"
     assert state.compute_stats().terminal_outcome == "completed"
 

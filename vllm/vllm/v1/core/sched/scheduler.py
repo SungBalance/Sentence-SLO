@@ -3458,9 +3458,10 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
-        # SSLO
-        if request.slo_state is not None:
-            request.slo_state.mark_terminal("completed")
+        # SSLO: terminal_outcome is stamped earlier in slo_state.on_finish
+        # so the value rides on RequestOutput.sslo_metrics before the
+        # client sees the final output. The scheduler-side cleanup runs
+        # afterward and would mark too late.
         self._sslo_clear_pending_state(request, time.monotonic())
         # SSLO: prune the done-log dedup set now that the request is
         # being removed from self.requests; nothing else can hand-roll a

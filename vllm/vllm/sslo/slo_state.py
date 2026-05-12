@@ -748,6 +748,11 @@ class RequestSLOState:
             )
         elif self.decoding_start_ts is None:
             self.decoding_start_ts = now
+        # output_processor calls on_finish on natural completion (the
+        # only place this method fires from production). Abort/timeout
+        # paths skip the output processor and stay at "in_progress".
+        if self.terminal_outcome == "in_progress":
+            self.terminal_outcome = "completed"
 
     def compute_stats(self) -> SsloRequestStats:
         return SsloRequestStats(
