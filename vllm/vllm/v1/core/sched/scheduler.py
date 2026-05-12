@@ -1110,7 +1110,7 @@ class Scheduler(SchedulerInterface):
         # scheduled tokens, which would mask partial-prefill (chunked) steps.
         self._sslo_prev_step_batch = len(scheduler_output.num_scheduled_tokens)
         new_req_ids = {
-            r.request_id for r in scheduler_output.scheduled_new_reqs}
+            r.req_id for r in scheduler_output.scheduled_new_reqs}
         prefill_count = len(new_req_ids)
         decoding_only = scheduler_output.total_num_scheduled_tokens > 0
         if new_req_ids:
