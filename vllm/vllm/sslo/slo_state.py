@@ -220,6 +220,12 @@ class ChunkRecord:
     # history yet) and any time before the predictor has a value. Compare
     # to num_token to measure prediction accuracy.
     expected_len: float | None
+    # Raw stall interval for this chunk; non-None only when late.
+    # Kept as raw timestamps so post-hoc analysis can merge overlapping
+    # stall windows across requests.
+    stall_start_ts: float | None
+    stall_end_ts: float | None
+    stall_duration_s: float
 
 
 class ChunkStatCollector:
@@ -249,6 +255,9 @@ class ChunkStatCollector:
         start_time_ts: float,
         num_token: int,
         expected_len: float | None,
+        stall_start_ts: float | None,
+        stall_end_ts: float | None,
+        stall_duration_s: float,
     ) -> None:
         running_iters = self._current_running_iters
         pending_iters = self._current_pending_iters
@@ -266,6 +275,9 @@ class ChunkStatCollector:
                 num_running_iters=running_iters,
                 num_pending_iters=pending_iters,
                 expected_len=expected_len,
+                stall_start_ts=stall_start_ts,
+                stall_end_ts=stall_end_ts,
+                stall_duration_s=stall_duration_s,
             ))
         # Aggregate stall = max(0, -slack); positive only when late.
         self.stall_time_total += max(0.0, -slack_s)
@@ -300,6 +312,9 @@ class SsloRequestStats:
     # pressure that slows decode progress.
     total_step_count: int = 0
     prefill_step_count: int = 0
+    # Wall-clock when the consumer can start reading: set at chunk 0 finish,
+    # equals d(0) under the new contract.
+    consume_start_ts: float | None = None
 
 
 @dataclass
@@ -313,6 +328,11 @@ class RequestSLOState:
     next_deadline_ts: float | None = None
     chunks_completed: int = 0
     current_chunk_generated_len: int = 0
+
+    # Wall-clock when consumption can start; set once at chunk 0 finish.
+    # d(0) = chunk_0_gen_finish_ts, not decoding_start_ts, because the
+    # consumer cannot start until the first chunk is actually available.
+    consume_start_ts: float | None = None
 
     # Diagnostic output.
     chunk_stats: ChunkStatCollector = field(default_factory=ChunkStatCollector)
@@ -390,9 +410,10 @@ class RequestSLOState:
         return self._chunk_len_predictor.value
 
     def chunk_deadline(self) -> float | None:
-        # next_deadline_ts is initialized to decoding_start_ts on the first
-        # on_token / on_chunk_boundary call, then advanced by the recurrence
-        # at each chunk boundary.
+        # Bootstrapped to decoding_start_ts at first token / chunk event,
+        # overwritten to gen_finish_ts(0) when chunk 0 completes (so
+        # d(0) = consume_start_ts), then advanced by the stall-aware
+        # recurrence at each subsequent chunk boundary.
         return self.next_deadline_ts
 
     def time_to_deadline(self, now: float) -> float | None:
@@ -449,8 +470,7 @@ class RequestSLOState:
 
     def _ensure_decoding_started(self, now: float) -> None:
         # Lazy bootstrap of decoding_start_ts and next_deadline_ts on the
-        # first token / chunk event. deadline(0) = decoding_start_ts so
-        # chunk 0 is "due immediately"; its slack is forced to 0 below.
+        # first token / chunk event.
         if self.decoding_start_ts is None:
             self.decoding_start_ts = now
             self.next_deadline_ts = now
@@ -469,18 +489,26 @@ class RequestSLOState:
 
         deadline = self.chunk_deadline()
         assert deadline is not None
-        # Chunk 0 has no preceding consumption budget — its deadline is the
-        # decoding start itself, so slack is not meaningful. Treat chunk 0
-        # as always on-time (slack=0) so request-level compliance measures
-        # only chunks 1+ where the consumer has a real budget.
+
         if self.chunks_completed == 0:
-            slack = 0.0
-            # Chunk 0 starts at decoding_start_ts.
+            # d(0) = chunk 0's own finish time: the consumer can't start
+            # until the first chunk is available, so its deadline IS now.
+            self.consume_start_ts = now
+            self.next_deadline_ts = now
+            deadline = now
             start_time_ts = self.decoding_start_ts
         else:
-            slack = deadline - now
-            # Subsequent chunks start where the previous one ended.
             start_time_ts = self.chunk_stats.records[-1].gen_finish_ts
+
+        slack = deadline - now
+        stall_duration_s = max(0.0, -slack)
+        if stall_duration_s > 0:
+            stall_start_ts: float | None = deadline
+            stall_end_ts: float | None = now
+        else:
+            stall_start_ts = None
+            stall_end_ts = None
+
         # Invariant: tokens are always accumulated (via on_token /
         # on_text_delta) before a chunk boundary is observed. on_finish's
         # tail flush only fires when prior on_text_delta calls added the
@@ -501,6 +529,9 @@ class RequestSLOState:
             start_time_ts=start_time_ts,
             num_token=num_token,
             expected_len=expected_len,
+            stall_start_ts=stall_start_ts,
+            stall_end_ts=stall_end_ts,
+            stall_duration_s=stall_duration_s,
         )
         self._chunk_len_predictor.update(num_token)
 
@@ -587,6 +618,7 @@ class RequestSLOState:
             final_chunk_expected_len=self._chunk_len_predictor.value,
             total_step_count=self.total_step_count,
             prefill_step_count=self.prefill_step_count,
+            consume_start_ts=self.consume_start_ts,
         )
 
     def chunk_records_asdict(self) -> list[dict]:

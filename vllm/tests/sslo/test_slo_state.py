@@ -40,15 +40,20 @@ def test_chunk_record_and_diagnostics_append():
     record = state.chunk_records[0]
     assert isinstance(record, ChunkRecord)
     assert record.chunk_idx == 0
-    assert record.deadline_ts == pytest.approx(5.0)
+    # Under the new contract d(0) = chunk 0's own finish time, not decoding_start_ts.
+    assert record.deadline_ts == pytest.approx(5.5)
     assert record.gen_finish_ts == pytest.approx(5.5)
-    # Chunk 0 has no preceding consumption budget — slack is forced to 0
-    # so the first chunk doesn't auto-violate request SLO.
     assert record.slack_s == 0.0
     assert record.pending_time_s == pytest.approx(0.3)
     assert state.chunk_stall_time_total == 0.0
     assert state.total_pending_time_s == pytest.approx(0.3)
     assert state.num_pending_intervals == 1
+    # Chunk 0 is on-time by definition — stall fields must be empty.
+    assert record.stall_duration_s == 0.0
+    assert record.stall_start_ts is None
+    assert record.stall_end_ts is None
+    # consume_start_ts is stamped at chunk 0 finish.
+    assert state.consume_start_ts == pytest.approx(5.5)
 
 
 def test_on_step_tracks_total_and_prefill_counts():
@@ -67,8 +72,7 @@ def test_on_step_tracks_total_and_prefill_counts():
 def test_chunk1_records_real_slack():
     # Chunk 1+ uses the real slack/stall computation. Stall-aware deadline
     # propagation: after chunk 0 finishes at t=0.5 with consume_time=1.0,
-    # the next deadline = max(0.5, 0.0) + 1.0 = 1.5 (consumption can't
-    # start before the chunk arrives).
+    # the next deadline = max(0.5, 0.5) + 1.0 = 1.5.
     state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
     state.on_token(0.0)
     state.on_chunk_boundary(0.5, word_count=2, chunk_consume_time_s=1.0)
@@ -81,6 +85,10 @@ def test_chunk1_records_real_slack():
     assert rec.slack_s == pytest.approx(-0.5)  # missed deadline by 0.5s
     # stall = max(0, -slack); aggregated into chunk_stall_time_total.
     assert state.chunk_stall_time_total == pytest.approx(0.5)
+    # Chunk 1 arrived late — stall fields must reflect the overrun.
+    assert rec.stall_duration_s == pytest.approx(0.5)
+    assert rec.stall_start_ts == pytest.approx(1.5)
+    assert rec.stall_end_ts == pytest.approx(2.0)
 
 
 def test_chunk_expected_len_p90_tracks_history():
@@ -120,8 +128,7 @@ def test_score_formula_and_deadline_sign():
         state.on_token(1.0)
 
     # measured_state(): chunk 0 finishes at 0.1 with consume=10.0. Under
-    # stall-aware propagation: cumulative_consume = max(0.1, 0) + 10.0 =
-    # 10.1, so the next deadline is 10.1.
+    # stall-aware propagation: deadline(1) = max(0.1, 0.1) + 10.0 = 10.1.
     assert state.time_to_deadline(5.1) == pytest.approx(5.0)
     assert state.expected_remaining_len() == pytest.approx(1.0)
     assert state.pressure(5.1, tpot_s=0.2) == pytest.approx(0.2 / 5.0)
@@ -189,3 +196,51 @@ def test_min_chunk_tokens_resets_after_flush():
     # Counter must reset; another 10-token sentence flushes again.
     state.on_text_delta(" Another long sentence here too.", 1.1, num_tokens=10)
     assert len(state.chunk_records) == 2
+
+
+def test_chunk0_slack_zero_by_structure():
+    # Chunk 0's deadline = its own finish time, so slack = deadline - now = 0
+    # without any special-case branch.
+    state = RequestSLOState(num_warmup_chunks=1)
+    state.on_token(3.0)
+    state.on_chunk_boundary(4.0, word_count=1, chunk_consume_time_s=1.0)
+    rec = state.chunk_records[0]
+    assert rec.slack_s == pytest.approx(0.0)
+    assert rec.deadline_ts == pytest.approx(rec.gen_finish_ts)
+
+
+def test_consume_start_ts_set_at_chunk0_end():
+    state = RequestSLOState(num_warmup_chunks=1)
+    state.on_token(1.0)
+    state.on_chunk_boundary(2.5, word_count=2, chunk_consume_time_s=1.0)
+    assert state.consume_start_ts == pytest.approx(2.5)
+    assert state.consume_start_ts == pytest.approx(
+        state.chunk_records[0].gen_finish_ts)
+
+
+def test_stall_fields_populated_when_late():
+    # Chunk 1 arrives after its deadline — stall fields must be set.
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    state.on_token(0.0)
+    state.on_chunk_boundary(1.0, word_count=1, chunk_consume_time_s=2.0)
+    # deadline(1) = max(1.0, 1.0) + 2.0 = 3.0; chunk arrives at 4.0.
+    state.on_token(1.0)
+    state.on_chunk_boundary(4.0, word_count=1, chunk_consume_time_s=1.0)
+    rec = state.chunk_records[1]
+    assert rec.stall_duration_s == pytest.approx(1.0)
+    assert rec.stall_start_ts == pytest.approx(3.0)
+    assert rec.stall_end_ts == pytest.approx(4.0)
+
+
+def test_stall_fields_none_when_ontime():
+    # Chunk 1 arrives before its deadline — stall fields must be empty.
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    state.on_token(0.0)
+    state.on_chunk_boundary(1.0, word_count=1, chunk_consume_time_s=5.0)
+    # deadline(1) = max(1.0, 1.0) + 5.0 = 6.0; chunk arrives at 3.0.
+    state.on_token(1.0)
+    state.on_chunk_boundary(3.0, word_count=1, chunk_consume_time_s=1.0)
+    rec = state.chunk_records[1]
+    assert rec.stall_duration_s == 0.0
+    assert rec.stall_start_ts is None
+    assert rec.stall_end_ts is None
