@@ -608,3 +608,19 @@ def test_terminal_outcome_default_in_progress_before_free():
     assert state.terminal_outcome == "in_progress"
     stats = state.compute_stats()
     assert stats.terminal_outcome == "in_progress"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 tests: _policy_score_with_fallback regression
+# ---------------------------------------------------------------------------
+
+def test_policy_fallback_returns_one_for_missing():
+    """_policy_score_with_fallback must return 1.0 for warmup (None pressure)."""
+    warmup_state = make_state(phase=Phase.WARMUP)
+    req = make_request("warmup_req", warmup_state)
+    scheduler = _make_pressure_scheduler(running=[req], max_num_running_reqs=2)
+    # No TPOT available yet
+    score = scheduler._policy_score_with_fallback(warmup_state, now=0.5, tpot=None)
+    assert score == pytest.approx(1.0)
+    # Also confirm that pressure() returns None (the raw signal)
+    assert warmup_state.pressure(0.5, None) is None

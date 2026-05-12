@@ -1128,16 +1128,19 @@ class Scheduler(SchedulerInterface):
                 req.slo_state.on_step(decoding_only)
 
     # SSLO
-    def _state_pressure(
+    def _policy_score_with_fallback(
         self,
         state: "RequestSLOState",
         now: float,
         tpot: float | None,
     ) -> float:
-        # Normalize the "not measurable" sentinel to 1.0 so downstream code
-        # sees only finite-or-inf. 1.0 = "exactly at deadline given current
-        # TPOT" — a deliberately pessimistic prior for requests we can't
-        # score yet (PREFILL/WARMUP, missing tpot, or no predictor sample).
+        """Policy-side score with the missing→1.0 fallback.
+
+        Used by placement decisions (priority sort, hysteresis, D-sum) so
+        cold-start MEASURED requests don't trip the critical guard. Log
+        sites must NOT use this — they should call state.pressure_components
+        and preserve pressure_available / pressure_missing_reason raw.
+        """
         pressure = state.pressure(now, tpot)
         return 1.0 if pressure is None else pressure
 
@@ -1221,7 +1224,7 @@ class Scheduler(SchedulerInterface):
             self._sslo_step_setup(now))
         base_n = self.max_num_running_reqs
         # has_critical only when we have a real tpot signal — otherwise the
-        # 1.0 default from _state_pressure would trip MEASURED-phase reqs
+        # 1.0 default from _policy_score_with_fallback would trip MEASURED-phase reqs
         # into the critical branch on cold start.
         self._sslo_step.has_critical = (
             base_tpot is not None
@@ -1364,7 +1367,7 @@ class Scheduler(SchedulerInterface):
             # D = total normalized pressure of admitted requests. Inf is
             # capped at 1.0 (already-late requests can't ask for more than
             # one slot of budget). Other Nones never appear because
-            # _state_pressure normalized them upstream.
+            # _policy_score_with_fallback normalized them upstream.
             self._sslo_step.has_critical = False
             D = sum(
                 1.0 if p == float("inf") else p
@@ -1420,7 +1423,7 @@ class Scheduler(SchedulerInterface):
                 pressures[req.request_id] = 1.0
                 tiers[req.request_id] = 2
                 continue
-            pressure = self._state_pressure(state, now, tpot)
+            pressure = self._policy_score_with_fallback(state, now, tpot)
             pressures[req.request_id] = pressure
             tiers[req.request_id] = self._classify_tier(req, pressure)
         return pressures, tiers
@@ -1429,7 +1432,7 @@ class Scheduler(SchedulerInterface):
     def _finalize_aggregates(self, pressures: dict[str, float]) -> None:
         # Pull avg/max into _sslo_step. Inf is dropped (it skews the
         # average); None never appears because _compute_pressures
-        # normalizes via _state_pressure.
+        # normalizes via _policy_score_with_fallback.
         finite = [p for p in pressures.values() if p != float("inf")]
         if finite:
             self._sslo_step.avg_score = sum(finite) / len(finite)
@@ -1661,7 +1664,7 @@ class Scheduler(SchedulerInterface):
                     continue
                 state = req.slo_state
                 assert state is not None
-                pressure = self._state_pressure(state, now, tpot_n)
+                pressure = self._policy_score_with_fallback(state, now, tpot_n)
                 if pressure >= self.sslo_config.critical_threshold:
                     all_resolved = False
                     break
@@ -1676,7 +1679,7 @@ class Scheduler(SchedulerInterface):
                     continue
                 state = req.slo_state
                 assert state is not None
-                pressure = self._state_pressure(state, now, tpot_n)
+                pressure = self._policy_score_with_fallback(state, now, tpot_n)
                 if pressure != float("inf") and pressure > worst:
                     worst = pressure
             return worst

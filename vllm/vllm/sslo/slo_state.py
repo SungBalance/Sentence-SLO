@@ -28,6 +28,37 @@ class Phase(IntEnum):
     MEASURED = 2
 
 
+
+_VALID_PRESSURE_MISSING_REASONS = frozenset(
+    {"prefill", "warmup", "no_tpot", "no_predictor"})
+
+
+@dataclass
+class PressureComponents:
+    """Decomposed pressure signal for logging and analysis.
+
+    All time values are in seconds. Fields are None when the corresponding
+    input was unavailable — callers must not substitute 1.0 here; that
+    substitution belongs in the policy path only.
+    """
+    remaining_tokens: float | None
+    estimated_step_time_s: float | None
+    buffer_slack_s: float | None
+    estimated_refill_time_s: float | None
+    refill_slack_s: float | None
+    depletion_pressure: float | None
+    # True when depletion_pressure was computed from real signals.
+    # False means the policy path will substitute 1.0.
+    pressure_available: bool
+    # When pressure_available is False, one of:
+    #   "prefill"      — phase == PREFILL
+    #   "warmup"       — phase == WARMUP
+    #   "no_tpot"      — tpot input was None
+    #   "no_predictor" — predictor.value is None
+    # None when pressure_available is True.
+    pressure_missing_reason: str | None
+
+
 class ChunkLengthPredictor:
     """Predict the next chunk's generated_len from completed chunks.
 
@@ -479,6 +510,61 @@ class RequestSLOState:
                 return max(1.0, high - self.current_chunk_generated_len)
         return max(1.0, remaining)
 
+    def pressure_components(
+        self, now: float, tpot_s: float | None
+    ) -> PressureComponents:
+        """Compute the raw pressure components for logging.
+
+        Unlike pressure(), this never returns a scalar fallback — instead
+        it surfaces which input was missing so the analysis layer can
+        distinguish "not measurable" from "exactly at deadline".
+        """
+        if self.phase == Phase.PREFILL:
+            return PressureComponents(
+                remaining_tokens=None, estimated_step_time_s=tpot_s,
+                buffer_slack_s=None, estimated_refill_time_s=None,
+                refill_slack_s=None, depletion_pressure=None,
+                pressure_available=False, pressure_missing_reason="prefill")
+        if self.phase == Phase.WARMUP:
+            return PressureComponents(
+                remaining_tokens=None, estimated_step_time_s=tpot_s,
+                buffer_slack_s=None, estimated_refill_time_s=None,
+                refill_slack_s=None, depletion_pressure=None,
+                pressure_available=False, pressure_missing_reason="warmup")
+        if tpot_s is None:
+            return PressureComponents(
+                remaining_tokens=None, estimated_step_time_s=None,
+                buffer_slack_s=None, estimated_refill_time_s=None,
+                refill_slack_s=None, depletion_pressure=None,
+                pressure_available=False, pressure_missing_reason="no_tpot")
+        remaining = self.expected_remaining_len()
+        if remaining is None:
+            return PressureComponents(
+                remaining_tokens=None, estimated_step_time_s=tpot_s,
+                buffer_slack_s=None, estimated_refill_time_s=None,
+                refill_slack_s=None, depletion_pressure=None,
+                pressure_available=False,
+                pressure_missing_reason="no_predictor")
+
+        ttd = self.time_to_deadline(now)
+        refill = remaining * tpot_s
+        refill_slack = (None if ttd is None else ttd - refill)
+        if ttd is None:
+            depletion = None
+        elif ttd <= 0:
+            depletion = float("inf")
+        else:
+            depletion = refill / ttd
+        return PressureComponents(
+            remaining_tokens=remaining,
+            estimated_step_time_s=tpot_s,
+            buffer_slack_s=ttd,
+            estimated_refill_time_s=refill,
+            refill_slack_s=refill_slack,
+            depletion_pressure=depletion,
+            pressure_available=True,
+            pressure_missing_reason=None)
+
     def pressure(self, now: float, tpot_s: float | None) -> float | None:
         """Forward-looking urgency (= remaining_work / time_to_deadline,
         normalized so 1.0 means "exactly at deadline given current TPOT").
@@ -497,19 +583,7 @@ class RequestSLOState:
             computing aggregate pressures).
           - finite float — normal urgency.
         """
-        if self.phase != Phase.MEASURED:
-            return None
-        if tpot_s is None:
-            return None
-        remaining = self.expected_remaining_len()
-        if remaining is None:
-            return None
-        time_to_deadline = self.time_to_deadline(now)
-        if time_to_deadline is None:
-            return None
-        if time_to_deadline <= 0:
-            return float("inf")
-        return (remaining * tpot_s) / time_to_deadline
+        return self.pressure_components(now, tpot_s).depletion_pressure
 
     def mark_admitted(self, now: float) -> None:
         if self.admitted_ts is None:

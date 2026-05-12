@@ -352,3 +352,105 @@ def test_admitted_ts_propagates_to_stats():
     state.mark_admitted(5.5)
     stats = state.compute_stats()
     assert stats.admitted_ts == pytest.approx(5.5)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 tests: PressureComponents + pressure_components()
+# ---------------------------------------------------------------------------
+
+def test_pressure_components_prefill():
+    state = RequestSLOState(num_warmup_chunks=2)
+    # Phase is PREFILL (decoding_start_ts is None)
+    assert state.phase.name == "PREFILL"
+    pc = state.pressure_components(1.0, tpot_s=0.05)
+    assert not pc.pressure_available
+    assert pc.pressure_missing_reason == "prefill"
+    assert pc.depletion_pressure is None
+
+
+def test_pressure_components_warmup():
+    state = RequestSLOState(num_warmup_chunks=2, min_chunk_tokens=0)
+    # Trigger decoding start but stay in WARMUP (chunks_completed < num_warmup_chunks)
+    state.on_token(0.0)
+    assert state.phase.name == "WARMUP"
+    pc = state.pressure_components(0.1, tpot_s=0.05)
+    assert not pc.pressure_available
+    assert pc.pressure_missing_reason == "warmup"
+    assert pc.depletion_pressure is None
+
+
+def test_pressure_components_no_tpot():
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    # Advance to MEASURED phase: complete warmup chunk
+    for _ in range(10):
+        state.on_token(0.0)
+    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    assert state.phase.name == "MEASURED"
+    pc = state.pressure_components(0.2, tpot_s=None)
+    assert not pc.pressure_available
+    assert pc.pressure_missing_reason == "no_tpot"
+    assert pc.depletion_pressure is None
+
+
+def test_pressure_components_no_predictor():
+    state = RequestSLOState(
+        num_warmup_chunks=1, chunk_len_strategy="past-future", min_chunk_tokens=0)
+    # "past-future" strategy never sets predictor.value
+    for _ in range(10):
+        state.on_token(0.0)
+    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    assert state.phase.name == "MEASURED"
+    assert state._chunk_len_predictor.value is None
+    pc = state.pressure_components(0.2, tpot_s=0.05)
+    assert not pc.pressure_available
+    assert pc.pressure_missing_reason == "no_predictor"
+    assert pc.depletion_pressure is None
+
+
+def test_pressure_components_available_finite():
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    for _ in range(10):
+        state.on_token(0.0)
+    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    assert state.phase.name == "MEASURED"
+    now = 0.5
+    tpot = 0.04
+    pc = state.pressure_components(now, tpot_s=tpot)
+    assert pc.pressure_available
+    assert pc.pressure_missing_reason is None
+    assert pc.remaining_tokens is not None
+    assert pc.estimated_refill_time_s is not None
+    assert pc.buffer_slack_s is not None
+    assert pc.refill_slack_s is not None
+    assert pc.depletion_pressure is not None
+    # depletion_pressure >= 1 iff refill_slack_s <= 0
+    if pc.refill_slack_s <= 0:
+        assert pc.depletion_pressure >= 1.0
+    else:
+        assert pc.depletion_pressure < 1.0
+
+
+def test_pressure_components_deadline_passed():
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    for _ in range(10):
+        state.on_token(0.0)
+    # chunk 0 completes very late (now=100.0), consume=1.0 → next deadline ≈ 101.0
+    state.on_chunk_boundary(100.0, word_count=2, chunk_consume_time_s=1.0)
+    assert state.phase.name == "MEASURED"
+    # Query well after the deadline (now=200.0)
+    pc = state.pressure_components(200.0, tpot_s=0.05)
+    assert pc.pressure_available
+    assert pc.buffer_slack_s is not None and pc.buffer_slack_s <= 0
+    assert pc.depletion_pressure == float("inf")
+
+
+def test_pressure_equals_depletion_pressure():
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    for _ in range(10):
+        state.on_token(0.0)
+    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    now = 0.5
+    tpot = 0.04
+    p = state.pressure(now, tpot)
+    pc = state.pressure_components(now, tpot_s=tpot)
+    assert p == pc.depletion_pressure
