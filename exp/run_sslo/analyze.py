@@ -13,6 +13,7 @@ from metrics_utils import distribution_stats, numeric_values, percentile
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent / "analysis"))
 import progress_metrics as pm
+from validity import validate_run
 
 MAX_NUM_SEQS = 64
 DEFAULT_OUTPUT_DIR = "exp/run_sslo/output"
@@ -370,6 +371,23 @@ def analyze(
             "num_chunks":        dist_for_key(req_rows, "num_chunks"),
         }
         metrics["throughput"][mode] = pm.throughput_stats(req_rows, per_req, window)
+        # SSLO Phase 6: scalar run-level workload counts consumed by
+        # validate_run (drop/timeout/throughput predicates).
+        num_total = len(req_rows)
+        num_completed = sum(
+            1 for r in req_rows if r.get("terminal_outcome") == "completed")
+        num_timeout = sum(
+            1 for r in req_rows if r.get("terminal_outcome") == "timeout")
+        num_chunks_total = sum(
+            int(r.get("num_chunks") or 0) for r in req_rows)
+        metrics["workload"][mode].update({
+            "num_requests_total": num_total,
+            "num_requests_completed": num_completed,
+            "num_requests_timeout": num_timeout,
+            "num_chunks_total": num_chunks_total,
+            "tokens_per_second": (
+                metrics["throughput"][mode].get("tokens_per_second")),
+        })
         metrics["cp_slo_violation"][mode] = pm.cp_slo_violation_rates(per_req, list(pm.DEFAULT_TAUS))
         # Phase 5: also surface the same violation table under the new
         # cpslo namespace so downstream readers don't have to know the
@@ -426,6 +444,30 @@ def analyze(
             mode_neg is not None and bl_neg is not None and mode_neg <= bl_neg * 1.1
         )
 
+    # SSLO Phase 6: feed validate_run with per-mode queueing distributions
+    # so the no-harm gate can read p99 queue_stall / pending_time.
+    for mode in ALL_MODES:
+        req_rows = req_by_mode[mode]
+        queue_stalls = [r["queue_stall_s"] for r in req_rows
+                        if r.get("queue_stall_s") is not None]
+        pending_times = [r["total_pending_time_s"] for r in req_rows
+                         if r.get("total_pending_time_s") is not None]
+        metrics["cpslo"].setdefault(mode, {})
+        metrics["cpslo"][mode]["queue_stall_distribution"] = distribution_stats(
+            queue_stalls, (50, 90, 99))
+        metrics["cpslo"][mode]["pending_time_distribution"] = distribution_stats(
+            pending_times, (50, 90, 99))
+
+    # SSLO Phase 6: best-effort load of run_meta.json sidecar produced by
+    # run_test.py for run-level identifiers and F3 counters.
+    run_meta: dict[str, Any] = {}
+    meta_path = output_dir / "run_meta.json"
+    if meta_path.exists():
+        try:
+            run_meta = json.loads(meta_path.read_text()) or {}
+        except json.JSONDecodeError:
+            run_meta = {}
+
     summary: dict[str, Any] = {
         "config": {
             "model": model,
@@ -438,11 +480,26 @@ def analyze(
             "is_control": is_control,
             "modes_run": modes_run,
             "sslo_config": sslo_config_by_mode,
+            "run_kind": modes_run[0] if modes_run else None,
         },
         "metrics": metrics,
         "queue_stall_available": queue_stall_available,
         "scheduler_saturation": scheduler_saturation,
         "passes": passes,
+        "run_meta": run_meta,
+    }
+
+    # SSLO Phase 6: validity + no-harm gate. Single-mode runs have no paired
+    # baseline tps available here, so the throughput-regression branch is
+    # skipped; _consolidate_mode_outputs.py / sweep-level analysis recompute
+    # against the paired baseline when both modes are present.
+    baseline_tps = (
+        metrics.get("workload", {}).get("baseline", {}).get("tokens_per_second"))
+    report = validate_run(summary, baseline_tokens_per_second=baseline_tps)
+    summary["validity"] = {
+        "validity_pass": report.validity_pass,
+        "no_harm_pass": report.no_harm_pass,
+        "invalid_reason": report.invalid_reason,
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)

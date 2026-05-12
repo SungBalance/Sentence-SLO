@@ -197,6 +197,10 @@ async def collect_request(
     queue_stall = (
         scheduled - queued if (queued and scheduled and scheduled >= queued) else None
     )
+    # SSLO Phase 6 F3: surface vLLM's per-request preemption counter so the
+    # run-level sidecar can sum it. Missing attr defaults to 0 for safety
+    # under older vLLM builds.
+    num_preemptions = int(getattr(metrics, "num_preemptions", 0) or 0) if metrics else 0
 
     slo_chunk_records = extract_chunk_records(last_output)
     # ttfc — time to first chunk, from queue entry to first chunk completion.
@@ -255,7 +259,78 @@ async def collect_request(
         # F2: request classification by observed generation length.
         "reference_output_tokens": reference_output_tokens,
         "request_class": request_class,
+        # SSLO Phase 6 F3: per-request preemption count (vLLM v1).
+        "num_preemptions": num_preemptions,
     }
+
+
+def _make_run_id(args: argparse.Namespace, ts: float) -> str:
+    return (
+        f"{args.run_kind}_{args.max_num_seqs}_{args.request_rate}_"
+        f"{args.request_rate_seed}_{int(ts)}"
+    )
+
+
+def _policy_label(args: argparse.Namespace) -> str:
+    # run_kind identifies the scheduling mode (baseline / sslo / sslo_adaptive / ...).
+    return args.run_kind
+
+
+def _make_variant_label(args: argparse.Namespace) -> str:
+    parts = [args.run_kind]
+    if "adaptive" in args.run_kind:
+        parts.append("abatch=on")
+    else:
+        parts.append("abatch=off")
+    return "/".join(parts)
+
+
+def _gpu_peak_bytes() -> int | None:
+    # Best-effort: CPU-only or torch-less environments return None.
+    try:
+        if torch.cuda.is_available():
+            return int(torch.cuda.max_memory_allocated())
+    except Exception:
+        return None
+    return None
+
+
+def _sum_preemptions(rows: list[dict[str, Any]]) -> int:
+    return sum(int(r.get("num_preemptions", 0) or 0) for r in rows)
+
+
+def write_run_meta(
+    args: argparse.Namespace,
+    output_dir: Path,
+    run_started_ts: float,
+    run_ended_ts: float,
+    requests_rows: list[dict[str, Any]],
+) -> None:
+    # Sidecar consumed by analyze.py / _consolidate_mode_outputs.py so the
+    # validity gate can see run-level identifiers and F3 counters even if
+    # the per-row JSONL doesn't.
+    meta = {
+        "run_id": _make_run_id(args, run_started_ts),
+        "policy": _policy_label(args),
+        "variant": _make_variant_label(args),
+        "seed": args.request_rate_seed,
+        "trace_id": (
+            f"poisson_rate{args.request_rate}_seed{args.request_rate_seed}"
+        ),
+        "workload_id": args.dataset_name,
+        "N": len(requests_rows),
+        "M": args.max_num_seqs,
+        "measurement_start_ts": run_started_ts,
+        "measurement_end_ts": run_ended_ts,
+        "gpu_memory_peak_bytes": _gpu_peak_bytes(),
+        "num_preemptions_total": _sum_preemptions(requests_rows),
+        "num_requests_completed": sum(
+            1 for r in requests_rows
+            if r.get("terminal_outcome") == "completed"
+        ),
+        "num_requests_total": len(requests_rows),
+    }
+    (output_dir / "run_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
 async def run_one(args: argparse.Namespace) -> None:
@@ -345,6 +420,7 @@ async def run_one(args: argparse.Namespace) -> None:
         )
 
     try:
+        run_started_ts = time.time()
         t0 = time.monotonic()
         tasks = [
             asyncio.create_task(collect_request_with_delay(
@@ -353,6 +429,7 @@ async def run_one(args: argparse.Namespace) -> None:
         ]
         rows = await asyncio.gather(*tasks)
         elapsed = time.monotonic() - t0
+        run_ended_ts = time.time()
         request_rows = [
             {"mode": args.run_kind,
              **{k: v for k, v in row.items() if k != "slo_chunk_records"}}
@@ -374,6 +451,10 @@ async def run_one(args: argparse.Namespace) -> None:
         # summary.config. Only emitted for sslo* modes; baseline gets {}.
         sslo_config_path = output_dir / "sslo_config.json"
         sslo_config_path.write_text(json.dumps(sslo_params) + "\n")
+        # SSLO Phase 6: run-level sidecar for the validity gate (run_id,
+        # GPU peak, preemption totals, completion counts).
+        write_run_meta(
+            args, output_dir, run_started_ts, run_ended_ts, request_rows)
         print(
             f"{args.run_kind}: completed {len(rows)} requests in {elapsed:.1f}s; "
             f"wrote {output_dir / 'requests.jsonl'}"
