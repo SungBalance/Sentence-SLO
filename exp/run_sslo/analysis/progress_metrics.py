@@ -8,6 +8,71 @@ from typing import Any
 DEFAULT_TAUS = (0.5, 1.0, 2.0, 5.0)
 
 
+def compute_stall_intervals(
+    chunks: list[dict[str, Any]],
+) -> list[tuple[float, float, float]]:
+    """Walk per-request chunks in order; merge contiguous stalls.
+
+    Returns list of (start_ts, end_ts, duration_s). Two consecutive
+    stalled chunks form one merged interval iff chunk N's stall_end_ts
+    equals chunk N+1's stall_start_ts (no consume break in between).
+    In practice with positive chunk_consume_time_s, stalls are
+    non-contiguous, but the merge correctly handles consume_time = 0
+    workloads and any other zero-gap edge case.
+    """
+    ordered = sorted(
+        (c for c in chunks if c.get("chunk_idx") is not None),
+        key=lambda c: c["chunk_idx"],
+    )
+    intervals: list[list[float]] = []
+    current: list[float] | None = None
+    for c in ordered:
+        dur = c.get("stall_duration_s")
+        if dur is None or dur <= 0:
+            if current is not None:
+                intervals.append(current)
+                current = None
+            continue
+        start = c.get("stall_start_ts")
+        end = c.get("stall_end_ts")
+        if start is None or end is None:
+            continue
+        start = float(start)
+        end = float(end)
+        if current is not None and current[1] == start:
+            current[1] = end
+        else:
+            if current is not None:
+                intervals.append(current)
+            current = [start, end]
+    if current is not None:
+        intervals.append(current)
+    return [(s, e, e - s) for s, e in intervals]
+
+
+def available_tokens_curve(
+    chunks: list[dict[str, Any]],
+) -> list[tuple[float, int]]:
+    """Step function of cumulative available tokens over time.
+
+    Derived from `chunk_generation_end_ts` + `cumulative_tokens_at_end`
+    per chunk. Used by M1 reconstruction in downstream plot scripts.
+    Not dumped to summary.json (size).
+    """
+    points: list[tuple[float, int]] = []
+    for c in chunks:
+        ts = c.get("chunk_generation_end_ts")
+        cum = c.get("cumulative_tokens_at_end")
+        if ts is None or cum is None:
+            continue
+        try:
+            points.append((float(ts), int(cum)))
+        except (TypeError, ValueError):
+            continue
+    points.sort(key=lambda p: p[0])
+    return points
+
+
 def _percentile(values: list[float], pct: float) -> float | None:
     if not values:
         return None
@@ -88,6 +153,11 @@ def per_request_progress(
             else None
         )
 
+        # Phase 5: merged contiguous stall intervals from
+        # stall_start_ts / stall_end_ts (chunk-record fields).
+        intervals = compute_stall_intervals(ch)
+        max_stall_interval_s = max((d for _, _, d in intervals), default=0.0)
+
         results.append({
             "request_id": rid,
             "arrival_ts": arrival_ts,
@@ -100,6 +170,9 @@ def per_request_progress(
             "max_stall_time": max_stall_time,
             "num_stall_intervals": num_stall_intervals,
             "stall_fraction": stall_fraction,
+            "stall_intervals": intervals,
+            "max_stall_interval_s": max_stall_interval_s,
+            "num_stall_intervals_merged": len(intervals),
             "num_output_tokens": req.get("num_output_tokens"),
             "num_prompt_tokens": req.get("num_prompt_tokens"),
         })
@@ -229,12 +302,14 @@ def cp_slo_violation_rates(
     per_req_progress: list[dict[str, Any]],
     taus: list[float],
 ) -> dict[str, dict[str, Any]]:
+    # Phase 5: switched basis from per-chunk `max_stall_time` to merged
+    # `max_stall_interval_s`. Contiguous stalls now count as one event.
     result: dict[str, dict[str, Any]] = {}
-    valid = [p for p in per_req_progress if p.get("max_stall_time") is not None]
+    valid = [p for p in per_req_progress if p.get("max_stall_interval_s") is not None]
     total = len(valid)
     for tau in taus:
         key = f"tau_{tau:g}"
-        violated = sum(1 for p in valid if p["max_stall_time"] > tau)
+        violated = sum(1 for p in valid if p["max_stall_interval_s"] > tau)
         result[key] = {
             "rate": (violated / total) if total > 0 else None,
             "violated": violated,

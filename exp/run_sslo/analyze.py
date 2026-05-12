@@ -296,6 +296,8 @@ def analyze(
         "prediction_ratio": {}, "stall_time": {},
         "progress_request": {}, "workload": {}, "throughput": {},
         "cp_slo_violation": {}, "measurement_window": {}, "handling_users": {},
+        # Phase 5: new top-level section for merged-interval CP-SLO metrics.
+        "cpslo": {},
     }
 
     for mode in ALL_MODES:
@@ -355,6 +357,13 @@ def analyze(
             "completion_latency":  distribution_stats(vals("completion_latency"), (50, 95, 99)),
             "demand_duration":     distribution_stats(vals("demand_duration"), (50, 95, 99)),
         }
+        # Phase 5: new merged-interval CP-SLO aggregates per mode.
+        metrics["cpslo"][mode] = {
+            "max_stall_interval_distribution": distribution_stats(
+                vals("max_stall_interval_s"), (50, 90, 99)),
+            "num_stall_intervals_merged_distribution": distribution_stats(
+                vals("num_stall_intervals_merged"), (50, 90, 99)),
+        }
         metrics["workload"][mode] = {
             "num_prompt_tokens": dist_for_key(req_rows, "num_prompt_tokens"),
             "num_output_tokens": dist_for_key(req_rows, "num_output_tokens"),
@@ -362,6 +371,11 @@ def analyze(
         }
         metrics["throughput"][mode] = pm.throughput_stats(req_rows, per_req, window)
         metrics["cp_slo_violation"][mode] = pm.cp_slo_violation_rates(per_req, list(pm.DEFAULT_TAUS))
+        # Phase 5: also surface the same violation table under the new
+        # cpslo namespace so downstream readers don't have to know the
+        # legacy key.
+        metrics["cpslo"][mode]["cp_slo_violation_rates_by_tau"] = (
+            metrics["cp_slo_violation"][mode])
         duration = (window[1] - window[0]) if (window[0] is not None and window[1] is not None) else None
         metrics["measurement_window"][mode] = {
             "start_ts":   window[0],
@@ -373,7 +387,19 @@ def analyze(
     for mode in ALL_MODES:
         sched_rows = sched_by_mode[mode]
         window = windows[mode]
-        metrics["handling_users"][mode] = pm.handling_users_stats(sched_rows, window)
+        hu_stats = pm.handling_users_stats(sched_rows, window)
+        metrics["handling_users"][mode] = hu_stats
+        # Phase 5: dual-write time-weighted mean onto scheduler.num_handling_users
+        # so downstream code can read the canonical mean from the same key
+        # without losing the existing simple-sample mean.
+        if metrics["scheduler"].get(mode) is not None:
+            nhu = metrics["scheduler"][mode].get("num_handling_users")
+            if isinstance(nhu, dict):
+                nhu["mean_time_weighted"] = hu_stats.get("time_avg")
+        # Phase 5: promote time-weighted mean into cpslo headline.
+        metrics["cpslo"].setdefault(mode, {})
+        metrics["cpslo"][mode]["mean_handling_users_time_weighted"] = (
+            hu_stats.get("time_avg"))
 
     scheduler_saturation: dict[str, Any] = {}
     for mode in SSLO_MODES:
