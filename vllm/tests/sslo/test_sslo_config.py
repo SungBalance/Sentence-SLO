@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for Phase A v2 SSLO config."""
+"""Tests for SSLO config."""
 
 import pytest
 
@@ -7,22 +7,17 @@ from vllm.sslo.config import SsloConfig
 from vllm.sslo.slo_state import RequestSLOState
 
 
-def test_defaults_match_phase_a_v2_plan():
+def test_defaults():
     cfg = SsloConfig()
     assert cfg.method == "baseline"
     assert cfg.policy == "threshold"
-    assert cfg.offloading is False
     assert cfg.adaptive_batching is False
     assert cfg.num_warmup_chunks == 4
     assert cfg.tpot_ema_alpha == 0.1
     assert cfg.critical_threshold == 1.0
     assert cfg.pending_in_threshold == 0.3
     assert cfg.pending_out_threshold == 0.7
-    assert cfg.offloading_in_threshold == 0.5
-    assert cfg.offloading_out_threshold == 0.7
     assert cfg.adaptive_batching_min_throughput_ratio == 0.9
-    assert cfg.offload_safety_margin_s == 0.05
-    assert cfg.offload_bandwidth_bytes_per_s == 1e10
     assert cfg.seconds_per_word == 0.28
     assert cfg.chunk_unit == "sentence"
     assert cfg.min_chunk_tokens == 16
@@ -39,10 +34,7 @@ def test_defaults_match_phase_a_v2_plan():
         ("tpot_ema_alpha", 1.1),
         ("critical_threshold", -0.1),
         ("pending_in_threshold", -0.1),
-        ("offloading_in_threshold", -0.1),
         ("adaptive_batching_min_throughput_ratio", 0.0),
-        ("offload_safety_margin_s", -0.1),
-        ("offload_bandwidth_bytes_per_s", 0.0),
         ("seconds_per_word", -0.1),
         ("min_chunk_tokens", -1),
     ],
@@ -55,8 +47,6 @@ def test_validation_rejects_invalid_values(field, value):
 def test_validation_rejects_bad_threshold_ordering():
     with pytest.raises(ValueError, match="pending_in_threshold"):
         SsloConfig(pending_in_threshold=0.8, pending_out_threshold=0.7)
-    with pytest.raises(ValueError, match="offloading_in_threshold"):
-        SsloConfig(offloading_in_threshold=0.8, offloading_out_threshold=0.7)
 
 
 def test_invalid_chunk_unit_raises():
@@ -73,7 +63,10 @@ def test_from_config_freezes_constants():
     )
     state = RequestSLOState.from_config(cfg)
     assert isinstance(state, RequestSLOState)
-    assert state.seconds_per_word == 0.5
+    # num_warmup_chunks persists on the instance (phase property reads it).
     assert state.num_warmup_chunks == 7
-    assert state.chunk_unit == "paragraph"
-    assert state.min_chunk_tokens == 24
+    # The other knobs propagate into the helpers built in __post_init__,
+    # not onto the instance.
+    assert state.chunk_separator.chunk_unit == "paragraph"
+    assert state.chunk_separator.min_chunk_tokens == 24
+    assert state.consume_estimator.seconds_per_word == 0.5

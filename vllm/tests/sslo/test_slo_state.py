@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for Phase A v2 SSLO request state."""
+"""Tests for SSLO request state."""
 
 import pytest
 
@@ -136,18 +136,8 @@ def test_score_none_during_warmup_or_missing_inputs():
 
     measured = measured_state()
     assert measured.pressure(0.2, None) is None
-    measured.chunk_expected_len = None
+    measured._chunk_len_predictor.value = None
     assert measured.pressure(0.2, 0.1) is None
-
-
-def test_offload_lifecycle_counters():
-    state = RequestSLOState()
-    state.on_offload_enter(2.0)
-    assert state.offload_enter_ts is not None
-    assert state.num_offload_intervals == 1
-    state.on_offload_exit(2.25)
-    assert state.offload_enter_ts is None
-    assert state.total_offload_time_s == pytest.approx(0.25)
 
 
 def test_text_delta_compatibility_flushes_by_chunk_unit():

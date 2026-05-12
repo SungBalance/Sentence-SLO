@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-_VALID_CHUNK_UNITS = frozenset({"sentence", "paragraph"})
+from vllm.sslo.slo_state import (
+    _DEFAULT_CHUNK_LEN_STRATEGY,
+    _VALID_CHUNK_LEN_STRATEGIES,
+    _VALID_CHUNK_UNITS,
+)
 
 
 @dataclass
@@ -13,19 +17,15 @@ class SsloConfig:
     #   "baseline" — schedule_sslo() runs (so chunk_records, tpot EMA, and
     #                scheduler_stats are emitted for fair comparison) but
     #                the SSLO placement decisions (critical/non-critical,
-    #                pending pool, waiting throttle, offload) are SKIPPED.
-    #                Equivalent to vanilla vLLM admission, with metrics.
+    #                pending pool, waiting throttle) are SKIPPED. Equivalent
+    #                to vanilla vLLM admission, with metrics.
     #   "sslo"     — full SSLO scheduling, algorithm chosen by `policy`.
     method: str = "baseline"
-    # SSLO placement algorithm (only meaningful when method=="sslo"):
+    # Placement algorithm (only meaningful when method=="sslo"):
     #   None        — placeholder; raises if method=="sslo".
-    #   "threshold" — hysteresis (in/out thresholds); legacy v1.
-    #   "pressure"  — pressure-budget admission; legacy v2.
-    #   "buffer"    — buffer-based admission (placeholder, not yet
-    #                 implemented).
-    #   "combined"  — combined policy (placeholder, not yet implemented).
+    #   "threshold" — hysteresis (in/out thresholds).
+    #   "pressure"  — pressure-budget admission.
     policy: str | None = "threshold"
-    offloading: bool = False
     adaptive_batching: bool = False
     num_warmup_chunks: int = 4
     tpot_ema_alpha: float = 0.1
@@ -37,18 +37,18 @@ class SsloConfig:
     #   in (0.3, 0.7) → keep current state (hysteresis band)
     pending_in_threshold: float = 0.3
     pending_out_threshold: float = 0.7
-    offloading_in_threshold: float = 0.5
-    offloading_out_threshold: float = 0.7
     adaptive_batching_min_throughput_ratio: float = 0.9
     # Hard floor for adaptive batching: the smallest profiled bucket whose
     # throughput is still ≥ this fraction of `max_num_seqs / base_tpot`.
     # Below it the cap shouldn't shrink — losing more than (1 - ratio) of
     # the base throughput isn't worth the latency relief.
     adaptive_batching_low_cap_throughput_ratio: float = 0.25
-    offload_safety_margin_s: float = 0.05
-    offload_bandwidth_bytes_per_s: float = 1e10
     seconds_per_word: float = 0.28
     chunk_unit: str = "sentence"
+    # Chunk-length predictor strategy: "ema" / "p90" / "p99" /
+    # "past-future" (placeholder). Picks the conservatism point for
+    # the predicted-remaining-tokens used by pressure().
+    chunk_len_strategy: str = _DEFAULT_CHUNK_LEN_STRATEGY
     # Defer flushing a found chunk boundary until the accumulated token count
     # since the last flush reaches this threshold. Short chunks (e.g. "Yes.")
     # are merged into the next chunk so the consume_time and chunk EMA are
@@ -60,6 +60,11 @@ class SsloConfig:
             raise ValueError(
                 f"chunk_unit must be one of {sorted(_VALID_CHUNK_UNITS)}, "
                 f"got {self.chunk_unit!r}")
+        if self.chunk_len_strategy not in _VALID_CHUNK_LEN_STRATEGIES:
+            raise ValueError(
+                f"chunk_len_strategy must be one of "
+                f"{sorted(_VALID_CHUNK_LEN_STRATEGIES)}, "
+                f"got {self.chunk_len_strategy!r}")
         if self.num_warmup_chunks < 1:
             raise ValueError(
                 f"num_warmup_chunks must be >= 1, "
@@ -74,9 +79,6 @@ class SsloConfig:
                 "critical_threshold",
                 "pending_in_threshold",
                 "pending_out_threshold",
-                "offloading_in_threshold",
-                "offloading_out_threshold",
-                "offload_safety_margin_s",
                 "seconds_per_word",
         ):
             value = getattr(self, name)
@@ -85,21 +87,14 @@ class SsloConfig:
         if self.min_chunk_tokens < 0:
             raise ValueError(
                 f"min_chunk_tokens must be >= 0, got {self.min_chunk_tokens}")
-        if self.offload_bandwidth_bytes_per_s <= 0:
-            raise ValueError(
-                f"offload_bandwidth_bytes_per_s must be > 0, "
-                f"got {self.offload_bandwidth_bytes_per_s}")
         if self.pending_in_threshold > self.pending_out_threshold:
             raise ValueError(
                 "pending_in_threshold must be <= pending_out_threshold")
-        if self.offloading_in_threshold > self.offloading_out_threshold:
-            raise ValueError(
-                "offloading_in_threshold must be <= offloading_out_threshold")
         if self.method not in ("baseline", "sslo"):
             raise ValueError(
                 f"method must be 'baseline' or 'sslo', "
                 f"got {self.method!r}")
-        valid_policies = (None, "threshold", "pressure", "buffer", "combined")
+        valid_policies = (None, "threshold", "pressure")
         if self.policy not in valid_policies:
             raise ValueError(
                 f"policy must be one of {valid_policies}, "

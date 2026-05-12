@@ -14,7 +14,6 @@ an `SsloRequestStats` value from `vllm.sslo.slo_state.RequestSLOState` with:
 - `neg_slack_chunk_count`: count of chunks with `cumulative_slack < 0`.
 - `total_pending_time_s`: sum of chunk pending time.
 - `num_pending_intervals`: number of pending intervals entered by the request.
-- `max_consecutive_pending`: longest consecutive pending-enter streak.
 - `final_ema_gen_time_s`: final chunk generation-time estimator value.
 - `final_ema_per_word_time_s`: final estimator per-token field as currently
   exposed by `RequestSLOState.compute_stats()`.

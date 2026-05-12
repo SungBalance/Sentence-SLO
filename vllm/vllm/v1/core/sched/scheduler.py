@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import json
+import math
 import os
 import time
 from collections import defaultdict, deque
@@ -64,16 +65,16 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 # SSLO
-from vllm.sslo.slo_state import Phase
+from vllm.sslo.slo_state import Phase, RequestSLOState
 
 
 # SSLO: per-step scheduler state. Reset at the top of every
 # `_apply_sslo_policy` call; read by `_compute_admission_budget_and_backfill`,
-# `_sslo_dump_step_stats`, the offload eligibility check, and the waiting-loop
-# admission gate in `schedule_sslo`.
+# `_sslo_dump_step_stats`, and the waiting-loop admission gate in
+# `schedule_sslo`.
 @dataclass
 class SsloStepState:
-    active_cap: int = 0
+    cur_max_num_requests: int = 0
     has_critical: bool = False
     avg_score: float | None = None
     max_score: float | None = None
@@ -209,13 +210,14 @@ class Scheduler(SchedulerInterface):
         self._sslo_capture_sizes_below_base: tuple[int, ...] = tuple(
             sorted((n for n in capture_sizes if n < self.max_num_running_reqs),
                    reverse=True))
-        # SSLO: wall-clock-per-step EMA across ALL steps (incl. prefill mix).
-        # Used by pressure() so forward projection reflects the actual rate at
-        # which a running request is making progress, not the steady-state
-        # decode rate.
-        self._sslo_wall_step_ema_s: float = 0.0
-        # SSLO
-        self.sslo_offloaded: set[str] = set()
+        # SSLO: wall-clock-per-step EMA keyed by (batch_size, num_prefills).
+        # Used by pressure() so forward projection picks the cell matching
+        # the upcoming step's expected composition. Falls back through
+        # same-batch-any-prefills avg → global avg → None at cold start.
+        self._sslo_step_wall_ema: dict[int, dict[int, float]] = {}
+        # SSLO: count of prefill-active requests in the previous step, used
+        # by _update_tpot_ema to key into _sslo_step_wall_ema.
+        self._sslo_prev_step_num_prefills: int = 0
         # SSLO
         self._sslo_prev_step_batch: int | None = None
         # SSLO
@@ -224,10 +226,10 @@ class Scheduler(SchedulerInterface):
         self._sslo_prev_step_start_ts: float | None = None
         # SSLO: pre-step num_computed_tokens snapshot for decoding-only detection
         self._sslo_pre_step_computed: dict[str, int] = {}
-        # SSLO: per-step scheduler state (active_cap / has_critical / avg+max
+        # SSLO: per-step scheduler state (cur_max_num_requests / has_critical / avg+max
         # pressure / waiting_admission_budget). Recomputed at the top of every
         # _apply_sslo_policy call; see SsloStepState definition above.
-        self._sslo_step = SsloStepState(active_cap=self.max_num_running_reqs)
+        self._sslo_step = SsloStepState(cur_max_num_requests=self.max_num_running_reqs)
         # SSLO: dedup for request_done log writes (multiple cleanup paths
         # call _sslo_log_request_done per request).
         self._sslo_done_logged: set[str] = set()
@@ -1028,26 +1030,21 @@ class Scheduler(SchedulerInterface):
         return scheduler_output
 
     # SSLO
-    def _update_tpot_ema(
-        self,
-        now: float,
-        scheduler_output: SchedulerOutput | None = None,
-    ) -> None:
-        del scheduler_output
+    def _update_tpot_ema(self, now: float) -> None:
         prev_batch = self._sslo_prev_step_batch
         if prev_batch is None or self._sslo_prev_step_start_ts is None:
             return
         delta = now - self._sslo_prev_step_start_ts
         alpha = self.sslo_config.tpot_ema_alpha
 
-        # Wall-step EMA: every step, regardless of decoding-only or batch
-        # size. Used by pressure() so forward projection sees the real wall
-        # clock per step (prefill cost included).
-        if self._sslo_wall_step_ema_s == 0.0:
-            self._sslo_wall_step_ema_s = delta
-        else:
-            self._sslo_wall_step_ema_s = (
-                alpha * delta + (1 - alpha) * self._sslo_wall_step_ema_s)
+        # Wall-step EMA keyed by (batch_size, num_prefills). Every step
+        # contributes to its cell; lookup at policy entry picks the
+        # matching cell for the upcoming step's expected composition.
+        prev_prefills = self._sslo_prev_step_num_prefills
+        bucket = self._sslo_step_wall_ema.setdefault(prev_batch, {})
+        prev_val = bucket.get(prev_prefills)
+        bucket[prev_prefills] = (
+            delta if prev_val is None else alpha * delta + (1 - alpha) * prev_val)
 
         # Per-bucket TPOT EMA: decoding-only steps whose batch size matches
         # a CUDA-graph-captured size. Adaptive batching only picks caps
@@ -1061,6 +1058,34 @@ class Scheduler(SchedulerInterface):
                 delta if prev is None else alpha * delta + (1 - alpha) * prev)
 
     # SSLO
+    def _sslo_step_ema_lookup(self, admitted: list[Request]) -> float | None:
+        """Pick the wall-step EMA cell that best matches the upcoming step.
+
+        Fallback chain:
+          1. exact (batch_size, num_prefills)
+          2. average of same-batch cells
+          3. global average across all cells
+          4. None (cold-start, no samples yet)
+        """
+        batch_size = len(admitted)
+        num_prefills = sum(
+            1 for req in admitted
+            if (getattr(req, "num_computed_tokens", 0)
+                < getattr(req, "num_prompt_tokens", 0)))
+        bucket = self._sslo_step_wall_ema.get(batch_size)
+        if bucket:
+            if num_prefills in bucket:
+                return bucket[num_prefills]
+            return sum(bucket.values()) / len(bucket)
+        all_vals = [
+            v for cells in self._sslo_step_wall_ema.values()
+            for v in cells.values()
+        ]
+        if all_vals:
+            return sum(all_vals) / len(all_vals)
+        return None
+
+    # SSLO
     def _record_step_for_next_ema(
         self,
         scheduler_output: SchedulerOutput,
@@ -1072,17 +1097,25 @@ class Scheduler(SchedulerInterface):
         # time we get here, num_computed_tokens has been incremented for
         # scheduled tokens, which would mask partial-prefill (chunked) steps.
         self._sslo_prev_step_batch = len(scheduler_output.num_scheduled_tokens)
+        new_req_ids = {
+            r.request_id for r in scheduler_output.scheduled_new_reqs}
+        prefill_count = len(new_req_ids)
         decoding_only = scheduler_output.total_num_scheduled_tokens > 0
-        if decoding_only and scheduler_output.scheduled_new_reqs:
+        if new_req_ids:
             decoding_only = False
-        if decoding_only:
-            for req_id in scheduler_output.num_scheduled_tokens:
-                req = self.requests.get(req_id)
-                pre = self._sslo_pre_step_computed.get(req_id)
-                if req is None or pre is None or pre < req.num_prompt_tokens:
-                    decoding_only = False
-                    break
+        for req_id in scheduler_output.num_scheduled_tokens:
+            if req_id in new_req_ids:
+                continue
+            req = self.requests.get(req_id)
+            pre = self._sslo_pre_step_computed.get(req_id)
+            if req is None or pre is None:
+                decoding_only = False
+                continue
+            if pre < req.num_prompt_tokens:
+                prefill_count += 1
+                decoding_only = False
         self._sslo_prev_step_decoding_only = decoding_only
+        self._sslo_prev_step_num_prefills = prefill_count
         self._sslo_prev_step_start_ts = now
 
         # SSLO: per-request step accounting. Increments total_step_count
@@ -1095,28 +1128,44 @@ class Scheduler(SchedulerInterface):
                 req.slo_state.on_step(decoding_only)
 
     # SSLO
-    def _classify_tier(self, req: Request, pressure: float | None) -> int:
+    def _state_pressure(
+        self,
+        state: "RequestSLOState",
+        now: float,
+        tpot: float | None,
+    ) -> float:
+        # Normalize the "not measurable" sentinel to 1.0 so downstream code
+        # sees only finite-or-inf. 1.0 = "exactly at deadline given current
+        # TPOT" — a deliberately pessimistic prior for requests we can't
+        # score yet (PREFILL/WARMUP, missing tpot, or no predictor sample).
+        pressure = state.pressure(now, tpot)
+        return 1.0 if pressure is None else pressure
+
+    # SSLO
+    def _classify_tier(self, req: Request, pressure: float) -> int:
         state = req.slo_state
-        assert state is not None
+        # Defensive — a request scheduled before _bind_slo_state has run
+        # (narrow inproc-engine window) has no slo_state. Treat it as
+        # tier 2 so it sorts after warmup and critical.
+        if state is None:
+            return 2
         if state.phase == Phase.WARMUP:
             return 1
-        if pressure is not None and pressure >= self.sslo_config.critical_threshold:
+        if pressure >= self.sslo_config.critical_threshold:
             return 0
         return 2
 
     # SSLO
-    def _priority_key(self, pressure: float | None, request_id: str):
-        if pressure is None:
-            return (1, 0.0, request_id)
+    def _priority_key(self, pressure: float, request_id: str):
         if pressure == float("inf"):
-            return (0, -float("inf"), request_id)
-        return (0, -pressure, request_id)
+            return (-float("inf"), request_id)
+        return (-pressure, request_id)
 
     # SSLO
     def _admit_priority_key(
         self,
         req: Request,
-        pressures: dict[str, float | None],
+        pressures: dict[str, float],
         tiers: dict[str, int],
     ):
         # Tier 1 (warmup) goes first, then pressure-priority within the rest.
@@ -1128,36 +1177,55 @@ class Scheduler(SchedulerInterface):
         )
 
     # SSLO
-    def _apply_sslo_threshold(self, now: float) -> dict[str, float | None]:
-        """SSLO placement using hysteresis (in/out thresholds). Legacy v1."""
-        # Reload BEFORE placement so a request whose offloaded_score crossed
-        # the reload threshold can compete in this step's placement instead
-        # of waiting for the next one.
-        self._update_tpot_ema(now)
-        self._reload_check(now)
-        self._sslo_step = SsloStepState(active_cap=self.max_num_running_reqs)
-        prev_pending_ids = {req.request_id for req in self.sslo_pending}
-        base_n = self.max_num_running_reqs
-        # Score uses the wall-step EMA (prefill-aware) so forward projection
-        # tracks actual progress, not idealised decode-only TPOT. None until
-        # at least one step has been observed.
-        base_tpot = (
-            self._sslo_wall_step_ema_s
-            if self._sslo_wall_step_ema_s > 0.0 else None)
-        admitted = list(self.running) + list(self.sslo_pending)
-        pressures, tiers = self._compute_pressures(admitted, now, base_tpot)
-        self._sslo_step.has_critical = any(tier == 0 for tier in tiers.values())
+    def _sslo_step_setup(self, now: float):
+        """Common per-step setup shared by all policy functions.
 
-        # Update aggregate pressures BEFORE backfill so admission cap uses the
-        # current step's avg, not the previous step's. Inf pressures would skew
-        # the average; drop them and treat the bucket as empty if all are inf.
-        finite = [
-            s for s in pressures.values()
-            if s is not None and s != float("inf")
-        ]
-        if finite:
-            self._sslo_step.avg_score = sum(finite) / len(finite)
-            self._sslo_step.max_score = max(finite)
+        Returns (prev_pending_ids, admitted, base_tpot, pressures, tiers).
+        Side effects: ticks the wall-step EMA, resets ``self._sslo_step``,
+        and folds finite pressures into avg/max via _finalize_aggregates.
+        Each policy is still responsible for setting ``has_critical`` /
+        ``cur_max_num_requests`` / ``waiting_admission_budget`` and the
+        actual placement decision.
+        """
+        self._update_tpot_ema(now)
+        self._sslo_step = SsloStepState(
+            cur_max_num_requests=self.max_num_running_reqs)
+        prev_pending_ids = {req.request_id for req in self.sslo_pending}
+        admitted = list(self.running) + list(self.sslo_pending)
+        base_tpot = self._sslo_step_ema_lookup(admitted)
+        pressures, tiers = self._compute_pressures(admitted, now, base_tpot)
+        self._finalize_aggregates(pressures)
+        return prev_pending_ids, admitted, base_tpot, pressures, tiers
+
+    # SSLO
+    def _sslo_commit_step(
+        self,
+        prev_pending_ids: set[str],
+        new_running: list[Request],
+        new_pending: list[Request],
+        now: float,
+    ) -> None:
+        """Common per-step commit: install placement, fire lifecycle
+        events, account per-chunk steps, and dump per-step stats."""
+        self.running = new_running
+        self.sslo_pending = new_pending
+        self._fire_pending_lifecycle(
+            prev_pending_ids, new_running, new_pending, now)
+        self._account_per_chunk_step(new_running, new_pending)
+        self._sslo_dump_step_stats(now)
+
+    # SSLO
+    def _apply_sslo_threshold(self, now: float) -> dict[str, float]:
+        """SSLO placement using hysteresis (in/out thresholds)."""
+        prev_pending_ids, admitted, base_tpot, pressures, tiers = (
+            self._sslo_step_setup(now))
+        base_n = self.max_num_running_reqs
+        # has_critical only when we have a real tpot signal — otherwise the
+        # 1.0 default from _state_pressure would trip MEASURED-phase reqs
+        # into the critical branch on cold start.
+        self._sslo_step.has_critical = (
+            base_tpot is not None
+            and any(tier == 0 for tier in tiers.values()))
 
         if self._sslo_step.has_critical:
             cap = base_n
@@ -1169,7 +1237,7 @@ class Scheduler(SchedulerInterface):
                     tpot_pick = self.tpot_ema.get(picked)
                     pressures, tiers = self._compute_pressures(
                         admitted, now, tpot_pick)
-            self._sslo_step.active_cap = cap
+            self._sslo_step.cur_max_num_requests = cap
             # SSLO: warmup-protect — Tier 1 (chunks_completed < num_warmup_chunks)
             # always goes to running first, ahead of priority-sorted measured
             # requests. Score isn't computable for warmup, so without this
@@ -1177,19 +1245,24 @@ class Scheduler(SchedulerInterface):
             sorted_admitted = sorted(
                 admitted,
                 key=lambda r: self._admit_priority_key(r, pressures, tiers))
-            new_running = [
-                req for req in sorted_admitted
-                if req.request_id not in self.sslo_offloaded
-            ][:cap]
-            new_running_ids = {req.request_id for req in new_running}
-            new_pending = [
-                req for req in sorted_admitted
-                if req.request_id not in new_running_ids
-            ]
+            new_running = sorted_admitted[:cap]
+            new_pending = sorted_admitted[cap:]
+            # Explicit (was relying on the SsloStepState default).
+            self._sslo_step.waiting_admission_budget = 0
+        elif base_tpot is None:
+            # Score-suspend: no tpot signal — hold current placement and
+            # skip both hysteresis classification and backfill. Allow
+            # waiting admission up to slack so the very first step has
+            # something to run and seed the EMA.
+            new_running = list(self.running)
+            new_pending = list(self.sslo_pending)
+            self._sslo_step.cur_max_num_requests = base_n
+            waiting_count = len(self.waiting) + len(self.skipped_waiting)
+            self._sslo_step.waiting_admission_budget = min(
+                waiting_count, max(0, base_n - len(new_running)))
         else:
-            score_suspend = base_tpot is None
             cands_running, cands_pending = self._classify_non_critical(
-                admitted, pressures, tiers, prev_pending_ids, score_suspend)
+                admitted, pressures, tiers, prev_pending_ids)
             cap = base_n
             if len(cands_running) > cap:
                 cands_running.sort(
@@ -1197,72 +1270,36 @@ class Scheduler(SchedulerInterface):
                 overflow = cands_running[cap:]
                 cands_running = cands_running[:cap]
                 cands_pending.extend(overflow)
-            self._sslo_step.active_cap = cap
+            self._sslo_step.cur_max_num_requests = cap
             self._compute_admission_budget_and_backfill(
                 cands_running, cands_pending, pressures)
             new_running = cands_running
             new_pending = cands_pending
 
-        self.running = new_running
-        self.sslo_pending = new_pending
-        self._fire_pending_lifecycle(prev_pending_ids, new_running, new_pending, now)
-        # SSLO
-        self._account_per_chunk_step(new_running, new_pending)
-        self._sslo_dump_step_stats(now)
+        self._sslo_commit_step(prev_pending_ids, new_running, new_pending, now)
         return pressures
 
     # SSLO
     def _apply_sslo_baseline(
         self, now: float
-    ) -> dict[str, float | None]:
+    ) -> dict[str, float]:
         """Baseline mode: emit stats only, skip all SSLO scheduling.
 
         Keeps self.running / self.sslo_pending as-is and lets the engine's
         normal admission loop fill running up to max_num_running_reqs.
         Pressures are computed and recorded for parity with sslo runs.
         """
-        self._update_tpot_ema(now)
-        self._sslo_step = SsloStepState(active_cap=self.max_num_running_reqs)
-        prev_pending_ids = {req.request_id for req in self.sslo_pending}
-        base_n = self.max_num_running_reqs
-        base_tpot = (
-            self._sslo_wall_step_ema_s
-            if self._sslo_wall_step_ema_s > 0.0 else None)
-        admitted = list(self.running) + list(self.sslo_pending)
-        pressures, tiers = self._compute_pressures(admitted, now, base_tpot)
-        finite = [
-            s for s in pressures.values()
-            if s is not None and s != float("inf")
-        ]
-        if finite:
-            self._sslo_step.avg_score = sum(finite) / len(finite)
-            self._sslo_step.max_score = max(finite)
+        prev_pending_ids, _, _, pressures, _ = self._sslo_step_setup(now)
         self._sslo_step.has_critical = False
-        self._sslo_step.active_cap = base_n
-        # Vanilla admission: just fill the gap up to max_num_running_reqs.
-        waiting_count = len(self.waiting) + len(self.skipped_waiting)
-        self._sslo_step.waiting_admission_budget = min(
-            waiting_count, max(0, base_n - len(self.running)))
-        new_running = list(self.running)
-        new_pending = list(self.sslo_pending)
-        self.running = new_running
-        self.sslo_pending = new_pending
-        self._fire_pending_lifecycle(prev_pending_ids, new_running, new_pending, now)
-        self._account_per_chunk_step(new_running, new_pending)
-        self._sslo_dump_step_stats(now)
+        # Baseline does not gate admission — engine's running-loop cap
+        # (len(self.running) == max_num_running_reqs) is the only fence.
+        # Set the budget to the full waiting count so the schedule_sslo
+        # wait-loop doesn't short-circuit on sslo_admit_remaining.
+        self._sslo_step.waiting_admission_budget = (
+            len(self.waiting) + len(self.skipped_waiting))
+        self._sslo_commit_step(
+            prev_pending_ids, self.running, self.sslo_pending, now)
         return pressures
-
-    # SSLO
-    def _apply_sslo_buffer(self, now: float) -> dict[str, float | None]:
-        """Buffer-based admission policy (placeholder, not yet implemented)."""
-        raise NotImplementedError(
-            "policy='buffer' is reserved but not implemented yet")
-
-    # SSLO
-    def _apply_sslo_combined(self, now: float) -> dict[str, float | None]:
-        """Combined admission policy (placeholder, not yet implemented)."""
-        raise NotImplementedError(
-            "policy='combined' is reserved but not implemented yet")
 
     # SSLO
     def _resolve_sslo_policy_dispatch(self):
@@ -1270,10 +1307,8 @@ class Scheduler(SchedulerInterface):
 
         method=='baseline' → _apply_sslo_baseline (placement skipped).
         method=='sslo'     → policy chooses the algorithm:
-            'threshold' → _apply_sslo_threshold (legacy v1 hysteresis)
-            'pressure'  → _apply_sslo_pressure  (legacy v2)
-            'buffer'    → _apply_sslo_buffer    (placeholder)
-            'combined'  → _apply_sslo_combined  (placeholder)
+            'threshold' → _apply_sslo_threshold (hysteresis in/out)
+            'pressure'  → _apply_sslo_pressure  (pressure budget)
         """
         if self.sslo_config.method == "baseline":
             return self._apply_sslo_baseline
@@ -1281,8 +1316,6 @@ class Scheduler(SchedulerInterface):
         dispatch = {
             "threshold": self._apply_sslo_threshold,
             "pressure": self._apply_sslo_pressure,
-            "buffer": self._apply_sslo_buffer,
-            "combined": self._apply_sslo_combined,
         }
         if policy not in dispatch:
             raise ValueError(
@@ -1290,42 +1323,25 @@ class Scheduler(SchedulerInterface):
         return dispatch[policy]
 
     # SSLO
-    def _apply_sslo_pressure(self, now: float) -> dict[str, float | None]:
-        """Pressure-budget admission policy (no offload). Three branches:
+    def _apply_sslo_pressure(self, now: float) -> dict[str, float]:
+        """Pressure-budget admission policy. Three branches:
         score-suspend, critical, and non-critical."""
-        self._update_tpot_ema(now)
-        self._sslo_step = SsloStepState(active_cap=self.max_num_running_reqs)
-        prev_pending_ids = {req.request_id for req in self.sslo_pending}
+        prev_pending_ids, admitted, base_tpot, pressures, tiers = (
+            self._sslo_step_setup(now))
         M = self.max_num_running_reqs
-        base_tpot = (
-            self._sslo_wall_step_ema_s
-            if self._sslo_wall_step_ema_s > 0.0 else None)
-        admitted = list(self.running) + list(self.sslo_pending)
-        pressures, tiers = self._compute_pressures(admitted, now, base_tpot)
-
-        finite = [
-            s for s in pressures.values()
-            if s is not None and s != float("inf")
-        ]
-        if finite:
-            self._sslo_step.avg_score = sum(finite) / len(finite)
-            self._sslo_step.max_score = max(finite)
 
         if base_tpot is None:
             # Branch 1: score-suspend — no TPOT yet, hold current placement.
+            # Allow waiting admission up to slack so the very first step
+            # has something to run; the resulting wall-step seeds the EMA.
             waiting_count = len(self.waiting) + len(self.skipped_waiting)
             self._sslo_step.waiting_admission_budget = min(
                 waiting_count, max(0, M - len(self.running)))
-            self._sslo_step.active_cap = M
+            self._sslo_step.cur_max_num_requests = M
             self._sslo_step.has_critical = False
             new_running = list(self.running)
             new_pending = list(self.sslo_pending)
-        elif any(
-            p is not None
-            and (p == float("inf")
-                 or p >= self.sslo_config.critical_threshold)
-            for p in pressures.values()
-        ):
+        elif any(tier == 0 for tier in tiers.values()):
             # Branch 2: critical mode — same cap logic as v1.
             self._sslo_step.has_critical = True
             cap = M
@@ -1336,46 +1352,43 @@ class Scheduler(SchedulerInterface):
                     tpot_pick = self.tpot_ema.get(picked)
                     pressures, tiers = self._compute_pressures(
                         admitted, now, tpot_pick)
-            self._sslo_step.active_cap = cap
+            self._sslo_step.cur_max_num_requests = cap
             sorted_admitted = sorted(
                 admitted,
                 key=lambda r: self._admit_priority_key(r, pressures, tiers))
             new_running = sorted_admitted[:cap]
-            new_running_ids = {req.request_id for req in new_running}
-            new_pending = [
-                req for req in sorted_admitted
-                if req.request_id not in new_running_ids
-            ]
+            new_pending = sorted_admitted[cap:]
             self._sslo_step.waiting_admission_budget = 0
         else:
             # Branch 3: non-critical mode — pressure-budget admission.
+            # D = total normalized pressure of admitted requests. Inf is
+            # capped at 1.0 (already-late requests can't ask for more than
+            # one slot of budget). Other Nones never appear because
+            # _state_pressure normalized them upstream.
             self._sslo_step.has_critical = False
-            D = 0.0
-            for req in admitted:
-                p = pressures[req.request_id]
-                D += p if (p is not None and p != float("inf")) else 1.0
+            D = sum(
+                1.0 if p == float("inf") else p
+                for p in pressures.values())
             waiting_count = len(self.waiting) + len(self.skipped_waiting)
             self._sslo_step.waiting_admission_budget = max(
-                0, min(waiting_count, int(M - D)))
-            cands_running_size = M - self._sslo_step.waiting_admission_budget
+                0, min(waiting_count, math.floor(M - D)))
+            # Cap cands_running_size by the step cap so a high D
+            # (many concurrent at-deadline reqs) can't push running over M.
+            cands_running_size = min(
+                M, M - self._sslo_step.waiting_admission_budget)
             sorted_admitted = sorted(
                 admitted,
                 key=lambda r: self._admit_priority_key(r, pressures, tiers))
             new_running = sorted_admitted[:cands_running_size]
             new_pending = sorted_admitted[cands_running_size:]
-            self._sslo_step.active_cap = M
+            self._sslo_step.cur_max_num_requests = M
 
-        self.running = new_running
-        self.sslo_pending = new_pending
-        self._fire_pending_lifecycle(prev_pending_ids, new_running, new_pending, now)
-        # SSLO
-        self._account_per_chunk_step(new_running, new_pending)
-        self._sslo_dump_step_stats(now)
+        self._sslo_commit_step(prev_pending_ids, new_running, new_pending, now)
         return pressures
 
     # SSLO
+    @staticmethod
     def _account_per_chunk_step(
-        self,
         running: list[Request],
         pending: list[Request],
     ) -> None:
@@ -1396,47 +1409,56 @@ class Scheduler(SchedulerInterface):
         admitted: list[Request],
         now: float,
         tpot: float | None,
-    ) -> tuple[dict[str, float | None], dict[str, int]]:
-        pressures: dict[str, float | None] = {}
+    ) -> tuple[dict[str, float], dict[str, int]]:
+        pressures: dict[str, float] = {}
         tiers: dict[str, int] = {}
         for req in admitted:
             state = req.slo_state
-            assert state is not None
-            pressure = state.pressure(now, tpot)
+            if state is None:
+                # Fast-path for requests pre-bind (narrow inproc window).
+                # Treat as default 1.0 / tier 2.
+                pressures[req.request_id] = 1.0
+                tiers[req.request_id] = 2
+                continue
+            pressure = self._state_pressure(state, now, tpot)
             pressures[req.request_id] = pressure
             tiers[req.request_id] = self._classify_tier(req, pressure)
         return pressures, tiers
 
     # SSLO
+    def _finalize_aggregates(self, pressures: dict[str, float]) -> None:
+        # Pull avg/max into _sslo_step. Inf is dropped (it skews the
+        # average); None never appears because _compute_pressures
+        # normalizes via _state_pressure.
+        finite = [p for p in pressures.values() if p != float("inf")]
+        if finite:
+            self._sslo_step.avg_score = sum(finite) / len(finite)
+            self._sslo_step.max_score = max(finite)
+
+    # SSLO
     def _classify_non_critical(
         self,
         admitted: list[Request],
-        pressures: dict[str, float | None],
+        pressures: dict[str, float],
         tiers: dict[str, int],
         prev_pending_ids: set[str],
-        score_suspend: bool,
     ) -> tuple[list[Request], list[Request]]:
-        if score_suspend:
-            return list(self.running), list(self.sslo_pending)
         in_thr = self.sslo_config.pending_in_threshold
         out_thr = self.sslo_config.pending_out_threshold
         cands_running: list[Request] = []
         cands_pending: list[Request] = []
         for req in admitted:
-            if req.request_id in self.sslo_offloaded:
-                cands_pending.append(req)
-                continue
             pressure = pressures[req.request_id]
             tier = tiers[req.request_id]
             in_pending = req.request_id in prev_pending_ids
             if tier == 1:
                 cands_running.append(req)
             elif in_pending:
-                if pressure is not None and pressure >= out_thr:
+                if pressure >= out_thr:
                     cands_running.append(req)
                 else:
                     cands_pending.append(req)
-            elif pressure is not None and pressure <= in_thr:
+            elif pressure <= in_thr:
                 cands_pending.append(req)
             else:
                 cands_running.append(req)
@@ -1447,20 +1469,24 @@ class Scheduler(SchedulerInterface):
         self,
         cands_running: list[Request],
         cands_pending: list[Request],
-        pressures: dict[str, float | None],
+        pressures: dict[str, float],
     ) -> None:
-        # Admission cap uses N / avg_pressure (max_capacity): the system
-        # can sustain that many concurrent admitted requests on average.
-        # Reserve up to (max_capacity - combined) slots for new waiting;
-        # the rest of the slack is backfilled from pending so this
-        # step's batch hits cap when supply exists.
-        cap = self._sslo_step.active_cap
+        # Intent: when avg_pressure < 1, the system can sustain more than
+        # `cap` concurrent admitted requests on average, so admission is
+        # opened up to the full `slack` (cap - len(cands_running)). The
+        # N/avg_p formula expresses that ceiling; the `slack` arg in the
+        # min(...) below is the effective floor when slack is the binding
+        # bound — that's deliberate, not a degeneracy.
+        cap = self._sslo_step.cur_max_num_requests
         slack = cap - len(cands_running)
         waiting_count = len(self.waiting) + len(self.skipped_waiting)
         combined = len(cands_running) + len(cands_pending)
         avg_p = self._sslo_step.avg_score
         if avg_p is not None and avg_p > 0:
-            max_capacity = int(self.max_num_running_reqs / avg_p)
+            # Use cur_max_num_requests (the step's effective cap) rather
+            # than the hard max_num_running_reqs ceiling, so an adaptive
+            # cap shrink propagates correctly.
+            max_capacity = int(cap / avg_p)
             admission_capacity = max(0, max_capacity - combined)
         else:
             admission_capacity = slack
@@ -1470,11 +1496,8 @@ class Scheduler(SchedulerInterface):
             0, slack - self._sslo_step.waiting_admission_budget)
         if backfill_budget <= 0 or not cands_pending:
             return
-        pending_pool = [
-            r for r in cands_pending
-            if r.request_id not in self.sslo_offloaded
-        ]
-        pending_pool.sort(
+        pending_pool = sorted(
+            cands_pending,
             key=lambda r: self._priority_key(
                 pressures[r.request_id], r.request_id))
         for pick in pending_pool[:backfill_budget]:
@@ -1494,14 +1517,14 @@ class Scheduler(SchedulerInterface):
             "ts": now,
             "running": len(self.running),
             "pending": len(self.sslo_pending),
-            "offloaded": len(self.sslo_offloaded),
             "num_handling_users": len(self.running) + len(self.sslo_pending),
             "waiting": len(self.waiting) + len(self.skipped_waiting),
-            "active_cap": self._sslo_step.active_cap,
+            "cur_max_num_requests": self._sslo_step.cur_max_num_requests,
             "has_critical": self._sslo_step.has_critical,
             "avg_score": self._sslo_step.avg_score,
             "max_score": self._sslo_step.max_score,
-            "wall_step_ema_s": self._sslo_wall_step_ema_s,
+            "step_wall_ema_cells": sum(
+                len(cells) for cells in self._sslo_step_wall_ema.values()),
         }
         with open(log_path, "a") as f:
             f.write(json.dumps(stats_row) + "\n")
@@ -1537,10 +1560,8 @@ class Scheduler(SchedulerInterface):
             req for req in self.sslo_pending
             if req.request_id != request.request_id
         ]
-        self.sslo_offloaded.discard(request.request_id)
         if request.slo_state is not None:
             request.slo_state.on_pending_exit(now)
-            request.slo_state.on_offload_exit(now)
             self._sslo_log_request_done(request, now)
 
     # SSLO
@@ -1558,15 +1579,10 @@ class Scheduler(SchedulerInterface):
         rid = request.request_id
         if rid in self._sslo_done_logged:
             return
-        # request.request_id is the engine-internal "<user_id>-<uuid>" form;
-        # split off the user_id prefix for cross-referencing chunks.jsonl
-        # which uses the user-side id.
-        user_id = rid.split("-", 1)[0] if "-" in rid else rid
         row = {
             "kind": "request_done",
             "ts": now,
             "request_id": rid,
-            "user_request_id": user_id,
             "total_step_count": state.total_step_count,
             "prefill_step_count": state.prefill_step_count,
             "chunks_completed": state.chunks_completed,
@@ -1580,132 +1596,6 @@ class Scheduler(SchedulerInterface):
             pass
 
     # SSLO
-    def _pick_offload_victim(
-        self,
-        now: float,
-        pressures: dict[str, float | None] | None = None,
-    ) -> Request | None:
-        candidates = [
-            req for req in self.sslo_pending
-            if self._is_offload_eligible(
-                req, now, pressures.get(req.request_id) if pressures else None)
-        ]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda req: self._offloaded_score(req, now))
-
-    # SSLO
-    def _is_offload_eligible(
-        self,
-        req: Request,
-        now: float,
-        pressure: float | None = None,
-    ) -> bool:
-        if not self.sslo_config.offloading or self._sslo_step.has_critical:
-            return False
-        state = req.slo_state
-        assert state is not None
-        if state.phase == Phase.WARMUP:
-            return False
-        if req.request_id in self.sslo_offloaded:
-            return False
-        if pressure is None:
-            base_tpot = (
-                self._sslo_wall_step_ema_s
-                if self._sslo_wall_step_ema_s > 0.0 else None)
-            pressure = state.pressure(now, base_tpot)
-        if pressure is None:
-            return False
-        if pressure >= self.sslo_config.critical_threshold:
-            return False
-        if pressure >= self.sslo_config.offloading_in_threshold:
-            return False
-        return self._offloaded_score(req, now) < (
-            self.sslo_config.offloading_in_threshold)
-
-    # SSLO
-    def _offloaded_score(self, req: Request, now: float) -> float:
-        # Cost-adjusted pressure: replace ttd with effective_ttd that accounts
-        # for offload + reload + safety_margin. Reuse state.pressure() to keep
-        # the formula in one place.
-        state = req.slo_state
-        assert state is not None
-        time_to_deadline = state.time_to_deadline(now)
-        if time_to_deadline is None or time_to_deadline <= 0:
-            return float("inf")
-        transfer_s = self._estimate_transfer_s(req)
-        effective_ttd = (
-            time_to_deadline
-            - 2 * transfer_s
-            - self.sslo_config.offload_safety_margin_s
-        )
-        if effective_ttd <= 0:
-            return float("inf")
-        base_tpot = (
-            self._sslo_wall_step_ema_s
-            if self._sslo_wall_step_ema_s > 0.0 else None)
-        base_score = state.pressure(now, base_tpot)
-        if base_score is None or base_score == float("inf"):
-            return float("inf")
-        return base_score * (time_to_deadline / effective_ttd)
-
-    # SSLO
-    def _estimate_transfer_s(self, req: Request) -> float:
-        block_count = 0
-        try:
-            blocks = self.kv_cache_manager.get_blocks(req.request_id)
-            for group_blocks in blocks.get_block_ids(allow_none=True):
-                if group_blocks:
-                    block_count += len(group_blocks)
-        except Exception:
-            block_count = 0
-        if block_count == 0:
-            return 0.0
-        bytes_per_block = self._sslo_bytes_per_block()
-        bandwidth = self.sslo_config.offload_bandwidth_bytes_per_s
-        return block_count * bytes_per_block / bandwidth
-
-    # SSLO
-    def _sslo_bytes_per_block(self) -> float:
-        try:
-            bytes_per_elem = getattr(self.cache_config, "cache_dtype_size", 2)
-            num_layers = sum(
-                len(group.layer_names)
-                for group in self.kv_cache_config.kv_cache_groups)
-            return float(self.cache_config.block_size * 2 * bytes_per_elem *
-                         max(1, num_layers))
-        except AttributeError:
-            return float(getattr(self.cache_config, "block_size", 16) * 4)
-
-    # SSLO
-    def _offload(self, req: Request, now: float) -> None:
-        # Phase A v2: marking only. Real KV transfer is deferred to a later
-        # phase. Bookkeeping = scheduler set + state lifecycle hook.
-        self.sslo_offloaded.add(req.request_id)
-        state = req.slo_state
-        assert state is not None
-        state.on_offload_enter(now)
-
-    # SSLO
-    def _begin_reload(self, req: Request, now: float) -> None:
-        # Phase A v2: marking only. See _offload above.
-        self.sslo_offloaded.discard(req.request_id)
-        state = req.slo_state
-        assert state is not None
-        state.on_offload_exit(now)
-
-    # SSLO
-    def _reload_check(self, now: float) -> None:
-        for req_id in list(self.sslo_offloaded):
-            req = self.requests.get(req_id)
-            if req is None:
-                self.sslo_offloaded.discard(req_id)
-                continue
-            if self._offloaded_score(req, now) >= (
-                self.sslo_config.offloading_out_threshold):
-                self._begin_reload(req, now)
-
-    # SSLO
     def _pick_adaptive_n(
         self,
         admitted: list[Request],
@@ -1714,7 +1604,8 @@ class Scheduler(SchedulerInterface):
         base_tpot: float | None,
     ) -> int | None:
         base_n = self.max_num_running_reqs
-        if not base_tpot:
+        # Explicit None / non-positive check.
+        if base_tpot is None or base_tpot <= 0:
             return None
         if not self._sslo_capture_sizes_below_base:
             return None  # CUDA graphs disabled — no smaller cap is safe.
@@ -1759,9 +1650,9 @@ class Scheduler(SchedulerInterface):
         if not candidates:
             return None
 
-        # Phase A v2 spec: pick the LARGEST n that resolves all critical
-        # (= preserves throughput while still clearing critical) over the
-        # smallest. Candidates are already in descending order.
+        # Pick the LARGEST n that resolves all critical (= preserves
+        # throughput while still clearing critical) over the smallest.
+        # Candidates are already in descending order.
         for n in candidates:
             tpot_n = self.tpot_ema[n]
             all_resolved = True
@@ -1770,8 +1661,8 @@ class Scheduler(SchedulerInterface):
                     continue
                 state = req.slo_state
                 assert state is not None
-                pressure = state.pressure(now, tpot_n)
-                if pressure is None or pressure >= self.sslo_config.critical_threshold:
+                pressure = self._state_pressure(state, now, tpot_n)
+                if pressure >= self.sslo_config.critical_threshold:
                     all_resolved = False
                     break
             if all_resolved:
@@ -1785,8 +1676,8 @@ class Scheduler(SchedulerInterface):
                     continue
                 state = req.slo_state
                 assert state is not None
-                pressure = state.pressure(now, tpot_n)
-                if pressure is not None and pressure != float("inf") and pressure > worst:
+                pressure = self._state_pressure(state, now, tpot_n)
+                if pressure != float("inf") and pressure > worst:
                     worst = pressure
             return worst
 
@@ -1842,7 +1733,6 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            # SSLO: request.slo_state.cumulative_slack is available here if slo_state is set
 
             if (
                 request.num_output_placeholders > 0
@@ -2236,15 +2126,6 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    # SSLO: pass precomputed pressures to avoid recomputing them
-                    victim = self._pick_offload_victim(
-                        scheduled_timestamp, sslo_scores)
-                    # SSLO
-                    if victim is not None:
-                        # SSLO
-                        self._offload(victim, scheduled_timestamp)
-                        # SSLO
-                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -2336,15 +2217,12 @@ class Scheduler(SchedulerInterface):
         # the running loop) so backfilled requests get tokens this step and
         # batch size stays at cap in non-adaptive mode.
 
-        # SSLO: _reload_check already runs at the head of _apply_sslo_policy
-        # so reloaded requests participate in this step's placement.
-
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
         assert token_budget >= 0
-        assert len(self.running) <= self._sslo_step.active_cap
+        assert len(self.running) <= self._sslo_step.cur_max_num_requests
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
@@ -3337,6 +3215,10 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.free(request)
         # SSLO
         self._sslo_clear_pending_state(request, time.monotonic())
+        # SSLO: prune the done-log dedup set now that the request is
+        # being removed from self.requests; nothing else can hand-roll a
+        # duplicate log for this rid after this point.
+        self._sslo_done_logged.discard(request.request_id)
         del self.requests[request.request_id]
 
     @property

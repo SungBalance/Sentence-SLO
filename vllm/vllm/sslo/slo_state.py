@@ -2,10 +2,13 @@
 """SSLO request lifecycle state for score-based scheduling."""
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import InitVar, asdict, dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING
+
+import numpy as np
 
 if TYPE_CHECKING:
     from vllm.sslo.config import SsloConfig
@@ -13,7 +16,7 @@ if TYPE_CHECKING:
 _SENTENCE_END_CHARS = frozenset(".!?。！？…")
 _VALID_CHUNK_UNITS = frozenset({"sentence", "paragraph"})
 
-_VALID_CHUNK_LEN_STRATEGIES = frozenset({"ema", "p90", "p99"})
+_VALID_CHUNK_LEN_STRATEGIES = frozenset({"ema", "p90", "p99", "past-future"})
 _DEFAULT_CHUNK_LEN_STRATEGY = "p90"
 _CHUNK_LEN_HISTORY_MAX = 64
 _CHUNK_LEN_EMA_ALPHA = 0.2
@@ -28,11 +31,15 @@ class Phase(IntEnum):
 class ChunkLengthPredictor:
     """Predict the next chunk's generated_len from completed chunks.
 
-    Three strategies select different points on the conservatism axis:
+    Strategies select different points on the conservatism axis:
       - "ema": EMA (alpha) — smooth, follows the central tendency.
       - "p90"/"p99": percentile over a sliding window — conservative
         upper bound that biases score() toward overestimating remaining
         work (and therefore admission/preemption pressure).
+      - "past-future": placeholder for a future strategy that combines
+        past-window and future-projection signals. Currently a no-op
+        stub; selecting it leaves `value` at None, so pressure() will
+        also be None (i.e. that request opts out of scoring).
     """
 
     def __init__(
@@ -48,27 +55,37 @@ class ChunkLengthPredictor:
         self.strategy = strategy
         self.history_max = history_max
         self.alpha = alpha
-        self._history: list[int] = []
+        self._history: deque[int] = deque(maxlen=history_max)
         self._ema: float | None = None
         self.value: float | None = None
+        # p99 companion value, populated only when strategy == "p90".
+        # expected_remaining_len() falls back to it when generated tokens
+        # exceed the p90 prediction so pressure() doesn't collapse to 1.
+        self.value_high: float | None = None
+        if strategy == "ema":
+            self.update = self.update_ema
+        elif strategy in ("p90", "p99"):
+            self.update = self.update_percentile
+        elif strategy == "past-future":
+            self.update = self.update_past_future
 
-    def update(self, generated_len: int) -> None:
+    def update_ema(self, generated_len: int) -> None:
         n = int(generated_len)
-        if self.strategy == "ema":
-            self._ema = float(n) if self._ema is None else (
-                self.alpha * n + (1.0 - self.alpha) * self._ema)
-            self.value = self._ema
-            return
-        self._history.append(n)
-        if len(self._history) > self.history_max:
-            self._history.pop(0)
-        sorted_h = sorted(self._history)
+        self._ema = float(n) if self._ema is None else (
+            self.alpha * n + (1.0 - self.alpha) * self._ema)
+        self.value = self._ema
+
+    def update_percentile(self, generated_len: int) -> None:
+        self._history.append(int(generated_len))
+        arr = np.fromiter(self._history, dtype=float)
         percentile = 90.0 if self.strategy == "p90" else 99.0
-        idx = min(
-            len(sorted_h) - 1,
-            int(len(sorted_h) * percentile / 100.0),
-        )
-        self.value = float(sorted_h[idx])
+        self.value = float(np.percentile(arr, percentile, method="nearest"))
+        if self.strategy == "p90":
+            self.value_high = float(
+                np.percentile(arr, 99.0, method="nearest"))
+
+    def update_past_future(self, generated_len: int) -> None:
+        pass
 
 
 class ChunkConsumeEstimator:
@@ -98,6 +115,15 @@ class ChunkSeparator:
     `min_chunk_tokens` tokens accumulated since the last flush are
     deferred — the boundary advances past them so a short fragment
     (e.g. "Yes.") merges into the next chunk.
+
+    Sentence vs paragraph boundary asymmetry: in sentence mode the
+    yielded chunk ends right after the sentence-end punctuation, and
+    trailing whitespace stays in the buffer as the next chunk's prefix.
+    In paragraph mode the chunk INCLUDES the trailing ``\\n\\n``
+    separator so the buffer can advance past it without re-matching the
+    boundary on the next feed. Word counts (`split()`) and the default
+    consume estimator ignore whitespace, so downstream math is
+    unaffected; callers that display chunks verbatim should strip.
     """
 
     def __init__(
@@ -179,20 +205,20 @@ class ChunkRecord:
     slack_s: float
     pending_time_s: float
     word_count: int
-    # SSLO: chunk start wall-clock — prev chunk's gen_finish_ts, or
+    # Chunk start wall-clock — prev chunk's gen_finish_ts, or
     # decoding_start_ts for chunk 0.
     start_time_ts: float
-    # SSLO: tokens generated within this chunk window.
+    # Tokens generated within this chunk window.
     num_token: int
-    # SSLO: scheduler-step accounting per chunk window. num_iters =
-    # num_running_iters + num_pending_iters_per_chunk.
+    # Scheduler-step accounting per chunk window.
+    # num_iters = num_running_iters + num_pending_iters.
     num_iters: int
     num_running_iters: int
-    num_pending_iters_per_chunk: int
-    # SSLO: predictor's estimate (in tokens) at chunk start — i.e. value
-    # used by pressure() during this chunk's generation. None for chunk 0
-    # (no history yet) and any time before the predictor has a value.
-    # Compare to num_token to measure prediction accuracy.
+    num_pending_iters: int
+    # Predictor's estimate (in tokens) at chunk start — i.e. value used by
+    # pressure() during this chunk's generation. None for chunk 0 (no
+    # history yet) and any time before the predictor has a value. Compare
+    # to num_token to measure prediction accuracy.
     expected_len: float | None
 
 
@@ -208,7 +234,7 @@ class ChunkStatCollector:
         self.records: list[ChunkRecord] = []
         self.stall_time_total: float = 0.0
         self._current_pending_s: float = 0.0
-        # SSLO: per-chunk scheduler-step tallies, reset at each record().
+        # Per-chunk scheduler-step tallies, reset at each record().
         self._current_running_iters: int = 0
         self._current_pending_iters: int = 0
 
@@ -238,10 +264,10 @@ class ChunkStatCollector:
                 num_token=num_token,
                 num_iters=running_iters + pending_iters,
                 num_running_iters=running_iters,
-                num_pending_iters_per_chunk=pending_iters,
+                num_pending_iters=pending_iters,
                 expected_len=expected_len,
             ))
-        # SSLO: aggregate stall = max(0, -slack); positive only when late.
+        # Aggregate stall = max(0, -slack); positive only when late.
         self.stall_time_total += max(0.0, -slack_s)
         self._current_pending_s = 0.0
         self._current_running_iters = 0
@@ -250,11 +276,9 @@ class ChunkStatCollector:
     def accumulate_pending(self, interval_s: float) -> None:
         self._current_pending_s += interval_s
 
-    # SSLO
     def accumulate_running_step(self) -> None:
         self._current_running_iters += 1
 
-    # SSLO
     def accumulate_pending_step(self) -> None:
         self._current_pending_iters += 1
 
@@ -267,8 +291,6 @@ class SsloRequestStats:
     chunk_stall_time_total: float
     total_pending_time_s: float
     num_pending_intervals: int
-    total_offload_time_s: float
-    num_offload_intervals: int
     chunks_completed: int
     final_chunk_expected_len: float | None
     # Scheduler-side step accounting. total_step_count = scheduler steps in
@@ -292,44 +314,50 @@ class RequestSLOState:
     chunks_completed: int = 0
     current_chunk_generated_len: int = 0
 
-    # Offload.
-    offload_enter_ts: float | None = None
-
     # Diagnostic output.
-    chunk_stats: ChunkStatCollector | None = None
+    chunk_stats: ChunkStatCollector = field(default_factory=ChunkStatCollector)
     total_pending_time_s: float = 0.0
     num_pending_intervals: int = 0
     pending_enter_ts: float | None = None
-    total_offload_time_s: float = 0.0
-    num_offload_intervals: int = 0
     # Scheduler step accounting (incremented by Scheduler each step).
     total_step_count: int = 0
     prefill_step_count: int = 0
 
-    # Config snapshots — used to construct the default helpers below.
-    # Provide chunk_separator / consume_estimator directly to override.
-    seconds_per_word: float = 0.28
+    # num_warmup_chunks lives on the instance because `phase` reads it
+    # every call. The other config knobs are consumed only at construction
+    # to build chunk_separator / consume_estimator / predictor, so they're
+    # InitVars and don't persist as instance attributes.
     num_warmup_chunks: int = 4
-    chunk_unit: str = "sentence"
-    chunk_len_strategy: str = _DEFAULT_CHUNK_LEN_STRATEGY
-    min_chunk_tokens: int = 16
-    chunk_separator: ChunkSeparator | None = None
-    consume_estimator: ChunkConsumeEstimator | None = None
+    seconds_per_word: InitVar[float] = 0.28
+    chunk_unit: InitVar[str] = "sentence"
+    chunk_len_strategy: InitVar[str] = _DEFAULT_CHUNK_LEN_STRATEGY
+    min_chunk_tokens: InitVar[int] = 16
+    # Override hooks — resolved in __post_init__ into non-Optional
+    # instance attributes so callers don't have to None-check on use.
+    chunk_separator: InitVar[ChunkSeparator | None] = None
+    consume_estimator: InitVar[ChunkConsumeEstimator | None] = None
 
-    def __post_init__(self) -> None:
-        if self.num_warmup_chunks < 0:
-            raise ValueError("num_warmup_chunks must be >= 0")
-        if self.chunk_separator is None:
-            self.chunk_separator = ChunkSeparator(
-                chunk_unit=self.chunk_unit,
-                min_chunk_tokens=self.min_chunk_tokens)
-        if self.consume_estimator is None:
-            self.consume_estimator = ChunkConsumeEstimator(
-                seconds_per_word=self.seconds_per_word)
-        if self.chunk_stats is None:
-            self.chunk_stats = ChunkStatCollector()
+    def __post_init__(
+        self,
+        seconds_per_word: float,
+        chunk_unit: str,
+        chunk_len_strategy: str,
+        min_chunk_tokens: int,
+        chunk_separator: ChunkSeparator | None,
+        consume_estimator: ChunkConsumeEstimator | None,
+    ) -> None:
+        if self.num_warmup_chunks < 1:
+            raise ValueError("num_warmup_chunks must be >= 1")
+        self.chunk_separator: ChunkSeparator = (
+            chunk_separator if chunk_separator is not None
+            else ChunkSeparator(
+                chunk_unit=chunk_unit,
+                min_chunk_tokens=min_chunk_tokens))
+        self.consume_estimator: ChunkConsumeEstimator = (
+            consume_estimator if consume_estimator is not None
+            else ChunkConsumeEstimator(seconds_per_word=seconds_per_word))
         self._chunk_len_predictor = ChunkLengthPredictor(
-            strategy=self.chunk_len_strategy)
+            strategy=chunk_len_strategy)
 
     @classmethod
     def from_config(cls, config: "SsloConfig") -> "RequestSLOState":
@@ -337,6 +365,7 @@ class RequestSLOState:
             seconds_per_word=config.seconds_per_word,
             num_warmup_chunks=config.num_warmup_chunks,
             chunk_unit=config.chunk_unit,
+            chunk_len_strategy=config.chunk_len_strategy,
             min_chunk_tokens=config.min_chunk_tokens,
         )
 
@@ -360,12 +389,6 @@ class RequestSLOState:
     def chunk_expected_len(self) -> float | None:
         return self._chunk_len_predictor.value
 
-    @chunk_expected_len.setter
-    def chunk_expected_len(self, value: float | None) -> None:
-        # Direct assignment used by tests to inject a value bypassing the
-        # predictor; keeps the predictor's `value` consistent.
-        self._chunk_len_predictor.value = value
-
     def chunk_deadline(self) -> float | None:
         # next_deadline_ts is initialized to decoding_start_ts on the first
         # on_token / on_chunk_boundary call, then advanced by the recurrence
@@ -380,7 +403,17 @@ class RequestSLOState:
         predicted = self._chunk_len_predictor.value
         if predicted is None:
             return None
-        return max(1.0, predicted - self.current_chunk_generated_len)
+        remaining = predicted - self.current_chunk_generated_len
+        if remaining <= 0:
+            # Over-shoot: this chunk is already longer than the p90
+            # prediction. Fall back to the p99 companion so pressure()
+            # keeps reflecting real remaining work instead of collapsing
+            # to the 1.0 floor below. value_high is only populated under
+            # strategy="p90"; for other strategies the floor is used.
+            high = self._chunk_len_predictor.value_high
+            if high is not None:
+                return max(1.0, high - self.current_chunk_generated_len)
+        return max(1.0, remaining)
 
     def pressure(self, now: float, tpot_s: float | None) -> float | None:
         """Forward-looking urgency (= remaining_work / time_to_deadline,
@@ -390,6 +423,15 @@ class RequestSLOState:
         from `score` because the value is dimensioned like load pressure
         (utilization-of-budget) and the semantics carry through the
         scheduler.
+
+        Return-value contract:
+          - ``None`` — not measurable yet (PREFILL/WARMUP, missing tpot,
+            or predictor has no value).
+          - ``float('inf')`` — deadline already passed (time_to_deadline
+            <= 0). Callers MUST handle inf: it propagates through max()
+            and >= comparisons, but breaks averaging (drop inf before
+            computing aggregate pressures).
+          - finite float — normal urgency.
         """
         if self.phase != Phase.MEASURED:
             return None
@@ -405,13 +447,16 @@ class RequestSLOState:
             return float("inf")
         return (remaining * tpot_s) / time_to_deadline
 
-    def on_token(self, now: float) -> None:
+    def _ensure_decoding_started(self, now: float) -> None:
+        # Lazy bootstrap of decoding_start_ts and next_deadline_ts on the
+        # first token / chunk event. deadline(0) = decoding_start_ts so
+        # chunk 0 is "due immediately"; its slack is forced to 0 below.
         if self.decoding_start_ts is None:
             self.decoding_start_ts = now
-            # SSLO: deadline(0) = decoding_start_ts (chunk 0 due immediately;
-            # slack is forced to 0 at chunk 0's boundary anyway).
-            if self.next_deadline_ts is None:
-                self.next_deadline_ts = now
+            self.next_deadline_ts = now
+
+    def on_token(self, now: float) -> None:
+        self._ensure_decoding_started(now)
         self.current_chunk_generated_len += 1
 
     def on_chunk_boundary(
@@ -420,9 +465,7 @@ class RequestSLOState:
         word_count: int,
         chunk_consume_time_s: float,
     ) -> None:
-        if self.decoding_start_ts is None:
-            self.decoding_start_ts = now
-            self.next_deadline_ts = now
+        self._ensure_decoding_started(now)
 
         deadline = self.chunk_deadline()
         assert deadline is not None
@@ -432,16 +475,20 @@ class RequestSLOState:
         # only chunks 1+ where the consumer has a real budget.
         if self.chunks_completed == 0:
             slack = 0.0
-            # SSLO: chunk 0 starts at decoding_start_ts.
+            # Chunk 0 starts at decoding_start_ts.
             start_time_ts = self.decoding_start_ts
         else:
             slack = deadline - now
-            # SSLO: subsequent chunks start where the previous one ended.
+            # Subsequent chunks start where the previous one ended.
             start_time_ts = self.chunk_stats.records[-1].gen_finish_ts
-        generated_len = self.current_chunk_generated_len or max(1, word_count)
-        # SSLO: capture the actual generated-token count before reset.
+        # Invariant: tokens are always accumulated (via on_token /
+        # on_text_delta) before a chunk boundary is observed. on_finish's
+        # tail flush only fires when prior on_text_delta calls added the
+        # tokens that produced the held-back text.
         num_token = self.current_chunk_generated_len
-        # SSLO: predictor's value BEFORE this chunk's update — i.e. the
+        assert num_token > 0, (
+            "on_chunk_boundary requires at least one accumulated token")
+        # Predictor's value BEFORE this chunk's update — i.e. the
         # estimate that pressure() used during this chunk's generation.
         expected_len = self._chunk_len_predictor.value
 
@@ -455,7 +502,7 @@ class RequestSLOState:
             num_token=num_token,
             expected_len=expected_len,
         )
-        self._chunk_len_predictor.update(int(generated_len))
+        self._chunk_len_predictor.update(num_token)
 
         # Stall-aware deadline recurrence (t = chunk index just completed):
         #   deadline(t+1) = max(deadline(t), finish(t)) + consume(t)
@@ -491,16 +538,6 @@ class RequestSLOState:
         if not decoding_only:
             self.prefill_step_count += 1
 
-    def on_offload_enter(self, now: float) -> None:
-        if self.offload_enter_ts is None:
-            self.offload_enter_ts = now
-            self.num_offload_intervals += 1
-
-    def on_offload_exit(self, now: float) -> None:
-        if self.offload_enter_ts is not None:
-            self.total_offload_time_s += now - self.offload_enter_ts
-        self.offload_enter_ts = None
-
     def on_text_delta(
         self,
         text: str,
@@ -510,8 +547,12 @@ class RequestSLOState:
         if not text and num_tokens <= 0:
             return
         delta_tokens = num_tokens if num_tokens > 0 else 1
-        for _ in range(delta_tokens):
-            self.on_token(now)
+        # Hot path: bulk-add tokens instead of calling on_token N times.
+        # Each call would re-check decoding_start_ts and burn one
+        # attribute write per token; with chunked prefill / speculative
+        # decoding N can be 8+ per delta.
+        self._ensure_decoding_started(now)
+        self.current_chunk_generated_len += delta_tokens
         for chunk_text in self.chunk_separator.feed(text, delta_tokens):
             word_count = len(chunk_text.split())
             self.on_chunk_boundary(
@@ -542,8 +583,6 @@ class RequestSLOState:
             chunk_stall_time_total=self.chunk_stall_time_total,
             total_pending_time_s=self.total_pending_time_s,
             num_pending_intervals=self.num_pending_intervals,
-            total_offload_time_s=self.total_offload_time_s,
-            num_offload_intervals=self.num_offload_intervals,
             chunks_completed=self.chunks_completed,
             final_chunk_expected_len=self._chunk_len_predictor.value,
             total_step_count=self.total_step_count,

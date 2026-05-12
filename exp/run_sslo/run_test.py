@@ -114,8 +114,7 @@ def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
             "num_token": _val(record, "num_token"),
             "num_iters": _val(record, "num_iters"),
             "num_running_iters": _val(record, "num_running_iters"),
-            "num_pending_iters_per_chunk":
-                _val(record, "num_pending_iters_per_chunk"),
+            "num_pending_iters": _val(record, "num_pending_iters"),
             "expected_len": _val(record, "expected_len"),
         })
     return normalized
@@ -158,7 +157,6 @@ async def collect_request(
             "slo_chunk_records": [],
             "total_pending_time_s": None,
             "num_pending_intervals": 0,
-            "max_consecutive_pending": 0,
         }
 
     metrics = getattr(last_output, "metrics", None)
@@ -197,9 +195,6 @@ async def collect_request(
     num_pending_iters_per_request = (
         getattr(sslo_metrics, "num_pending_intervals", 0) if sslo_metrics else 0
     )
-    max_consecutive_pending = (
-        getattr(sslo_metrics, "max_consecutive_pending", 0) if sslo_metrics else 0
-    )
 
     return {
         "request_id": request_id,
@@ -215,7 +210,6 @@ async def collect_request(
         "slo_chunk_records": slo_chunk_records,
         "total_pending_time_s": total_pending_time_s,
         "num_pending_iters_per_request": num_pending_iters_per_request,
-        "max_consecutive_pending": max_consecutive_pending,
     }
 
 
