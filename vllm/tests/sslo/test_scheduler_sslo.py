@@ -567,3 +567,44 @@ def test_v2_score_suspend_waiting_budget_limited_by_waiting_count():
     assert scheduler._sslo_step.waiting_admission_budget == 3
 
 
+
+
+# ---------------------------------------------------------------------------
+# Phase 2B tests: admitted_ts and terminal_outcome via scheduler paths
+# ---------------------------------------------------------------------------
+
+def test_admitted_ts_set_on_first_admission_via_mark():
+    # Verify the state machine directly: mark_admitted fires once,
+    # is idempotent, and propagates to compute_stats().
+    state = make_state()
+    t1 = 1.0
+    t2 = 2.0
+    state.mark_admitted(t1)
+    state.mark_admitted(t2)  # second call must not overwrite
+    assert state.admitted_ts == pytest.approx(t1)
+    stats = state.compute_stats()
+    assert stats.admitted_ts == pytest.approx(t1)
+
+
+def test_terminal_outcome_completed_on_free():
+    # _free_blocks calls mark_terminal("completed") before _sslo_clear_pending_state.
+    # Simulate: build a minimal request with slo_state, call _free_blocks on it.
+    state = make_state()
+    req = make_request("r1", state)
+
+    # _free_blocks asserts request.is_finished(); attach that method.
+    req.is_finished = lambda: True
+
+    scheduler = make_scheduler(running=[req])
+    scheduler._free_blocks(req)
+
+    assert state.terminal_outcome == "completed"
+    assert state.compute_stats().terminal_outcome == "completed"
+
+
+def test_terminal_outcome_default_in_progress_before_free():
+    # terminal_outcome must start as "in_progress" and not change until free.
+    state = make_state()
+    assert state.terminal_outcome == "in_progress"
+    stats = state.compute_stats()
+    assert stats.terminal_outcome == "in_progress"

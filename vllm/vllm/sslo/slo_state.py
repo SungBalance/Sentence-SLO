@@ -226,6 +226,20 @@ class ChunkRecord:
     stall_start_ts: float | None
     stall_end_ts: float | None
     stall_duration_s: float
+    # Cumulative token indices: half-open [token_start_idx, token_end_idx).
+    token_start_idx: int = 0
+    token_end_idx: int = 0
+    cumulative_tokens_at_end: int = 0
+    # Consume time persisted here for CP-SLO export; same value used to
+    # advance next_deadline_ts in on_chunk_boundary.
+    chunk_consume_time_s: float = 0.0
+    # Demand window: [deadline_ts, deadline_ts + chunk_consume_time_s).
+    demand_window_start_ts: float = 0.0
+    demand_window_end_ts: float = 0.0
+    # p99 companion from the predictor — only populated under p90 strategy.
+    expected_chunk_len_high: float | None = None
+    # Which predictor strategy produced expected_len.
+    predictor_source: str = ""
 
 
 class ChunkStatCollector:
@@ -258,6 +272,14 @@ class ChunkStatCollector:
         stall_start_ts: float | None,
         stall_end_ts: float | None,
         stall_duration_s: float,
+        token_start_idx: int,
+        token_end_idx: int,
+        cumulative_tokens_at_end: int,
+        chunk_consume_time_s: float,
+        demand_window_start_ts: float,
+        demand_window_end_ts: float,
+        expected_chunk_len_high: float | None,
+        predictor_source: str,
     ) -> None:
         running_iters = self._current_running_iters
         pending_iters = self._current_pending_iters
@@ -278,6 +300,14 @@ class ChunkStatCollector:
                 stall_start_ts=stall_start_ts,
                 stall_end_ts=stall_end_ts,
                 stall_duration_s=stall_duration_s,
+                token_start_idx=token_start_idx,
+                token_end_idx=token_end_idx,
+                cumulative_tokens_at_end=cumulative_tokens_at_end,
+                chunk_consume_time_s=chunk_consume_time_s,
+                demand_window_start_ts=demand_window_start_ts,
+                demand_window_end_ts=demand_window_end_ts,
+                expected_chunk_len_high=expected_chunk_len_high,
+                predictor_source=predictor_source,
             ))
         # Aggregate stall = max(0, -slack); positive only when late.
         self.stall_time_total += max(0.0, -slack_s)
@@ -315,6 +345,10 @@ class SsloRequestStats:
     # Wall-clock when the consumer can start reading: set at chunk 0 finish,
     # equals d(0) under the new contract.
     consume_start_ts: float | None = None
+    # Wall-clock of first waiting→running transition; None if never admitted.
+    admitted_ts: float | None = None
+    # Final disposition of the request.
+    terminal_outcome: str = "in_progress"
 
 
 @dataclass
@@ -333,6 +367,13 @@ class RequestSLOState:
     # d(0) = chunk_0_gen_finish_ts, not decoding_start_ts, because the
     # consumer cannot start until the first chunk is actually available.
     consume_start_ts: float | None = None
+
+    # Wall-clock of first waiting→running transition. Idempotent — only
+    # set once; re-entries (running→pending→running) do not update it.
+    admitted_ts: float | None = None
+
+    # Final request disposition, updated at cleanup time.
+    terminal_outcome: str = "in_progress"
 
     # Diagnostic output.
     chunk_stats: ChunkStatCollector = field(default_factory=ChunkStatCollector)
@@ -378,6 +419,8 @@ class RequestSLOState:
             else ChunkConsumeEstimator(seconds_per_word=seconds_per_word))
         self._chunk_len_predictor = ChunkLengthPredictor(
             strategy=chunk_len_strategy)
+        # Running cumulative token count; reset at each chunk boundary.
+        self._cumulative_tokens: int = 0
 
     @classmethod
     def from_config(cls, config: "SsloConfig") -> "RequestSLOState":
@@ -468,6 +511,13 @@ class RequestSLOState:
             return float("inf")
         return (remaining * tpot_s) / time_to_deadline
 
+    def mark_admitted(self, now: float) -> None:
+        if self.admitted_ts is None:
+            self.admitted_ts = now
+
+    def mark_terminal(self, outcome: str) -> None:
+        self.terminal_outcome = outcome
+
     def _ensure_decoding_started(self, now: float) -> None:
         # Lazy bootstrap of decoding_start_ts and next_deadline_ts on the
         # first token / chunk event.
@@ -520,6 +570,10 @@ class RequestSLOState:
         # estimate that pressure() used during this chunk's generation.
         expected_len = self._chunk_len_predictor.value
 
+        token_start_idx = self._cumulative_tokens
+        token_end_idx = self._cumulative_tokens + num_token
+        self._cumulative_tokens = token_end_idx
+
         self.chunk_stats.record(
             chunk_idx=self.chunks_completed,
             deadline_ts=deadline,
@@ -532,6 +586,14 @@ class RequestSLOState:
             stall_start_ts=stall_start_ts,
             stall_end_ts=stall_end_ts,
             stall_duration_s=stall_duration_s,
+            token_start_idx=token_start_idx,
+            token_end_idx=token_end_idx,
+            cumulative_tokens_at_end=token_end_idx,
+            chunk_consume_time_s=chunk_consume_time_s,
+            demand_window_start_ts=deadline,
+            demand_window_end_ts=deadline + chunk_consume_time_s,
+            expected_chunk_len_high=self._chunk_len_predictor.value_high,
+            predictor_source=self._chunk_len_predictor.strategy,
         )
         self._chunk_len_predictor.update(num_token)
 
@@ -619,6 +681,8 @@ class RequestSLOState:
             total_step_count=self.total_step_count,
             prefill_step_count=self.prefill_step_count,
             consume_start_ts=self.consume_start_ts,
+            admitted_ts=self.admitted_ts,
+            terminal_outcome=self.terminal_outcome,
         )
 
     def chunk_records_asdict(self) -> list[dict]:

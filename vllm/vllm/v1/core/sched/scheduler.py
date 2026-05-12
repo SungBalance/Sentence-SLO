@@ -2178,6 +2178,9 @@ class Scheduler(SchedulerInterface):
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
                 if request.status == RequestStatus.WAITING:
+                    # SSLO
+                    if request.slo_state is not None:
+                        request.slo_state.mark_admitted(scheduled_timestamp)
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
@@ -3214,6 +3217,8 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         # SSLO
+        if request.slo_state is not None:
+            request.slo_state.mark_terminal("completed")
         self._sslo_clear_pending_state(request, time.monotonic())
         # SSLO: prune the done-log dedup set now that the request is
         # being removed from self.requests; nothing else can hand-roll a

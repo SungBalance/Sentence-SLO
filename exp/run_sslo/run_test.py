@@ -20,6 +20,7 @@ from lm_datasets import load_prompts
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from metrics_utils import MODES_DEFAULT
+from analysis.cpslo_names import classify_request
 
 
 DEFAULT_OUTPUT_DIR = "exp/run_sslo/output"
@@ -116,6 +117,22 @@ def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
             "num_running_iters": _val(record, "num_running_iters"),
             "num_pending_iters": _val(record, "num_pending_iters"),
             "expected_len": _val(record, "expected_len"),
+            # CP-SLO canonical names (dual-write alongside legacy keys above).
+            "chunk_deadline_ts": deadline,
+            "chunk_deadline_margin_s": slack,
+            "chunk_generation_start_ts": start_ts,
+            "chunk_generation_end_ts": end_ts,
+            "token_start_idx": _val(record, "token_start_idx"),
+            "token_end_idx": _val(record, "token_end_idx"),
+            "cumulative_tokens_at_end": _val(record, "cumulative_tokens_at_end"),
+            "chunk_consume_time_s": _val(record, "chunk_consume_time_s"),
+            "demand_window_start_ts": _val(record, "demand_window_start_ts"),
+            "demand_window_end_ts": _val(record, "demand_window_end_ts"),
+            "expected_chunk_len_high": _val(record, "expected_chunk_len_high"),
+            "predictor_source": _val(record, "predictor_source"),
+            "stall_start_ts": _val(record, "stall_start_ts"),
+            "stall_end_ts": _val(record, "stall_end_ts"),
+            "stall_duration_s": _val(record, "stall_duration_s"),
         })
     return normalized
 
@@ -196,6 +213,22 @@ async def collect_request(
         getattr(sslo_metrics, "num_pending_intervals", 0) if sslo_metrics else 0
     )
 
+    admitted_ts_val = (
+        getattr(sslo_metrics, "admitted_ts", None) if sslo_metrics else None
+    )
+    consume_start_ts_val = (
+        getattr(sslo_metrics, "consume_start_ts", None) if sslo_metrics else None
+    )
+    terminal_outcome_val = (
+        getattr(sslo_metrics, "terminal_outcome", "in_progress") if sslo_metrics else "in_progress"
+    )
+    queue_stall_s = (
+        float(admitted_ts_val) - float(queued)
+        if (admitted_ts_val is not None and queued is not None and admitted_ts_val >= queued)
+        else None
+    )
+    reference_output_tokens = num_gen if num_gen > 0 else None
+    request_class = classify_request(reference_output_tokens)
     return {
         "request_id": request_id,
         "request_idx": request_idx,
@@ -210,6 +243,18 @@ async def collect_request(
         "slo_chunk_records": slo_chunk_records,
         "total_pending_time_s": total_pending_time_s,
         "num_pending_iters_per_request": num_pending_iters_per_request,
+        # CP-SLO lifecycle fields.
+        "admitted_ts": admitted_ts_val,
+        "consume_start_ts": consume_start_ts_val,
+        "terminal_outcome": terminal_outcome_val,
+        "queue_stall_s": queue_stall_s,
+        # CP-SLO canonical aliases (same values, new names).
+        "first_token_ts": first_ts,
+        "TTFC": ttfc,
+        "num_pending_intervals": num_pending_iters_per_request,
+        # F2: request classification by observed generation length.
+        "reference_output_tokens": reference_output_tokens,
+        "request_class": request_class,
     }
 
 

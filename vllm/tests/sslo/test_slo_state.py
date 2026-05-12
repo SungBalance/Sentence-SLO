@@ -244,3 +244,111 @@ def test_stall_fields_none_when_ontime():
     assert rec.stall_duration_s == 0.0
     assert rec.stall_start_ts is None
     assert rec.stall_end_ts is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A tests: ChunkRecord new fields
+# ---------------------------------------------------------------------------
+
+def test_chunk_token_indices_monotone():
+    # Three chunks; token indices must be contiguous with no gaps.
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    # Chunk 0: 5 tokens
+    for _ in range(5):
+        state.on_token(0.0)
+    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    # Chunk 1: 3 tokens
+    for _ in range(3):
+        state.on_token(0.2)
+    state.on_chunk_boundary(0.3, word_count=1, chunk_consume_time_s=1.0)
+    # Chunk 2: 7 tokens
+    for _ in range(7):
+        state.on_token(0.4)
+    state.on_chunk_boundary(0.5, word_count=3, chunk_consume_time_s=1.0)
+
+    recs = state.chunk_records
+    assert len(recs) == 3
+    assert recs[0].token_start_idx == 0
+    assert recs[0].token_end_idx == 5
+    assert recs[1].token_start_idx == 5
+    assert recs[1].token_end_idx == 8
+    assert recs[2].token_start_idx == 8
+    assert recs[2].token_end_idx == 15
+    # cumulative_tokens_at_end matches token_end_idx
+    for rec in recs:
+        assert rec.cumulative_tokens_at_end == rec.token_end_idx
+
+
+def test_chunk_demand_window():
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    state.on_token(0.0)
+    # chunk 0: deadline = now = 1.0, consume = 2.0
+    state.on_chunk_boundary(1.0, word_count=1, chunk_consume_time_s=2.0)
+    rec = state.chunk_records[0]
+    assert rec.demand_window_start_ts == pytest.approx(rec.deadline_ts)
+    assert rec.demand_window_end_ts == pytest.approx(rec.deadline_ts + rec.chunk_consume_time_s)
+    assert rec.chunk_consume_time_s == pytest.approx(2.0)
+
+
+def test_predictor_source_p90_emits_value_high():
+    state = RequestSLOState(
+        num_warmup_chunks=1, chunk_len_strategy="p90", min_chunk_tokens=0)
+    # Need at least 2 chunks to have a value_high (p99 over history).
+    for _ in range(10):
+        state.on_token(0.0)
+    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    for _ in range(20):
+        state.on_token(0.2)
+    state.on_chunk_boundary(0.3, word_count=3, chunk_consume_time_s=1.0)
+    # chunk 1 is the first to have a non-None expected_chunk_len_high
+    rec = state.chunk_records[1]
+    assert rec.predictor_source == "p90"
+    assert rec.expected_chunk_len_high is not None
+
+
+def test_predictor_source_ema_no_value_high():
+    state = RequestSLOState(
+        num_warmup_chunks=1, chunk_len_strategy="ema", min_chunk_tokens=0)
+    for _ in range(10):
+        state.on_token(0.0)
+    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    for _ in range(5):
+        state.on_token(0.2)
+    state.on_chunk_boundary(0.3, word_count=1, chunk_consume_time_s=1.0)
+    rec = state.chunk_records[1]
+    assert rec.predictor_source == "ema"
+    assert rec.expected_chunk_len_high is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2B tests: admitted_ts + terminal_outcome on RequestSLOState directly
+# ---------------------------------------------------------------------------
+
+def test_admitted_ts_idempotent():
+    state = RequestSLOState(num_warmup_chunks=1)
+    state.mark_admitted(1.0)
+    state.mark_admitted(2.0)  # second call must not overwrite
+    assert state.admitted_ts == pytest.approx(1.0)
+
+
+def test_terminal_outcome_defaults_in_progress():
+    state = RequestSLOState(num_warmup_chunks=1)
+    assert state.terminal_outcome == "in_progress"
+    stats = state.compute_stats()
+    assert stats.terminal_outcome == "in_progress"
+
+
+def test_terminal_outcome_completed_via_mark():
+    state = RequestSLOState(num_warmup_chunks=1)
+    state.mark_terminal("completed")
+    assert state.terminal_outcome == "completed"
+    stats = state.compute_stats()
+    assert stats.terminal_outcome == "completed"
+    assert stats.admitted_ts is None  # not set in this path
+
+
+def test_admitted_ts_propagates_to_stats():
+    state = RequestSLOState(num_warmup_chunks=1)
+    state.mark_admitted(5.5)
+    stats = state.compute_stats()
+    assert stats.admitted_ts == pytest.approx(5.5)
