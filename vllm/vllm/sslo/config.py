@@ -54,6 +54,20 @@ class SsloConfig:
     # are merged into the next chunk so the consume_time and chunk EMA are
     # not skewed by sub-token sentences.
     min_chunk_tokens: int = 16
+    # Decision log control. Emits per-(step, admitted_request) rows to
+    # decisions.jsonl for M5 (refill-slack diagnostic) and M6 (cumulative
+    # ablation) analysis.
+    #   "off"           — never emit (default for baseline runs).
+    #   "step"          — every admitted request, every scheduler step.
+    #                     ~1M rows/5min run; use for M5 deep dives.
+    #   "tier_changes"  — emit on tier transition or admit/preempt event,
+    #                     plus a full snapshot every `decision_heartbeat_steps`.
+    #   "admit_only"    — emit only on the step where the request was
+    #                     admitted from waiting or preempted from running.
+    decision_log_mode: str = "tier_changes"
+    # How often (in scheduler steps) the tier_changes mode emits a
+    # full-admitted heartbeat to keep non-transitioning requests sampled.
+    decision_heartbeat_steps: int = 200
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
@@ -102,3 +116,12 @@ class SsloConfig:
         if self.method == "sslo" and self.policy is None:
             raise ValueError(
                 "policy must be set (not None) when method='sslo'")
+        valid_modes = ("off", "step", "tier_changes", "admit_only")
+        if self.decision_log_mode not in valid_modes:
+            raise ValueError(
+                f"decision_log_mode must be one of {valid_modes}, "
+                f"got {self.decision_log_mode!r}")
+        if self.decision_heartbeat_steps < 1:
+            raise ValueError(
+                f"decision_heartbeat_steps must be >= 1, "
+                f"got {self.decision_heartbeat_steps}")

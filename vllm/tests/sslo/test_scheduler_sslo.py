@@ -107,6 +107,14 @@ def make_scheduler(
     scheduler._sslo_step = SsloStepState(cur_max_num_requests=max_num_running_reqs)
     scheduler._sslo_done_logged = set()
     scheduler._sslo_log_dir_created = False
+    # SSLO: decision-log state normally seeded by Scheduler.__init__.
+    scheduler._sslo_prev_tier = {}
+    scheduler._sslo_prev_selected = {}
+    scheduler._sslo_step_idx = 0
+    scheduler._sslo_decision_buffer = []
+    scheduler._sslo_decision_buffer_max = 256
+    scheduler._sslo_decision_log_path = None
+    scheduler._sslo_decision_log_dir_created = False
     scheduler.max_num_running_reqs = max_num_running_reqs
     # Tests treat every multiple of 8 ≤ max_num_running_reqs as a captured
     # CUDA graph size. Override per-test where needed.
@@ -624,3 +632,103 @@ def test_policy_fallback_returns_one_for_missing():
     assert score == pytest.approx(1.0)
     # Also confirm that pressure() returns None (the raw signal)
     assert warmup_state.pressure(0.5, None) is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 tests: decision log emission
+# ---------------------------------------------------------------------------
+
+
+def test_decision_log_off_writes_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "SSLO_STATS_LOG_PATH", str(tmp_path / "scheduler_stats.jsonl"))
+    cfg = SsloConfig(method="sslo", decision_log_mode="off")
+    req = make_request("r", make_state(deadline=10.0, expected_len=2.0))
+    scheduler = make_scheduler(running=[req], max_num_running_reqs=2, cfg=cfg)
+
+    scheduler._apply_sslo_policy(0.0)
+
+    assert scheduler._sslo_decision_buffer == []
+    # path resolve is gated by the "off" early-return; the lazy resolver
+    # still works in isolation, so check the buffer instead.
+    assert not (tmp_path / "decisions.jsonl").exists()
+
+
+def test_decision_log_step_emits_every_admitted(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "SSLO_STATS_LOG_PATH", str(tmp_path / "scheduler_stats.jsonl"))
+    cfg = SsloConfig(method="sslo", decision_log_mode="step")
+    a = make_request("a", make_state(deadline=10.0, expected_len=2.0))
+    b = make_request("b", make_state(deadline=10.0, expected_len=2.0))
+    scheduler = make_scheduler(running=[a, b], max_num_running_reqs=2, cfg=cfg)
+
+    scheduler._apply_sslo_policy(0.0)
+
+    assert len(scheduler._sslo_decision_buffer) == 2
+
+
+def test_decision_log_tier_changes_emits_on_transition(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "SSLO_STATS_LOG_PATH", str(tmp_path / "scheduler_stats.jsonl"))
+    # Large heartbeat so the second step only fires on tier changes.
+    cfg = SsloConfig(
+        method="sslo", decision_log_mode="tier_changes",
+        decision_heartbeat_steps=10000)
+    a = make_request("a", make_state(deadline=10.0, expected_len=2.0))
+    scheduler = make_scheduler(running=[a], max_num_running_reqs=2, cfg=cfg)
+
+    scheduler._apply_sslo_policy(0.0)
+    # Step 0 is a heartbeat (idx % heartbeat == 0) and all reqs are new.
+    assert len(scheduler._sslo_decision_buffer) == 1
+    scheduler._sslo_decision_buffer.clear()
+
+    # Step 1: no tier change, no selection change, no heartbeat → silent.
+    scheduler._apply_sslo_policy(1.0)
+    assert scheduler._sslo_decision_buffer == []
+
+
+def test_decision_log_admit_only_subset(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "SSLO_STATS_LOG_PATH", str(tmp_path / "scheduler_stats.jsonl"))
+    cfg = SsloConfig(
+        method="sslo", decision_log_mode="admit_only",
+        decision_heartbeat_steps=10000)
+    a = make_request("a", make_state(deadline=10.0, expected_len=2.0))
+    scheduler = make_scheduler(running=[a], max_num_running_reqs=2, cfg=cfg)
+
+    # Step 0: first-seen event for "a".
+    scheduler._apply_sslo_policy(0.0)
+    admit_only_first = len(scheduler._sslo_decision_buffer)
+    scheduler._sslo_decision_buffer.clear()
+    # Step 1: no event → no emit.
+    scheduler._apply_sslo_policy(1.0)
+    assert scheduler._sslo_decision_buffer == []
+
+    # Cross-check against tier_changes with same heartbeat: same count
+    # on step 0 (both fire for new request), but admit_only never fires
+    # the heartbeat path so it stays a strict subset over time.
+    cfg2 = SsloConfig(
+        method="sslo", decision_log_mode="tier_changes",
+        decision_heartbeat_steps=10000)
+    b = make_request("b", make_state(deadline=10.0, expected_len=2.0))
+    sched2 = make_scheduler(running=[b], max_num_running_reqs=2, cfg=cfg2)
+    sched2._apply_sslo_policy(0.0)
+    assert len(sched2._sslo_decision_buffer) >= admit_only_first
+
+
+def test_decision_log_buffer_flushes_on_overflow(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "SSLO_STATS_LOG_PATH", str(tmp_path / "scheduler_stats.jsonl"))
+    cfg = SsloConfig(method="sslo", decision_log_mode="step")
+    a = make_request("a", make_state(deadline=10.0, expected_len=2.0))
+    b = make_request("b", make_state(deadline=10.0, expected_len=2.0))
+    scheduler = make_scheduler(running=[a, b], max_num_running_reqs=2, cfg=cfg)
+    scheduler._sslo_decision_buffer_max = 1  # force flush on first row
+
+    scheduler._apply_sslo_policy(0.0)
+
+    decisions_path = tmp_path / "decisions.jsonl"
+    assert decisions_path.exists()
+    lines = decisions_path.read_text().splitlines()
+    assert len(lines) == 2
+    assert scheduler._sslo_decision_buffer == []

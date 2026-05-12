@@ -65,7 +65,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 # SSLO
-from vllm.sslo.slo_state import Phase, RequestSLOState
+from vllm.sslo.slo_state import Phase, PressureComponents, RequestSLOState
 
 
 # SSLO: per-step scheduler state. Reset at the top of every
@@ -236,6 +236,18 @@ class Scheduler(SchedulerInterface):
         # SSLO: track whether the SSLO_STATS_LOG_PATH dir has been created
         # so we don't makedirs() once per scheduler step.
         self._sslo_log_dir_created: bool = False
+        # SSLO: per-request prev-tier snapshot for tier_changes mode.
+        self._sslo_prev_tier: dict[str, int] = {}
+        # SSLO: per-request prev-was_selected snapshot for admit/preempt
+        # event detection across steps.
+        self._sslo_prev_selected: dict[str, bool] = {}
+        # SSLO: scheduler-step counter for heartbeat scheduling.
+        self._sslo_step_idx: int = 0
+        # SSLO: dedicated decisions.jsonl writer with row buffer.
+        self._sslo_decision_buffer: list[str] = []
+        self._sslo_decision_buffer_max: int = 256
+        self._sslo_decision_log_path: str | None = None
+        self._sslo_decision_log_dir_created: bool = False
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -1207,6 +1219,11 @@ class Scheduler(SchedulerInterface):
         new_running: list[Request],
         new_pending: list[Request],
         now: float,
+        pressures: dict[str, float] | None = None,
+        tiers: dict[str, int] | None = None,
+        admitted: list[Request] | None = None,
+        base_tpot: float | None = None,
+        pressure_components: dict[str, PressureComponents] | None = None,
     ) -> None:
         """Common per-step commit: install placement, fire lifecycle
         events, account per-chunk steps, and dump per-step stats."""
@@ -1216,6 +1233,212 @@ class Scheduler(SchedulerInterface):
             prev_pending_ids, new_running, new_pending, now)
         self._account_per_chunk_step(new_running, new_pending)
         self._sslo_dump_step_stats(now)
+        # SSLO: per-(step, admitted) decision log. Only emits when the
+        # policy passes the full kwargs; legacy callers (none, but kept
+        # for safety) skip it.
+        if (admitted is not None and pressures is not None
+                and tiers is not None):
+            new_running_ids = {r.request_id for r in new_running}
+            self._sslo_dump_decision_log(
+                now, admitted, new_running_ids, pressures, tiers,
+                base_tpot, pressure_components)
+        # SSLO: heartbeat math during emission uses the pre-increment
+        # value; bump here so the next step sees the next index.
+        self._sslo_step_idx += 1
+
+    # SSLO
+    def _sslo_decision_log_resolve(self) -> str | None:
+        """Resolve decisions.jsonl path lazily from SSLO_STATS_LOG_PATH.
+
+        The decision log lives next to scheduler_stats.jsonl with a fixed
+        name so analysis tooling can pair them without an extra knob.
+        """
+        if self._sslo_decision_log_path is not None:
+            return self._sslo_decision_log_path
+        step_log = os.environ.get("SSLO_STATS_LOG_PATH")
+        if not step_log:
+            return None
+        self._sslo_decision_log_path = os.path.join(
+            os.path.dirname(step_log), "decisions.jsonl")
+        return self._sslo_decision_log_path
+
+    # SSLO
+    def _sslo_decision_flush(self) -> None:
+        """Append buffered decision rows to disk and clear the buffer."""
+        if not self._sslo_decision_buffer:
+            return
+        path = self._sslo_decision_log_resolve()
+        if path is None:
+            self._sslo_decision_buffer.clear()
+            return
+        if not self._sslo_decision_log_dir_created:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self._sslo_decision_log_dir_created = True
+        with open(path, "a") as f:
+            for line in self._sslo_decision_buffer:
+                f.write(line + "\n")
+        self._sslo_decision_buffer.clear()
+
+    # SSLO
+    def _sslo_compute_decision_components(
+        self,
+        admitted: list[Request],
+        now: float,
+        tpot: float | None,
+    ) -> dict[str, PressureComponents]:
+        """Per-request raw PressureComponents for decision logging.
+
+        Separate from _compute_pressures (which returns policy-fallback
+        floats); this is the log-side raw signal preserving
+        pressure_available / pressure_missing_reason. Returns {} when
+        the decision log is off so policy callsites pay zero per-step
+        overhead.
+        """
+        if self.sslo_config.decision_log_mode == "off":
+            return {}
+        return {
+            req.request_id: req.slo_state.pressure_components(now, tpot)
+            for req in admitted
+            if req.slo_state is not None
+        }
+
+    # SSLO
+    def _sslo_dump_decision_log(
+        self,
+        now: float,
+        admitted: list[Request],
+        new_running_ids: set[str],
+        pressures: dict[str, float],
+        tiers: dict[str, int],
+        base_tpot: float | None,
+        pressure_components: dict[str, PressureComponents] | None = None,
+    ) -> None:
+        mode = self.sslo_config.decision_log_mode
+        if mode == "off":
+            return
+        path = self._sslo_decision_log_resolve()
+        if path is None:
+            return
+
+        # tier_changes heartbeat: snapshot every Nth step so a request
+        # whose tier never changes is still sampled.
+        emit_all = (
+            mode == "step"
+            or (mode == "tier_changes"
+                and self._sslo_step_idx
+                % self.sslo_config.decision_heartbeat_steps == 0))
+
+        batch_size = len(admitted)
+        num_prefills = sum(
+            1 for req in admitted
+            if (getattr(req, "num_computed_tokens", 0)
+                < getattr(req, "num_prompt_tokens", 0)))
+        cur_cap = self._sslo_step.cur_max_num_requests
+
+        for req in admitted:
+            rid = req.request_id
+            new_tier = tiers[rid]
+            prev_tier = self._sslo_prev_tier.get(rid)
+            was_selected = rid in new_running_ids
+            tier_changed = (
+                prev_tier is not None and prev_tier != new_tier)
+            prev_selected = self._sslo_prev_selected.get(rid)
+            selection_changed = (
+                prev_selected is not None
+                and prev_selected != was_selected)
+            # First-seen requests count as an event so the initial state
+            # is always captured under tier_changes / admit_only.
+            is_event = (
+                tier_changed or selection_changed
+                or rid not in self._sslo_prev_tier)
+
+            if mode == "step":
+                should_emit = True
+            elif mode == "tier_changes":
+                should_emit = emit_all or is_event
+            elif mode == "admit_only":
+                should_emit = is_event
+            else:
+                should_emit = False
+            if not should_emit:
+                continue
+
+            components = (
+                pressure_components.get(rid)
+                if pressure_components else None)
+            policy_score = pressures[rid]
+            if components is not None and components.pressure_available:
+                depletion = components.depletion_pressure
+                buffer_slack = components.buffer_slack_s
+                refill_time = components.estimated_refill_time_s
+                refill_slack = components.refill_slack_s
+                pressure_available = True
+                missing_reason = None
+                fallback_used = False
+            else:
+                depletion = None
+                buffer_slack = None
+                refill_time = None
+                refill_slack = None
+                pressure_available = False
+                missing_reason = (
+                    components.pressure_missing_reason
+                    if components is not None else None)
+                fallback_used = True
+
+            # JSON can't encode inf; stringify so downstream readers see
+            # the magnitude rather than a NaN/null.
+            depletion_json: float | str | None
+            if depletion is None:
+                depletion_json = None
+            elif depletion == float("inf"):
+                depletion_json = "inf"
+            else:
+                depletion_json = depletion
+
+            row = {
+                "ts": now,
+                "step_idx": self._sslo_step_idx,
+                "request_id": rid,
+                "phase": (
+                    req.slo_state.phase.name
+                    if req.slo_state is not None else "no_state"),
+                "tier": new_tier,
+                "was_candidate": True,
+                "was_selected": was_selected,
+                "priority_rank": None,
+                "buffer_slack_s": buffer_slack,
+                "estimated_refill_time_s": refill_time,
+                "refill_slack_s": refill_slack,
+                "depletion_pressure": depletion_json,
+                "pressure_available": pressure_available,
+                "pressure_missing_reason": missing_reason,
+                "fallback_score_used": fallback_used,
+                "policy_score": policy_score,
+                "estimated_step_time_s": base_tpot,
+                "batch_size": batch_size,
+                "num_prefills": num_prefills,
+                "cur_max_num_requests": cur_cap,
+                # Phase 6 placeholders — schema slot added so readers can
+                # rely on key presence; values filled by future work.
+                "admission_reason": None,
+                "backfill_reason": None,
+                "preemption_reason": None,
+            }
+            self._sslo_decision_buffer.append(json.dumps(row))
+
+        # Snapshot prev state for next step's event detection.
+        new_prev_tier: dict[str, int] = {}
+        new_prev_selected: dict[str, bool] = {}
+        for req in admitted:
+            rid = req.request_id
+            new_prev_tier[rid] = tiers[rid]
+            new_prev_selected[rid] = rid in new_running_ids
+        self._sslo_prev_tier = new_prev_tier
+        self._sslo_prev_selected = new_prev_selected
+
+        if len(self._sslo_decision_buffer) >= self._sslo_decision_buffer_max:
+            self._sslo_decision_flush()
 
     # SSLO
     def _apply_sslo_threshold(self, now: float) -> dict[str, float]:
@@ -1279,7 +1502,13 @@ class Scheduler(SchedulerInterface):
             new_running = cands_running
             new_pending = cands_pending
 
-        self._sslo_commit_step(prev_pending_ids, new_running, new_pending, now)
+        # SSLO: components captured AFTER adaptive cap may re-pick a tpot.
+        components = self._sslo_compute_decision_components(
+            admitted, now, base_tpot)
+        self._sslo_commit_step(
+            prev_pending_ids, new_running, new_pending, now,
+            pressures=pressures, tiers=tiers, admitted=admitted,
+            base_tpot=base_tpot, pressure_components=components)
         return pressures
 
     # SSLO
@@ -1292,7 +1521,8 @@ class Scheduler(SchedulerInterface):
         normal admission loop fill running up to max_num_running_reqs.
         Pressures are computed and recorded for parity with sslo runs.
         """
-        prev_pending_ids, _, _, pressures, _ = self._sslo_step_setup(now)
+        prev_pending_ids, admitted, base_tpot, pressures, tiers = (
+            self._sslo_step_setup(now))
         self._sslo_step.has_critical = False
         # Baseline does not gate admission — engine's running-loop cap
         # (len(self.running) == max_num_running_reqs) is the only fence.
@@ -1300,8 +1530,12 @@ class Scheduler(SchedulerInterface):
         # wait-loop doesn't short-circuit on sslo_admit_remaining.
         self._sslo_step.waiting_admission_budget = (
             len(self.waiting) + len(self.skipped_waiting))
+        components = self._sslo_compute_decision_components(
+            admitted, now, base_tpot)
         self._sslo_commit_step(
-            prev_pending_ids, self.running, self.sslo_pending, now)
+            prev_pending_ids, self.running, self.sslo_pending, now,
+            pressures=pressures, tiers=tiers, admitted=admitted,
+            base_tpot=base_tpot, pressure_components=components)
         return pressures
 
     # SSLO
@@ -1386,7 +1620,12 @@ class Scheduler(SchedulerInterface):
             new_pending = sorted_admitted[cands_running_size:]
             self._sslo_step.cur_max_num_requests = M
 
-        self._sslo_commit_step(prev_pending_ids, new_running, new_pending, now)
+        components = self._sslo_compute_decision_components(
+            admitted, now, base_tpot)
+        self._sslo_commit_step(
+            prev_pending_ids, new_running, new_pending, now,
+            pressures=pressures, tiers=tiers, admitted=admitted,
+            base_tpot=base_tpot, pressure_components=components)
         return pressures
 
     # SSLO
@@ -3227,6 +3466,9 @@ class Scheduler(SchedulerInterface):
         # being removed from self.requests; nothing else can hand-roll a
         # duplicate log for this rid after this point.
         self._sslo_done_logged.discard(request.request_id)
+        # SSLO: short runs may end before the decision buffer fills —
+        # flush on each terminal so partial logs still hit disk.
+        self._sslo_decision_flush()
         del self.requests[request.request_id]
 
     @property

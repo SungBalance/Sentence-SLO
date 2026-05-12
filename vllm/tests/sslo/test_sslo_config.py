@@ -54,6 +54,22 @@ def test_invalid_chunk_unit_raises():
         SsloConfig(chunk_unit="token")
 
 
+def test_decision_log_mode_default():
+    cfg = SsloConfig()
+    assert cfg.decision_log_mode == "tier_changes"
+    assert cfg.decision_heartbeat_steps == 200
+
+
+def test_decision_log_mode_validation():
+    with pytest.raises(ValueError, match="decision_log_mode"):
+        SsloConfig(decision_log_mode="invalid")
+
+
+def test_decision_heartbeat_validation():
+    with pytest.raises(ValueError, match="decision_heartbeat_steps"):
+        SsloConfig(decision_heartbeat_steps=0)
+
+
 def test_from_config_freezes_constants():
     cfg = SsloConfig(
         seconds_per_word=0.5,
