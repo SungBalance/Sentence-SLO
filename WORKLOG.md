@@ -351,3 +351,62 @@ Existing 36-cell sweep re-aggregated successfully — all metrics populate from 
 - DRY refactor (codex): extended `metrics_utils.lookup(summary, path, field, mode)` so `field=None` returns the node itself; deleted `_metric_node` and replaced call sites with `lookup(..., None, ...)`; added `_context_row(summary, path_label, run_idx, mode)` helper shared by `_emit_rows` and `cmd_csv` warmup block; precomputed `windows[mode]` dict in the first ALL_MODES loop of `analyze.py` and reused in the handling_users loop. Net delta: -12 lines across the 3 files.
 - Verification (byte-identical): re-ran analyze + sweep_analysis csv on existing smoke cells; `summary.json` (baseline + sslo), `summary.csv` (107 cols), `summary_warmup.csv` (13 cols) all `diff`-SAME against pre-refactor snapshots.
 - Round 2 audit (Explore agent): re-confirmed all refactors preserve functional equivalence; verified end-to-end values against plan (manual recompute of total_stall_time, completion_latency, measurement_window endpoints, cp_slo_violation rate at tau=0.5s, handling_users time_avg for baseline). No new DRY violations or orphan imports.
+
+## 2026-05-12 — CP-SLO metric refactor (7 phases, commits 4fc2301..3c4812c)
+
+Multi-agent planning + dev-verify loop per phase per AGENTS.md.
+Spec at `/tmp/cpslo_todo.md`; canonical reference in `metric.md`.
+
+- Phase 1 (`4fc2301`): timing contract. d(0) = consume_start_ts = chunk 0
+  gen_finish_ts; removed special-case `slack=0` branch; new ChunkRecord
+  fields `stall_start_ts / stall_end_ts / stall_duration_s`.
+- Phase 2 (`1a2eecb`): schema expansion. 8 new ChunkRecord fields
+  (token indices, demand window, predictor source/high). admitted_ts +
+  terminal_outcome on RequestSLOState; scheduler stamps in
+  schedule_sslo. F2 request_class via fixed token buckets
+  (`xs/s/m/l`) on observed `num_generation_tokens`. New module
+  `exp/run_sslo/analysis/cpslo_names.py` for legacy↔canonical alias.
+  run_test.py dual-writes 15 chunk + 9 request canonical keys.
+- Phase 3 (`74d7034`): pressure components + missing preservation
+  (D1 split). New `PressureComponents` dataclass and
+  `state.pressure_components(now, tpot)`; `pressure()` rerouted as
+  thin wrapper. Scheduler `_state_pressure` renamed to
+  `_policy_score_with_fallback` — keeps the 1.0 normalize on the
+  policy path (cold-start critical guard depends on it) while
+  decision logs see the raw None.
+- Phase 4 (`f0fccab`): per-step × per-admitted-request decision log.
+  Config knobs `decision_log_mode` (off / step / tier_changes /
+  admit_only, default tier_changes) and `decision_heartbeat_steps`
+  (200). Buffered JSONL writer to `decisions.jsonl`. Schema includes
+  PressureComponents + admission/backfill/preemption_reason slots
+  (None for now — populated in a follow-up).
+- Phase 5 (`25d8f7a`): analysis migration. New
+  `progress_metrics.compute_stall_intervals` merges contiguous
+  stalls; `cp_slo_violation_rates` now thresholds on
+  `max_stall_interval_s` (not per-chunk max). analyze.py adds
+  `metrics["cpslo"]` section with max_stall_interval_distribution,
+  num_stall_intervals_merged_distribution, cp_slo_violation_rates_by_tau,
+  mean_handling_users_time_weighted.
+- Phase 6 (`3c4812c`): validity + no-harm + run-level + F3. New
+  `exp/run_sslo/analysis/validity.py` with pre-declared thresholds
+  and `validate_run`. `run_meta.json` sidecar with run_id, variant,
+  seed, trace_id, workload_id, N, M, measurement_start/end_ts,
+  gpu_memory_peak_bytes, num_preemptions_total, completion counters.
+  `_consolidate_mode_outputs.consolidate_validity_csv` writes
+  `validity_checks.csv`.
+
+Tests: 83 SSLO engine + 14 analysis = 97 total, all pass.
+
+CP-SLO contract semantics that BREAK comparability with pre-refactor
+sweep outputs:
+- chunk 0 `deadline_ts` shifts from `decoding_start_ts` to
+  `gen_finish_ts(0)` (chunk 0 itself).
+- `mean_handling_users` headline switches from sample-mean to
+  time-weighted-mean — analyze.py dual-writes for one transition release.
+- `queue_stall_s` semantics shift from `scheduled_ts - queued_ts` to
+  `admitted_ts - queued_ts` (admit-time-based).
+- `cp_slo_violation` basis switches from per-chunk max to merged
+  contiguous interval max.
+
+Bump `summary.json` schema_version when dropping legacy alias keys
+(planned follow-up).
