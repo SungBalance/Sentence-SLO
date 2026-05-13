@@ -77,17 +77,15 @@ DIST_METRICS: tuple[DistMetric, ...] = (
     DistMetric("output_tokens",         ("workload", "num_output_tokens"), 1.0),
     DistMetric("chunks_per_req",        ("workload", "num_chunks"),        1.0),
 )
-STATS = ("mean", "p50", "p99")
-# Per-metric extra stats. `combined` needs min/max (running+pending floor and
-# ceiling for occupancy); other metrics keep the default {mean, p50, p99}.
+# Canonical latency-like cohort: every distribution metric emits all six.
+# Matches metrics_utils.distribution_stats default percentile set
+# (50, 90, 95, 99) plus mean and max.
+STATS = ("mean", "p50", "p90", "p95", "p99", "max")
+# Per-metric extra stats. Reserved for non-standard fields like `min` on
+# handling-users (running+pending floor). All standard quantiles are
+# already in STATS, so most metrics need no extras.
 DIST_EXTRA_STATS: dict[str, tuple[str, ...]] = {
-    "num_handling_users":    ("min", "max"),
-    "stall_time":            ("p90",),
-    "total_stall_s":         ("p95", "max"),
-    "max_stall_s":           ("p95", "max"),
-    "stall_fraction_pct":    ("p95",),
-    "completion_latency_s":  ("p95", "max"),
-    "demand_duration_s":     ("p95",),
+    "num_handling_users": ("min",),
 }
 
 # Scalar (non-distribution) metrics — emit one column each.

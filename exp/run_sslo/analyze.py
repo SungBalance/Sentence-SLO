@@ -35,8 +35,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def dist_for_key(rows: list[dict[str, Any]], key: str) -> dict[str, float | int | None]:
-    """Standard mean/p50/p90/p99/max distribution over rows[*][key]."""
-    return distribution_stats(numeric_values(rows, key), (50, 90, 99))
+    """Standard mean/p50/p90/p95/p99/max distribution over rows[*][key]."""
+    return distribution_stats(numeric_values(rows, key))
 
 
 def slack_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
@@ -111,7 +111,7 @@ def prediction_ratio_stats(rows: list[dict[str, Any]]) -> dict[str, float | int 
         if expected_f <= 0:
             continue
         values.append(actual_f / expected_f)
-    return distribution_stats(values, (50, 90, 99))
+    return distribution_stats(values)
 
 
 def request_compliance_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
@@ -139,7 +139,7 @@ def pending_request_stats(rows: list[dict[str, Any]]) -> dict[str, dict[str, flo
     return {
         "time": dist_for_key(rows, "total_pending_time_s"),
         "intervals": distribution_stats(
-            numeric_values(rows, "num_pending_iters_per_request"), (50, 90)),
+            numeric_values(rows, "num_pending_iters_per_request")),
     }
 
 
@@ -158,7 +158,7 @@ def inter_chunk_delay_stats(rows: list[dict[str, Any]]) -> dict[str, float | int
             prev_end = float(prev["end_time_ts"])
             if cur_end >= prev_end:
                 delays.append(cur_end - prev_end)
-    return distribution_stats(delays, (50, 90, 99))
+    return distribution_stats(delays)
 
 
 def h2_rows(
@@ -343,7 +343,7 @@ def analyze(
         # Include min in `num_handling_users` so summary captures the
         # running+pending floor alongside mean/max.
         nhu_dist = distribution_stats(
-            numeric_values(sched_rows, "num_handling_users"), (50, 90, 99),
+            numeric_values(sched_rows, "num_handling_users"),
             include_min=True)
         metrics["scheduler"][mode] = {
             "running": dist_for_key(sched_rows, "running"),
@@ -361,19 +361,19 @@ def analyze(
             return [p[key] for p in per_req if p.get(key) is not None]
 
         metrics["progress_request"][mode] = {
-            "total_stall_time":    distribution_stats(vals("total_stall_time"), (50, 95, 99)),
-            "max_stall_time":      distribution_stats(vals("max_stall_time"), (50, 95, 99)),
-            "num_stall_intervals": distribution_stats(vals("num_stall_intervals"), (50, 95, 99)),
-            "stall_fraction":      distribution_stats(vals("stall_fraction"), (50, 95, 99)),
-            "completion_latency":  distribution_stats(vals("completion_latency"), (50, 95, 99)),
-            "demand_duration":     distribution_stats(vals("demand_duration"), (50, 95, 99)),
+            "total_stall_time":    distribution_stats(vals("total_stall_time")),
+            "max_stall_time":      distribution_stats(vals("max_stall_time")),
+            "num_stall_intervals": distribution_stats(vals("num_stall_intervals")),
+            "stall_fraction":      distribution_stats(vals("stall_fraction")),
+            "completion_latency":  distribution_stats(vals("completion_latency")),
+            "demand_duration":     distribution_stats(vals("demand_duration")),
         }
         # Phase 5: new merged-interval CP-SLO aggregates per mode.
         metrics["cpslo"][mode] = {
             "max_stall_interval_distribution": distribution_stats(
-                vals("max_stall_interval_s"), (50, 90, 99)),
+                vals("max_stall_interval_s")),
             "num_stall_intervals_merged_distribution": distribution_stats(
-                vals("num_stall_intervals_merged"), (50, 90, 99)),
+                vals("num_stall_intervals_merged")),
         }
         metrics["workload"][mode] = {
             "num_prompt_tokens": dist_for_key(req_rows, "num_prompt_tokens"),
@@ -465,9 +465,9 @@ def analyze(
                          if r.get("total_pending_time_s") is not None]
         metrics["cpslo"].setdefault(mode, {})
         metrics["cpslo"][mode]["queue_stall_distribution"] = distribution_stats(
-            queue_stalls, (50, 90, 99))
+            queue_stalls)
         metrics["cpslo"][mode]["pending_time_distribution"] = distribution_stats(
-            pending_times, (50, 90, 99))
+            pending_times)
 
     summary: dict[str, Any] = {
         "config": {

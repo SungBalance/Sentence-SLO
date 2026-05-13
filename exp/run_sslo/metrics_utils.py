@@ -24,41 +24,36 @@ class MetricSpec:
     label: str
 
 
+# Standard quantile cohort for latency-like distributions.
+_DIST_FIELDS: tuple[str, ...] = ("mean", "p50", "p90", "p95", "p99", "max")
+
+
+def _dist_specs(
+    path: tuple[str, ...],
+    scale: float,
+    fmt: str,
+    label_prefix: str,
+    fields: tuple[str, ...] = _DIST_FIELDS,
+) -> tuple[MetricSpec, ...]:
+    """Build mean/p50/p90/p95/p99/max specs for a distribution-bearing node."""
+    return tuple(
+        MetricSpec(path, f, scale, fmt, f"{label_prefix} {f}") for f in fields
+    )
+
+
 DISPLAY_GROUPS: tuple[tuple[str, tuple[MetricSpec, ...]], ...] = (
     ("Latency", (
-        MetricSpec(("ttft", "post_cap"), "mean", 1.0,  "{:.3f}", "TTFT post_cap mean (s)"),
-        MetricSpec(("ttft", "post_cap"), "p50",  1.0,  "{:.3f}", "TTFT post_cap p50 (s)"),
-        MetricSpec(("ttft", "post_cap"), "p90",  1.0,  "{:.3f}", "TTFT post_cap p90 (s)"),
-        MetricSpec(("ttft", "post_cap"), "p99",  1.0,  "{:.3f}", "TTFT post_cap p99 (s)"),
-        MetricSpec(("ttft", "post_cap"), "max",  1.0,  "{:.3f}", "TTFT post_cap max (s)"),
-        MetricSpec(("ttfc",),            "mean", 1.0,  "{:.3f}", "TTFC mean (s)"),
-        MetricSpec(("ttfc",),            "p50",  1.0,  "{:.3f}", "TTFC p50 (s)"),
-        MetricSpec(("ttfc",),            "p99",  1.0,  "{:.3f}", "TTFC p99 (s)"),
-        MetricSpec(("tpot",),            "mean", 1000, "{:.2f}", "TPOT mean (ms)"),
-        MetricSpec(("tpot",),            "p50",  1000, "{:.2f}", "TPOT p50 (ms)"),
-        MetricSpec(("tpot",),            "p90",  1000, "{:.2f}", "TPOT p90 (ms)"),
-        MetricSpec(("tpot",),            "p99",  1000, "{:.2f}", "TPOT p99 (ms)"),
-        MetricSpec(("tpot",),            "max",  1000, "{:.2f}", "TPOT max (ms)"),
+        *_dist_specs(("ttft", "post_cap"), 1.0,  "{:.3f}", "TTFT post_cap (s)"),
+        *_dist_specs(("ttfc",),            1.0,  "{:.3f}", "TTFC (s)"),
+        *_dist_specs(("tpot",),            1000, "{:.2f}", "TPOT (ms)"),
     )),
     ("Queue stall", (
-        MetricSpec(("queue_stall",), "mean", 1000, "{:.2f}", "queue stall mean (ms)"),
-        MetricSpec(("queue_stall",), "p50",  1000, "{:.2f}", "queue stall p50 (ms)"),
-        MetricSpec(("queue_stall",), "p90",  1000, "{:.2f}", "queue stall p90 (ms)"),
-        MetricSpec(("queue_stall",), "p99",  1000, "{:.2f}", "queue stall p99 (ms)"),
-        MetricSpec(("queue_stall",), "max",  1000, "{:.2f}", "queue stall max (ms)"),
+        *_dist_specs(("queue_stall",), 1000, "{:.2f}", "queue stall (ms)"),
     )),
     ("Slack", (
-        MetricSpec(("slack",),                      "neg_ratio", 100, "{:.4f}", "neg slack ratio (%)"),
-        MetricSpec(("slack",),                      "mean",      1.0, "{:.3f}", "slack mean (s)"),
-        MetricSpec(("slack",),                      "p50",       1.0, "{:.3f}", "slack p50 (s)"),
-        MetricSpec(("slack",),                      "p90",       1.0, "{:.3f}", "slack p90 (s)"),
-        MetricSpec(("slack",),                      "p99",       1.0, "{:.3f}", "slack p99 (s)"),
-        MetricSpec(("slack",),                      "max",       1.0, "{:.3f}", "slack max (s)"),
-        MetricSpec(("slack", "violated-magnitude"), "mean",      1.0, "{:.3f}", "violated magnitude mean (s)"),
-        MetricSpec(("slack", "violated-magnitude"), "p50",       1.0, "{:.3f}", "violated magnitude p50 (s)"),
-        MetricSpec(("slack", "violated-magnitude"), "p90",       1.0, "{:.3f}", "violated magnitude p90 (s)"),
-        MetricSpec(("slack", "violated-magnitude"), "p99",       1.0, "{:.3f}", "violated magnitude p99 (s)"),
-        MetricSpec(("slack", "violated-magnitude"), "max",       1.0, "{:.3f}", "violated magnitude max (s)"),
+        MetricSpec(("slack",), "neg_ratio", 100, "{:.4f}", "neg slack ratio (%)"),
+        *_dist_specs(("slack",),                      1.0, "{:.3f}", "slack (s)"),
+        *_dist_specs(("slack", "violated-magnitude"), 1.0, "{:.3f}", "violated magnitude (s)"),
     )),
     ("SLO compliance", (
         MetricSpec(("slo_compliance",), "rate",           100, "{:.2f}", "SLO compliance (%)"),
@@ -66,67 +61,38 @@ DISPLAY_GROUPS: tuple[tuple[str, tuple[MetricSpec, ...]], ...] = (
         MetricSpec(("slo_compliance",), "total_requests", 1.0, "{:.1f}", "SLO total reqs"),
     )),
     ("Scheduler occupancy", (
-        MetricSpec(("scheduler", "running"),  "mean", 1.0, "{:.2f}", "running mean"),
-        MetricSpec(("scheduler", "running"),  "p50",  1.0, "{:.2f}", "running p50"),
-        MetricSpec(("scheduler", "running"),  "p90",  1.0, "{:.2f}", "running p90"),
-        MetricSpec(("scheduler", "running"),  "p99",  1.0, "{:.2f}", "running p99"),
+        *_dist_specs(("scheduler", "running"), 1.0, "{:.2f}", "running"),
         MetricSpec(("scheduler", "num_handling_users"), "min",  1.0, "{:.2f}", "handling-users min"),
-        MetricSpec(("scheduler", "num_handling_users"), "mean", 1.0, "{:.2f}", "handling-users mean"),
-        MetricSpec(("scheduler", "num_handling_users"), "max",  1.0, "{:.2f}", "handling-users max"),
-        MetricSpec(("scheduler", "num_handling_users"), "p50",  1.0, "{:.2f}", "handling-users p50"),
-        MetricSpec(("scheduler", "num_handling_users"), "p90",  1.0, "{:.2f}", "handling-users p90"),
-        MetricSpec(("scheduler", "num_handling_users"), "p99",  1.0, "{:.2f}", "handling-users p99"),
+        *_dist_specs(("scheduler", "num_handling_users"), 1.0, "{:.2f}", "handling-users"),
     )),
     ("Pending dynamics", (
-        MetricSpec(("pending", "time"),      "mean", 1.0, "{:.3f}", "pending time mean (s)"),
-        MetricSpec(("pending", "time"),      "p50",  1.0, "{:.3f}", "pending time p50 (s)"),
-        MetricSpec(("pending", "time"),      "p90",  1.0, "{:.3f}", "pending time p90 (s)"),
-        MetricSpec(("pending", "time"),      "p99",  1.0, "{:.3f}", "pending time p99 (s)"),
-        MetricSpec(("pending", "intervals"), "mean", 1.0, "{:.2f}", "pending intervals mean"),
-        MetricSpec(("pending", "intervals"), "p50",  1.0, "{:.2f}", "pending intervals p50"),
-        MetricSpec(("pending", "intervals"), "p90",  1.0, "{:.2f}", "pending intervals p90"),
+        *_dist_specs(("pending", "time"),      1.0, "{:.3f}", "pending time (s)"),
+        *_dist_specs(("pending", "intervals"), 1.0, "{:.2f}", "pending intervals"),
     )),
     ("Streaming smoothness", (
-        MetricSpec(("inter_chunk_delay",), "mean", 1000, "{:.2f}", "inter-chunk delay mean (ms)"),
-        MetricSpec(("inter_chunk_delay",), "p50",  1000, "{:.2f}", "inter-chunk delay p50 (ms)"),
-        MetricSpec(("inter_chunk_delay",), "p90",  1000, "{:.2f}", "inter-chunk delay p90 (ms)"),
-        MetricSpec(("inter_chunk_delay",), "p99",  1000, "{:.2f}", "inter-chunk delay p99 (ms)"),
-        MetricSpec(("inter_chunk_delay",), "max",  1000, "{:.2f}", "inter-chunk delay max (ms)"),
+        *_dist_specs(("inter_chunk_delay",), 1000, "{:.2f}", "inter-chunk delay (ms)"),
     )),
     ("Stall (request)", (
-        MetricSpec(("progress_request", "total_stall_time"), "mean", 1.0, "{:.3f}", "total stall mean (s)"),
-        MetricSpec(("progress_request", "total_stall_time"), "p50",  1.0, "{:.3f}", "total stall p50 (s)"),
-        MetricSpec(("progress_request", "total_stall_time"), "p95",  1.0, "{:.3f}", "total stall p95 (s)"),
-        MetricSpec(("progress_request", "total_stall_time"), "p99",  1.0, "{:.3f}", "total stall p99 (s)"),
-        MetricSpec(("progress_request", "max_stall_time"),   "p95",  1.0, "{:.3f}", "max stall p95 (s)"),
-        MetricSpec(("progress_request", "max_stall_time"),   "p99",  1.0, "{:.3f}", "max stall p99 (s)"),
-        MetricSpec(("progress_request", "stall_fraction"),   "mean", 100, "{:.2f}", "stall fraction mean (%)"),
-        MetricSpec(("progress_request", "stall_fraction"),   "p95",  100, "{:.2f}", "stall fraction p95 (%)"),
-        MetricSpec(("progress_request", "num_stall_intervals"), "mean", 1.0, "{:.2f}", "stall intervals mean"),
+        *_dist_specs(("progress_request", "total_stall_time"),    1.0, "{:.3f}", "total stall (s)"),
+        *_dist_specs(("progress_request", "max_stall_time"),      1.0, "{:.3f}", "max stall (s)"),
+        *_dist_specs(("progress_request", "stall_fraction"),      100, "{:.2f}", "stall fraction (%)"),
+        *_dist_specs(("progress_request", "num_stall_intervals"), 1.0, "{:.2f}", "stall intervals"),
     )),
     ("Latency (request)", (
-        MetricSpec(("progress_request", "completion_latency"), "mean", 1.0, "{:.3f}", "completion latency mean (s)"),
-        MetricSpec(("progress_request", "completion_latency"), "p50",  1.0, "{:.3f}", "completion latency p50 (s)"),
-        MetricSpec(("progress_request", "completion_latency"), "p95",  1.0, "{:.3f}", "completion latency p95 (s)"),
-        MetricSpec(("progress_request", "completion_latency"), "p99",  1.0, "{:.3f}", "completion latency p99 (s)"),
-        MetricSpec(("progress_request", "demand_duration"),    "mean", 1.0, "{:.3f}", "demand duration mean (s)"),
+        *_dist_specs(("progress_request", "completion_latency"), 1.0, "{:.3f}", "completion latency (s)"),
+        *_dist_specs(("progress_request", "demand_duration"),    1.0, "{:.3f}", "demand duration (s)"),
     )),
     ("Workload", (
-        MetricSpec(("workload", "num_prompt_tokens"), "mean", 1.0, "{:.1f}", "prompt tokens mean"),
-        MetricSpec(("workload", "num_prompt_tokens"), "p50",  1.0, "{:.1f}", "prompt tokens p50"),
-        MetricSpec(("workload", "num_prompt_tokens"), "p99",  1.0, "{:.1f}", "prompt tokens p99"),
-        MetricSpec(("workload", "num_output_tokens"), "mean", 1.0, "{:.1f}", "output tokens mean"),
-        MetricSpec(("workload", "num_output_tokens"), "p50",  1.0, "{:.1f}", "output tokens p50"),
-        MetricSpec(("workload", "num_output_tokens"), "p99",  1.0, "{:.1f}", "output tokens p99"),
-        MetricSpec(("workload", "num_chunks"),        "mean", 1.0, "{:.2f}", "chunks/req mean"),
-        MetricSpec(("workload", "num_chunks"),        "p99",  1.0, "{:.2f}", "chunks/req p99"),
+        *_dist_specs(("workload", "num_prompt_tokens"), 1.0, "{:.1f}", "prompt tokens"),
+        *_dist_specs(("workload", "num_output_tokens"), 1.0, "{:.1f}", "output tokens"),
+        *_dist_specs(("workload", "num_chunks"),        1.0, "{:.2f}", "chunks/req"),
     )),
     ("Throughput", (
         MetricSpec(("throughput",), "tokens_per_second",   1.0, "{:.2f}", "tokens/s"),
         MetricSpec(("throughput",), "completed_req_per_s", 1.0, "{:.2f}", "completed req/s"),
         MetricSpec(("throughput",), "duration_s",          1.0, "{:.2f}", "measurement window (s)"),
     )),
-    ("Handling users", (
+    ("Handling users (time-weighted)", (
         MetricSpec(("handling_users",), "time_avg", 1.0, "{:.2f}", "handling users time-avg"),
         MetricSpec(("handling_users",), "p50",      1.0, "{:.2f}", "handling users p50"),
         MetricSpec(("handling_users",), "p95",      1.0, "{:.2f}", "handling users p95"),
@@ -163,13 +129,18 @@ def numeric_values(rows: list[dict[str, Any]], key: str) -> list[float]:
 
 def distribution_stats(
     values: list[float],
-    percentiles: tuple[int, ...] = (50, 90, 99),
+    percentiles: tuple[int, ...] = (50, 90, 95, 99),
     *,
     include_mean: bool = True,
     include_min: bool = False,
     include_max: bool = True,
 ) -> dict[str, float | int | None]:
-    """Build a standard {count, mean, min?, p<X>..., max?} dict from values."""
+    """Build a standard {count, mean, min?, p<X>..., max?} dict from values.
+
+    Default percentile set is (50, 90, 95, 99) so latency-like metrics
+    consistently expose mean/p50/p90/p95/p99/max in summary.csv. Older
+    callsites passing custom tuples may still do so for narrower views.
+    """
     stats: dict[str, float | int | None] = {"count": len(values)}
     if include_mean:
         stats["mean"] = statistics.fmean(values) if values else None
