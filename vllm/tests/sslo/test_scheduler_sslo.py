@@ -861,10 +861,11 @@ def test_mlp_srjf_fallback_when_no_feasible_n():
 
 def test_mlp_non_critical_admission_budget_uses_measured_only():
     # 1 warmup + 3 measured at serve ≈ 0.3 (deadline=10, expected_len=3,
-    # tpot=1.0 from helper). avg_p over MEASURED only = 0.3 (warmup
-    # excluded). base_n = 32 → max_capacity = floor(32/0.3) = 106;
-    # combined = n_measured = 3 (warmup not counted as load yet);
-    # admission_capacity = 106 - 3 = 103. Budget = min(waiting=100, 103).
+    # tpot=1.0 from helper). avg_p over MEASURED only = 0.3, so
+    # admission_capacity is large. But the per-step admit count is
+    # bounded by how many running measured reqs can be safely demoted
+    # (defer < mlp_defer_constraint) — here all 3 measured qualify, so
+    # budget = 3 (and those 3 should appear in sslo_pending).
     warm = make_request("w", make_state(phase=Phase.WARMUP))
     measured = [
         make_request(
@@ -878,16 +879,18 @@ def test_mlp_non_critical_admission_budget_uses_measured_only():
     sched._apply_sslo_policy(0.0)
 
     assert sched._sslo_step.has_critical is False
-    # admission ceiling driven by measured-only avg_p, not slack
-    assert sched._sslo_step.waiting_admission_budget == 100
+    # Voluntary demotion of all 3 demotable measured reqs creates 3
+    # admission slots for this step.
+    assert sched._sslo_step.waiting_admission_budget == 3
+    # The warmup stays in running; the 3 measured are demoted.
+    assert len(sched.running) == 1
+    assert len(sched.sslo_pending) == 3
 
 
-def test_mlp_non_critical_all_warmup_admits_waiting():
-    # cap=2; two warmups, no measured. avg_p degenerates to epsilon →
-    # max_capacity is effectively unlimited. The slack-blocking
-    # behavior from the original design was removed: under MLP,
-    # admitting a waiting req grows admitted past cap and the next
-    # step's partition re-balances.
+def test_mlp_non_critical_no_admit_when_all_warmup_running():
+    # cap=2; two warmups force-running, no measured candidate to demote.
+    # The voluntary-demotion mechanism only displaces MEASURED reqs;
+    # warmups stay put. Therefore no admission slack is created.
     warmups = [
         make_request(f"w{i}", make_state(phase=Phase.WARMUP))
         for i in range(2)
@@ -897,7 +900,8 @@ def test_mlp_non_critical_all_warmup_admits_waiting():
 
     sched._apply_sslo_policy(0.0)
 
-    assert sched._sslo_step.waiting_admission_budget == 10
+    assert sched._sslo_step.waiting_admission_budget == 0
+    assert len(sched.sslo_pending) == 0
 
 
 def test_mlp_dispatch_resolves():

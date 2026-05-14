@@ -2313,16 +2313,45 @@ class Scheduler(SchedulerInterface):
         avg_p = max(avg_p, eps)
         max_capacity = int(base_n // avg_p) if avg_p > 0 else base_n
         # admission ceiling: max_capacity - n_measured (warmup not counted
-        # toward load until it produces tokens). slack intentionally NOT
-        # used here — under MLP, admitting a waiting req grows admitted
-        # past base_n, and the next step's _mlp_partition naturally bumps
-        # the lowest-serve measured reqs into pending (defer-feasibility
-        # gating their stay). Pinning the budget to slack would freeze
-        # handling_users at base_n, defeating the whole admission scheme.
+        # toward load until it produces tokens).
         combined = n_measured
         admission_capacity = max(0, max_capacity - combined)
-        self._sslo_step.waiting_admission_budget = max(
-            0, min(waiting_count, admission_capacity))
+        plan_admit = max(0, min(waiting_count, admission_capacity))
+
+        # Engine's admission loop (schedule_sslo:~2591) breaks when
+        # len(self.running) == max_num_running_reqs. If non-critical
+        # partition keeps everyone in running (no forced+defer<1), slack
+        # stays 0 and waiting can't enter — handling_users freezes at
+        # base_n. To open the gate without reintroducing hysteresis, we
+        # voluntarily move the `plan_admit` lowest-serve MEASURED reqs
+        # whose defer < mlp_defer_constraint from new_running to
+        # new_pending. This creates slack equal to the planned admit
+        # count; the defer feasibility check guarantees the demoted reqs
+        # are still safe to wait one epoch.
+        defer_thr = self.sslo_config.mlp_defer_constraint
+        if plan_admit > 0 and new_pending == []:
+            demotable: list[tuple[float, Request]] = []
+            for req in new_running:
+                state = req.slo_state
+                if state is None or state.phase != Phase.MEASURED:
+                    continue
+                d = defer_base.get(req.request_id)
+                if d is None or d == float("inf") or d >= defer_thr:
+                    continue
+                s = serve_base.get(req.request_id)
+                if s is None:
+                    continue
+                demotable.append((s, req))
+            demotable.sort(key=lambda x: x[0])
+            n_demote = min(plan_admit, len(demotable))
+            if n_demote > 0:
+                demoted_reqs = [req for _, req in demotable[:n_demote]]
+                new_running = [r for r in new_running if r not in demoted_reqs]
+                new_pending = list(new_pending) + demoted_reqs
+                plan_admit = n_demote  # admit only as many as we made room for
+            else:
+                plan_admit = 0
+        self._sslo_step.waiting_admission_budget = plan_admit
 
         # Log-side scores: serve_pressure with 1.0 fallback for non-
         # measurable requests. avg_score/max_score honored via the
