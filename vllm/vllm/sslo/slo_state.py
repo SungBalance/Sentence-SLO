@@ -32,6 +32,12 @@ class Phase(IntEnum):
 _VALID_PRESSURE_MISSING_REASONS = frozenset(
     {"prefill", "warmup", "no_tpot", "no_predictor"})
 
+# Shared epsilon for multi-level pressure denominators so ttd→0 (or
+# defer_buffer→0) does not blow up to NaN; saturated cases still surface
+# as +inf via the explicit ≤ 0 branches in
+# multi_level_pressure_components.
+_PRESSURE_DENOM_EPSILON = 1e-9
+
 
 @dataclass
 class PressureComponents:
@@ -57,6 +63,20 @@ class PressureComponents:
     #   "no_predictor" — predictor.value is None
     # None when pressure_available is True.
     pressure_missing_reason: str | None
+    # Multi-level pressure fields (policy="multi_level_pressure"). All
+    # optional / None for legacy policies. When the request is measurable:
+    #   epoch_time_s        — expected wall-clock for one scheduler step at
+    #                          the candidate batch size (= tpot_ema[n]).
+    #   defer_buffer_slack_s — ttd - epoch_time_s; remaining slack if this
+    #                          step is deferred. None when epoch_s is None
+    #                          (callers asking for serve-only).
+    #   serve_pressure      — refill_time / max(ttd, ε). 1.0 ⇒ at-deadline.
+    #   defer_pressure      — refill_time / max(defer_buffer, ε). > serve
+    #                          whenever epoch_s > 0; +inf if defer_buffer ≤ 0.
+    epoch_time_s: float | None = None
+    defer_buffer_slack_s: float | None = None
+    serve_pressure: float | None = None
+    defer_pressure: float | None = None
 
 
 class ChunkLengthPredictor:
@@ -584,6 +604,131 @@ class RequestSLOState:
           - finite float — normal urgency.
         """
         return self.pressure_components(now, tpot_s).depletion_pressure
+
+    def multi_level_pressure_components(
+        self,
+        now: float,
+        tpot_s: float | None,
+        epoch_s: float | None,
+    ) -> PressureComponents:
+        """Two-level pressure signal used by policy="multi_level_pressure".
+
+        Mirrors pressure_components phase gating (PREFILL/WARMUP/no_tpot/
+        no_predictor → pressure_available=False with reason) so the
+        decision log can distinguish unmeasurable requests from
+        at-deadline ones. When measurable, populates:
+          - serve_pressure = refill / max(ttd, ε)
+          - defer_pressure = refill / max(ttd - epoch_s, ε)
+        epoch_s=None means "treat the next step's wall-clock as 0", so
+        defer collapses onto serve — used when the caller is only
+        interested in the serve-side urgency at a given batch.
+        """
+        if self.phase == Phase.PREFILL:
+            return PressureComponents(
+                remaining_tokens=None, estimated_step_time_s=tpot_s,
+                buffer_slack_s=None, estimated_refill_time_s=None,
+                refill_slack_s=None, depletion_pressure=None,
+                pressure_available=False, pressure_missing_reason="prefill",
+                epoch_time_s=epoch_s,
+                defer_buffer_slack_s=None,
+                serve_pressure=None, defer_pressure=None)
+        if self.phase == Phase.WARMUP:
+            return PressureComponents(
+                remaining_tokens=None, estimated_step_time_s=tpot_s,
+                buffer_slack_s=None, estimated_refill_time_s=None,
+                refill_slack_s=None, depletion_pressure=None,
+                pressure_available=False, pressure_missing_reason="warmup",
+                epoch_time_s=epoch_s,
+                defer_buffer_slack_s=None,
+                serve_pressure=None, defer_pressure=None)
+        if tpot_s is None:
+            return PressureComponents(
+                remaining_tokens=None, estimated_step_time_s=None,
+                buffer_slack_s=None, estimated_refill_time_s=None,
+                refill_slack_s=None, depletion_pressure=None,
+                pressure_available=False, pressure_missing_reason="no_tpot",
+                epoch_time_s=epoch_s,
+                defer_buffer_slack_s=None,
+                serve_pressure=None, defer_pressure=None)
+        remaining = self.expected_remaining_len()
+        if remaining is None:
+            return PressureComponents(
+                remaining_tokens=None, estimated_step_time_s=tpot_s,
+                buffer_slack_s=None, estimated_refill_time_s=None,
+                refill_slack_s=None, depletion_pressure=None,
+                pressure_available=False,
+                pressure_missing_reason="no_predictor",
+                epoch_time_s=epoch_s,
+                defer_buffer_slack_s=None,
+                serve_pressure=None, defer_pressure=None)
+
+        ttd = self.time_to_deadline(now)
+        refill = remaining * tpot_s
+        refill_slack = (None if ttd is None else ttd - refill)
+        if ttd is None:
+            depletion = None
+            serve = None
+            defer = None
+            defer_buffer = None
+        elif ttd <= 0:
+            depletion = float("inf")
+            serve = float("inf")
+            defer = float("inf")
+            # Defer buffer is still defined (epoch shifts the already-past
+            # deadline further into the red); report it for logging.
+            defer_buffer = (None if epoch_s is None else ttd - epoch_s)
+        else:
+            depletion = refill / ttd
+            serve = refill / max(ttd, _PRESSURE_DENOM_EPSILON)
+            if epoch_s is None:
+                defer_buffer = None
+                defer = serve
+            else:
+                defer_buffer = ttd - epoch_s
+                if defer_buffer <= 0:
+                    defer = float("inf")
+                else:
+                    defer = refill / max(
+                        defer_buffer, _PRESSURE_DENOM_EPSILON)
+        return PressureComponents(
+            remaining_tokens=remaining,
+            estimated_step_time_s=tpot_s,
+            buffer_slack_s=ttd,
+            estimated_refill_time_s=refill,
+            refill_slack_s=refill_slack,
+            depletion_pressure=depletion,
+            pressure_available=True,
+            pressure_missing_reason=None,
+            epoch_time_s=epoch_s,
+            defer_buffer_slack_s=defer_buffer,
+            serve_pressure=serve,
+            defer_pressure=defer)
+
+    def serve_pressure(
+        self, now: float, tpot_s: float | None
+    ) -> float | None:
+        """Scalar wrapper around multi_level_pressure_components.
+
+        epoch_s is fixed to None — caller only wants the serve side.
+        Returns None for unmeasurable requests (PREFILL/WARMUP/no_tpot/
+        no_predictor); finite or +inf otherwise.
+        """
+        return self.multi_level_pressure_components(
+            now, tpot_s, None).serve_pressure
+
+    def defer_pressure(
+        self,
+        now: float,
+        tpot_s: float | None,
+        epoch_s: float | None,
+    ) -> float | None:
+        """Scalar wrapper around multi_level_pressure_components.
+
+        Same None contract as serve_pressure(). When epoch_s is None the
+        defer side collapses to the serve side.
+        """
+        return self.multi_level_pressure_components(
+            now, tpot_s, epoch_s).defer_pressure
 
     def mark_admitted(self, now: float) -> None:
         if self.admitted_ts is None:

@@ -68,6 +68,16 @@ class SsloConfig:
     # How often (in scheduler steps) the tier_changes mode emits a
     # full-admitted heartbeat to keep non-transitioning requests sampled.
     decision_heartbeat_steps: int = 200
+    # multi_level_pressure policy knobs. mlp_pressure_epsilon guards the
+    # denominator in serve / defer pressure when ttd or defer_buffer
+    # collapse toward zero; mlp_critical_serve_threshold triggers the
+    # critical branch when any MEASURED request's serve_pressure crosses
+    # it at base_n; mlp_defer_constraint forces requests with
+    # defer_pressure ≥ constraint into running so deferring one step
+    # would miss the deadline.
+    mlp_pressure_epsilon: float = 1e-9
+    mlp_critical_serve_threshold: float = 1.0
+    mlp_defer_constraint: float = 1.0
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
@@ -108,7 +118,7 @@ class SsloConfig:
             raise ValueError(
                 f"method must be 'baseline' or 'sslo', "
                 f"got {self.method!r}")
-        valid_policies = (None, "threshold", "pressure")
+        valid_policies = (None, "threshold", "pressure", "multi_level_pressure")
         if self.policy not in valid_policies:
             raise ValueError(
                 f"policy must be one of {valid_policies}, "
@@ -125,3 +135,20 @@ class SsloConfig:
             raise ValueError(
                 f"decision_heartbeat_steps must be >= 1, "
                 f"got {self.decision_heartbeat_steps}")
+        for name in (
+                "mlp_pressure_epsilon",
+                "mlp_critical_serve_threshold",
+                "mlp_defer_constraint",
+        ):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
+        if (
+            self.method == "sslo"
+            and self.policy == "multi_level_pressure"
+            and not self.adaptive_batching
+        ):
+            raise ValueError(
+                "policy='multi_level_pressure' requires "
+                "adaptive_batching=True (the policy's critical branch "
+                "shrinks the cap to clear deadline misses)")
