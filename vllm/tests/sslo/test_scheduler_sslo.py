@@ -860,13 +860,11 @@ def test_mlp_srjf_fallback_when_no_feasible_n():
 
 
 def test_mlp_non_critical_admission_budget_uses_measured_only():
-    # 1 warmup + 3 measured at serve ≈ 0.3 (deadline=10, expected_len=3).
-    # avg_p over MEASURED only = 0.3 (warmup excluded).
-    # base_n = 32 → max_capacity = floor(32/0.3) = 106; combined =
-    # max(3, 4) = 4; admission_capacity = max(0, 106 - 4) = 102; slack
-    # = 32 - len(running). Test that the warmup is not in the avg path
-    # by checking admission_budget is bounded by slack, not by a
-    # warmup-contaminated avg_p.
+    # 1 warmup + 3 measured at serve ≈ 0.3 (deadline=10, expected_len=3,
+    # tpot=1.0 from helper). avg_p over MEASURED only = 0.3 (warmup
+    # excluded). base_n = 32 → max_capacity = floor(32/0.3) = 106;
+    # combined = n_measured = 3 (warmup not counted as load yet);
+    # admission_capacity = 106 - 3 = 103. Budget = min(waiting=100, 103).
     warm = make_request("w", make_state(phase=Phase.WARMUP))
     measured = [
         make_request(
@@ -879,16 +877,17 @@ def test_mlp_non_critical_admission_budget_uses_measured_only():
 
     sched._apply_sslo_policy(0.0)
 
-    # All 4 admitted go to running (cap=32, no defer-violators).
-    # slack = 32 - 4 = 28. admission_capacity from measured-only avg_p
-    # ≥ slack. Budget is bounded by slack.
     assert sched._sslo_step.has_critical is False
-    assert sched._sslo_step.waiting_admission_budget == 28
+    # admission ceiling driven by measured-only avg_p, not slack
+    assert sched._sslo_step.waiting_admission_budget == 100
 
 
-def test_mlp_non_critical_waiting_admit_blocked_when_slack_zero():
-    # cap=2; two warmups force-running → slack=0 even though waiting
-    # is non-empty. Admission budget must be 0.
+def test_mlp_non_critical_all_warmup_admits_waiting():
+    # cap=2; two warmups, no measured. avg_p degenerates to epsilon →
+    # max_capacity is effectively unlimited. The slack-blocking
+    # behavior from the original design was removed: under MLP,
+    # admitting a waiting req grows admitted past cap and the next
+    # step's partition re-balances.
     warmups = [
         make_request(f"w{i}", make_state(phase=Phase.WARMUP))
         for i in range(2)
@@ -898,7 +897,7 @@ def test_mlp_non_critical_waiting_admit_blocked_when_slack_zero():
 
     sched._apply_sslo_policy(0.0)
 
-    assert sched._sslo_step.waiting_admission_budget == 0
+    assert sched._sslo_step.waiting_admission_budget == 10
 
 
 def test_mlp_dispatch_resolves():

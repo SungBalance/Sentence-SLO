@@ -2312,11 +2312,17 @@ class Scheduler(SchedulerInterface):
         ) / denom
         avg_p = max(avg_p, eps)
         max_capacity = int(base_n // avg_p) if avg_p > 0 else base_n
-        combined = max(n_measured, len(admitted))
+        # admission ceiling: max_capacity - n_measured (warmup not counted
+        # toward load until it produces tokens). slack intentionally NOT
+        # used here — under MLP, admitting a waiting req grows admitted
+        # past base_n, and the next step's _mlp_partition naturally bumps
+        # the lowest-serve measured reqs into pending (defer-feasibility
+        # gating their stay). Pinning the budget to slack would freeze
+        # handling_users at base_n, defeating the whole admission scheme.
+        combined = n_measured
         admission_capacity = max(0, max_capacity - combined)
-        slack = base_n - len(new_running)
         self._sslo_step.waiting_admission_budget = max(
-            0, min(waiting_count, admission_capacity, slack))
+            0, min(waiting_count, admission_capacity))
 
         # Log-side scores: serve_pressure with 1.0 fallback for non-
         # measurable requests. avg_score/max_score honored via the
