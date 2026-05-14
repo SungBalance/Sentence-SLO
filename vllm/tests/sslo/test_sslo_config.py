@@ -70,6 +70,27 @@ def test_decision_heartbeat_validation():
         SsloConfig(decision_heartbeat_steps=0)
 
 
+def test_mlp_valid_when_adaptive_true():
+    cfg = SsloConfig(
+        method="sslo",
+        policy="multi_level_pressure",
+        adaptive_batching=True,
+    )
+    assert cfg.policy == "multi_level_pressure"
+    assert cfg.mlp_pressure_epsilon == 1e-9
+    assert cfg.mlp_critical_serve_threshold == 1.0
+    assert cfg.mlp_defer_constraint == 1.0
+
+
+def test_mlp_invalid_when_adaptive_false():
+    with pytest.raises(ValueError, match="adaptive_batching=True"):
+        SsloConfig(
+            method="sslo",
+            policy="multi_level_pressure",
+            adaptive_batching=False,
+        )
+
+
 def test_from_config_freezes_constants():
     cfg = SsloConfig(
         seconds_per_word=0.5,

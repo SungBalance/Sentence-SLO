@@ -454,3 +454,93 @@ def test_pressure_equals_depletion_pressure():
     p = state.pressure(now, tpot)
     pc = state.pressure_components(now, tpot_s=tpot)
     assert p == pc.depletion_pressure
+
+
+# ---------------------------------------------------------------------------
+# multi_level_pressure_components() tests (policy="multi_level_pressure")
+# ---------------------------------------------------------------------------
+
+def _measured_state_with_history(now_chunk_finish: float = 0.1):
+    """Build a MEASURED-phase state with predictor populated.
+
+    Mirrors the pattern used by other pressure_components tests: 10
+    tokens accumulated, one warmup chunk closed at now_chunk_finish so
+    chunks_completed becomes 1 and phase advances to MEASURED.
+    """
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    for _ in range(10):
+        state.on_token(0.0)
+    state.on_chunk_boundary(
+        now_chunk_finish, word_count=2, chunk_consume_time_s=1.0)
+    assert state.phase.name == "MEASURED"
+    return state
+
+
+def test_mlp_components_prefill():
+    state = RequestSLOState(num_warmup_chunks=2)
+    pc = state.multi_level_pressure_components(1.0, tpot_s=0.05, epoch_s=0.05)
+    assert not pc.pressure_available
+    assert pc.pressure_missing_reason == "prefill"
+    assert pc.serve_pressure is None
+    assert pc.defer_pressure is None
+
+
+def test_mlp_components_warmup():
+    state = RequestSLOState(num_warmup_chunks=2, min_chunk_tokens=0)
+    state.on_token(0.0)
+    assert state.phase.name == "WARMUP"
+    pc = state.multi_level_pressure_components(
+        0.1, tpot_s=0.05, epoch_s=0.05)
+    assert not pc.pressure_available
+    assert pc.pressure_missing_reason == "warmup"
+    assert pc.serve_pressure is None
+    assert pc.defer_pressure is None
+
+
+def test_mlp_components_no_tpot():
+    state = _measured_state_with_history()
+    pc = state.multi_level_pressure_components(
+        0.2, tpot_s=None, epoch_s=None)
+    assert not pc.pressure_available
+    assert pc.pressure_missing_reason == "no_tpot"
+    assert pc.serve_pressure is None
+    assert pc.defer_pressure is None
+
+
+def test_mlp_components_no_epoch_defaults_to_serve():
+    state = _measured_state_with_history()
+    pc = state.multi_level_pressure_components(
+        0.2, tpot_s=0.04, epoch_s=None)
+    assert pc.pressure_available
+    assert pc.serve_pressure is not None
+    # epoch_s=None collapses defer onto serve.
+    assert pc.defer_pressure == pc.serve_pressure
+    assert pc.defer_buffer_slack_s is None
+
+
+def test_mlp_components_deadline_passed():
+    state = _measured_state_with_history(now_chunk_finish=100.0)
+    pc = state.multi_level_pressure_components(
+        200.0, tpot_s=0.05, epoch_s=0.05)
+    assert pc.pressure_available
+    assert pc.buffer_slack_s is not None and pc.buffer_slack_s <= 0
+    # ttd <= 0 → both serve and defer saturate to +inf.
+    assert pc.serve_pressure == float("inf")
+    assert pc.defer_pressure == float("inf")
+
+
+def test_mlp_components_defer_blows_when_epoch_exceeds_slack():
+    state = _measured_state_with_history()
+    # State sets deadline at ~1.1s (now_chunk_finish=0.1 + consume=1.0).
+    # Query at now=1.0 so ttd ≈ 0.1, then pick epoch_s > 0.1 so
+    # defer_buffer goes non-positive while serve stays finite.
+    pc = state.multi_level_pressure_components(
+        1.0, tpot_s=0.04, epoch_s=0.2)
+    assert pc.pressure_available
+    assert pc.buffer_slack_s is not None and pc.buffer_slack_s > 0
+    assert pc.serve_pressure is not None
+    assert pc.serve_pressure != float("inf")
+    # defer_buffer = ttd - epoch_s ≤ 0 → defer saturates to +inf.
+    assert pc.defer_buffer_slack_s is not None
+    assert pc.defer_buffer_slack_s <= 0
+    assert pc.defer_pressure == float("inf")

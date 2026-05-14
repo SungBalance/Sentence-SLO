@@ -5,7 +5,7 @@
 #   run_test.sh <run_kind> <max_num_seqs> <model>
 #
 # Required positional args:
-#   $1  run_kind   (baseline | sslo | sslo_offload | sslo_adaptive | sslo_adaptive_offload)
+#   $1  run_kind   (baseline | sslo | sslo_offload | sslo_adaptive | sslo_adaptive_offload | sslo_mlp)
 #   $2  max_num_seqs
 #   $3  model
 #

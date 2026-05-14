@@ -12,6 +12,8 @@ MODES_DEFAULT = (
     "sslo_offload",
     "sslo_adaptive",
     "sslo_adaptive_offload",
+    # SSLO
+    "sslo_mlp",
 )
 
 

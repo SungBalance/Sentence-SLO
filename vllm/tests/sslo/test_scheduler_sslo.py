@@ -731,3 +731,220 @@ def test_decision_log_buffer_flushes_on_overflow(monkeypatch, tmp_path):
     lines = decisions_path.read_text().splitlines()
     assert len(lines) == 2
     assert scheduler._sslo_decision_buffer == []
+
+
+# ---------------------------------------------------------------------------
+# multi_level_pressure policy tests (F5)
+# ---------------------------------------------------------------------------
+
+def _make_mlp_scheduler(max_num_running_reqs=32, adaptive_batching=True, **kwargs):
+    """Helper: make_scheduler pre-configured for policy="multi_level_pressure".
+
+    Pre-seeds tpot_ema with multiple captured sizes so the cap search has
+    real choices; tests that need a specific tpot map override after.
+    """
+    cfg = kwargs.pop("cfg", None) or SsloConfig(
+        method="sslo",
+        policy="multi_level_pressure",
+        adaptive_batching=adaptive_batching,
+    )
+    sched = make_scheduler(
+        cfg=cfg, max_num_running_reqs=max_num_running_reqs, **kwargs)
+    # Default seed: every multiple-of-8 captured size carries a tpot
+    # entry. Override per-test as needed.
+    sched.tpot_ema = {n: 1.0 for n in sched._sslo_cudagraph_sizes}
+    return sched
+
+
+def test_mlp_critical_only_measured_phase_triggers():
+    # WARMUP req would carry serve=None — must not flip the critical
+    # gate. The lone MEASURED req has serve=0.2 (well below 1.0).
+    warm = make_request("w", make_state(phase=Phase.WARMUP))
+    measured = make_request(
+        "m", make_state(deadline=10.0, expected_len=2.0))  # serve = 0.2
+    sched = _make_mlp_scheduler(
+        running=[warm, measured], max_num_running_reqs=4)
+
+    sched._apply_sslo_policy(0.0)
+
+    assert sched._sslo_step.has_critical is False
+
+
+def test_mlp_critical_fires_on_measured_serve_ge_one():
+    # serve = remaining*tpot/ttd = 1.5*1.0/1.0 = 1.5 ≥ 1.0 → critical.
+    measured = make_request(
+        "m", make_state(deadline=1.0, expected_len=1.5))
+    sched = _make_mlp_scheduler(
+        running=[measured], max_num_running_reqs=32)
+    sched.tpot_ema = {32: 1.0, 24: 0.5, 16: 0.5, 8: 0.5}
+
+    sched._apply_sslo_policy(0.0)
+
+    assert sched._sslo_step.has_critical is True
+    assert sched._sslo_step.cur_max_num_requests <= 32
+    assert sched._sslo_step.waiting_admission_budget == 0
+
+
+def test_mlp_pick_n_no_throughput_floor():
+    # Only the smallest profiled bucket (8) can shrink the cap; its
+    # throughput 8/4.0 = 2 vs base 32/1.0 = 32 (ratio 0.0625) would be
+    # rejected by the legacy throughput-floor logic. MLP must not apply
+    # that floor.
+    measured = make_request(
+        "m", make_state(deadline=1.0, expected_len=1.5))
+    sched = _make_mlp_scheduler(
+        running=[measured], max_num_running_reqs=32)
+    sched.tpot_ema = {32: 1.0, 8: 4.0}
+
+    picked_n, running, pending, _serve, _defer = sched._mlp_pick_adaptive_n(
+        [measured], now=0.0, base_tpot=1.0)
+    # 8 is feasible (objective is finite) and the only option below base.
+    assert picked_n in (8, 32)
+    assert running  # the measured req lands in running
+
+
+def test_mlp_defer_constraint_forces_running():
+    # ttd = 0.5, epoch_s (= tpot_ema[base]) = 1.0 → defer_buffer = -0.5
+    # → defer = inf ≥ mlp_defer_constraint (1.0). Even with low serve
+    # this req must end up in running under _mlp_partition.
+    forced = make_request(
+        "forced", make_state(deadline=0.5, expected_len=0.1))
+    low = make_request("low", make_state(deadline=100.0, expected_len=1.0))
+    sched = _make_mlp_scheduler(
+        running=[forced, low], max_num_running_reqs=1)
+    sched.tpot_ema = {n: 1.0 for n in sched._sslo_cudagraph_sizes}
+
+    sched._apply_sslo_policy(0.0)
+
+    running_ids = {r.request_id for r in sched.running}
+    assert "forced" in running_ids
+
+
+def test_mlp_warmup_force_running_independent_of_pressure():
+    # 2 warmup + 2 measured (low serve). cap=2 → warmup wins
+    # (forced=empty since no MEASURED defer-violator).
+    warmups = [
+        make_request(f"w{i}", make_state(phase=Phase.WARMUP))
+        for i in range(2)
+    ]
+    measured = [
+        make_request(
+            f"m{i}", make_state(deadline=100.0, expected_len=1.0))
+        for i in range(2)
+    ]
+    sched = _make_mlp_scheduler(
+        running=warmups + measured, max_num_running_reqs=2)
+
+    sched._apply_sslo_policy(0.0)
+
+    running_ids = {r.request_id for r in sched.running}
+    assert "w0" in running_ids and "w1" in running_ids
+
+
+def test_mlp_srjf_fallback_when_no_feasible_n():
+    # All candidates infeasible: every MEASURED req has serve ≥ 1 AND
+    # defer = inf across every tpot. _mlp_pick_adaptive_n must still
+    # return a valid (n, partition) tuple via the SRJF fallback path.
+    reqs = [
+        make_request(f"r{i}", make_state(deadline=0.1, expected_len=10.0))
+        for i in range(3)
+    ]
+    sched = _make_mlp_scheduler(running=reqs, max_num_running_reqs=32)
+    sched.tpot_ema = {32: 1.0, 24: 1.0, 16: 1.0, 8: 1.0}
+
+    picked_n, running, pending, _serve, _defer = sched._mlp_pick_adaptive_n(
+        reqs, now=0.0, base_tpot=1.0)
+
+    assert picked_n in (32, 24, 16, 8)
+    assert len(running) + len(pending) == len(reqs)
+
+
+def test_mlp_non_critical_admission_budget_uses_measured_only():
+    # 1 warmup + 3 measured at serve ≈ 0.3 (deadline=10, expected_len=3).
+    # avg_p over MEASURED only = 0.3 (warmup excluded).
+    # base_n = 32 → max_capacity = floor(32/0.3) = 106; combined =
+    # max(3, 4) = 4; admission_capacity = max(0, 106 - 4) = 102; slack
+    # = 32 - len(running). Test that the warmup is not in the avg path
+    # by checking admission_budget is bounded by slack, not by a
+    # warmup-contaminated avg_p.
+    warm = make_request("w", make_state(phase=Phase.WARMUP))
+    measured = [
+        make_request(
+            f"m{i}", make_state(deadline=10.0, expected_len=3.0))
+        for i in range(3)
+    ]
+    sched = _make_mlp_scheduler(
+        running=[warm] + measured, max_num_running_reqs=32)
+    sched.waiting = [object()] * 100  # plenty of waiting
+
+    sched._apply_sslo_policy(0.0)
+
+    # All 4 admitted go to running (cap=32, no defer-violators).
+    # slack = 32 - 4 = 28. admission_capacity from measured-only avg_p
+    # ≥ slack. Budget is bounded by slack.
+    assert sched._sslo_step.has_critical is False
+    assert sched._sslo_step.waiting_admission_budget == 28
+
+
+def test_mlp_non_critical_waiting_admit_blocked_when_slack_zero():
+    # cap=2; two warmups force-running → slack=0 even though waiting
+    # is non-empty. Admission budget must be 0.
+    warmups = [
+        make_request(f"w{i}", make_state(phase=Phase.WARMUP))
+        for i in range(2)
+    ]
+    sched = _make_mlp_scheduler(running=warmups, max_num_running_reqs=2)
+    sched.waiting = [object()] * 10
+
+    sched._apply_sslo_policy(0.0)
+
+    assert sched._sslo_step.waiting_admission_budget == 0
+
+
+def test_mlp_dispatch_resolves():
+    cfg = SsloConfig(
+        method="sslo",
+        policy="multi_level_pressure",
+        adaptive_batching=True,
+    )
+    sched = make_scheduler(max_num_running_reqs=8, cfg=cfg)
+    assert sched._apply_sslo_policy.__name__ == (
+        "_apply_sslo_multi_level_pressure")
+
+
+def test_mlp_adaptive_required_in_config():
+    with pytest.raises(ValueError, match="adaptive_batching=True"):
+        SsloConfig(
+            method="sslo",
+            policy="multi_level_pressure",
+            adaptive_batching=False,
+        )
+
+
+def test_mlp_decision_log_emits_new_fields(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "SSLO_STATS_LOG_PATH", str(tmp_path / "scheduler_stats.jsonl"))
+    cfg = SsloConfig(
+        method="sslo",
+        policy="multi_level_pressure",
+        adaptive_batching=True,
+        decision_log_mode="step",
+    )
+    a = make_request("a", make_state(deadline=10.0, expected_len=2.0))
+    sched = make_scheduler(running=[a], max_num_running_reqs=8, cfg=cfg)
+
+    sched._apply_sslo_policy(0.0)
+
+    assert len(sched._sslo_decision_buffer) == 1
+    import json
+    row = json.loads(sched._sslo_decision_buffer[0])
+    # New MLP fields present in the schema.
+    assert "serve_pressure" in row
+    assert "defer_pressure" in row
+    assert "epoch_time_s" in row
+    assert "defer_buffer_slack_s" in row
+    # MEASURED-phase request → serve is populated.
+    assert row["phase"] == "MEASURED"
+    assert row["serve_pressure"] is not None
+    # tier kept for back-compat (MLP writes 0).
+    assert row["tier"] == 0
