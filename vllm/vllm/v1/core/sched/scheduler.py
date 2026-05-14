@@ -1066,6 +1066,8 @@ class Scheduler(SchedulerInterface):
         # Per-bucket TPOT EMA: decoding-only steps whose batch size matches
         # a CUDA-graph-captured size. Adaptive batching only picks caps
         # from this set, so we only need latency samples at those sizes.
+        # SSLO: MLP epoch_time(b) = tpot_ema[b]; prefill 섞인 step은 EMA에
+        # 들어가지 않는다 (decoding_only 게이팅이 이미 보장).
         if (
             self._sslo_prev_step_decoding_only
             and prev_batch in self._sslo_cudagraph_sizes
@@ -1372,6 +1374,13 @@ class Scheduler(SchedulerInterface):
                 pressure_components.get(rid)
                 if pressure_components else None)
             policy_score = pressures[rid]
+            # SSLO: MLP component fields are optional — populated when
+            # the policy is multi_level_pressure and the request is
+            # measurable. None otherwise, including legacy policies.
+            mlp_serve = None
+            mlp_defer = None
+            mlp_epoch = None
+            mlp_defer_buffer = None
             if components is not None and components.pressure_available:
                 depletion = components.depletion_pressure
                 buffer_slack = components.buffer_slack_s
@@ -1380,6 +1389,15 @@ class Scheduler(SchedulerInterface):
                 pressure_available = True
                 missing_reason = None
                 fallback_used = False
+                mlp_serve = components.serve_pressure
+                mlp_defer = components.defer_pressure
+                mlp_epoch = components.epoch_time_s
+                mlp_defer_buffer = components.defer_buffer_slack_s
+                # SSLO: MLP — depletion_pressure aliases serve_pressure so
+                # existing analysis (which reads depletion_pressure) sees
+                # the serve-side urgency under MLP without schema churn.
+                if depletion is None and mlp_serve is not None:
+                    depletion = mlp_serve
             else:
                 depletion = None
                 buffer_slack = None
@@ -1390,16 +1408,20 @@ class Scheduler(SchedulerInterface):
                     components.pressure_missing_reason
                     if components is not None else None)
                 fallback_used = True
+                if components is not None:
+                    mlp_epoch = components.epoch_time_s
 
             # JSON can't encode inf; stringify so downstream readers see
             # the magnitude rather than a NaN/null.
-            depletion_json: float | str | None
-            if depletion is None:
-                depletion_json = None
-            elif depletion == float("inf"):
-                depletion_json = "inf"
-            else:
-                depletion_json = depletion
+            def _json_safe(v: float | None) -> float | str | None:
+                if v is None:
+                    return None
+                if v == float("inf"):
+                    return "inf"
+                return v
+            depletion_json = _json_safe(depletion)
+            serve_json = _json_safe(mlp_serve)
+            defer_json = _json_safe(mlp_defer)
 
             row = {
                 "ts": now,
@@ -1429,6 +1451,11 @@ class Scheduler(SchedulerInterface):
                 "admission_reason": None,
                 "backfill_reason": None,
                 "preemption_reason": None,
+                # SSLO: MLP-only fields (None under legacy policies).
+                "serve_pressure": serve_json,
+                "defer_pressure": defer_json,
+                "epoch_time_s": mlp_epoch,
+                "defer_buffer_slack_s": mlp_defer_buffer,
             }
             self._sslo_decision_buffer.append(json.dumps(row))
 
@@ -1549,8 +1576,10 @@ class Scheduler(SchedulerInterface):
 
         method=='baseline' → _apply_sslo_baseline (placement skipped).
         method=='sslo'     → policy chooses the algorithm:
-            'threshold' → _apply_sslo_threshold (hysteresis in/out)
-            'pressure'  → _apply_sslo_pressure  (pressure budget)
+            'threshold'            → _apply_sslo_threshold (hysteresis in/out)
+            'pressure'             → _apply_sslo_pressure  (D-sum admission)
+            'multi_level_pressure' → _apply_sslo_multi_level_pressure
+                                     (serve/defer + no throughput floor)
         """
         if self.sslo_config.method == "baseline":
             return self._apply_sslo_baseline
@@ -1558,6 +1587,8 @@ class Scheduler(SchedulerInterface):
         dispatch = {
             "threshold": self._apply_sslo_threshold,
             "pressure": self._apply_sslo_pressure,
+            # SSLO
+            "multi_level_pressure": self._apply_sslo_multi_level_pressure,
         }
         if policy not in dispatch:
             raise ValueError(
@@ -1929,6 +1960,391 @@ class Scheduler(SchedulerInterface):
             return worst
 
         return min(candidates, key=worst_score_at)
+
+    # SSLO
+    def _compute_serve_defer_pair(
+        self,
+        admitted: list[Request],
+        now: float,
+        tpot_s: float | None,
+        epoch_s: float | None,
+    ) -> tuple[
+        dict[str, float | None],
+        dict[str, float | None],
+        dict[str, PressureComponents],
+    ]:
+        """Per-request (serve, defer) pressures at a given tpot/epoch.
+
+        Returns serve/defer dicts that hold ``None`` for unmeasurable
+        requests (PREFILL/WARMUP/no_tpot/no_predictor) — callers handle
+        the None case explicitly. The components dict mirrors the
+        PressureComponents returned by RequestSLOState for decision-log
+        emission.
+        """
+        serve: dict[str, float | None] = {}
+        defer: dict[str, float | None] = {}
+        components: dict[str, PressureComponents] = {}
+        for req in admitted:
+            state = req.slo_state
+            if state is None:
+                serve[req.request_id] = None
+                defer[req.request_id] = None
+                continue
+            comp = state.multi_level_pressure_components(
+                now, tpot_s, epoch_s)
+            components[req.request_id] = comp
+            serve[req.request_id] = comp.serve_pressure
+            defer[req.request_id] = comp.defer_pressure
+        return serve, defer, components
+
+    # SSLO
+    def _mlp_partition(
+        self,
+        admitted: list[Request],
+        serve: dict[str, float | None],
+        defer: dict[str, float | None],
+        cap: int,
+    ) -> tuple[list[Request], list[Request]]:
+        """Partition admitted into (running, pending) under MLP rules.
+
+        Priority bands (filled in order until cap is reached):
+          1. forced_running_measured — MEASURED requests with
+             defer ≥ mlp_defer_constraint. Deferring one step would push
+             these past the deadline, so they MUST run this step.
+          2. warmup_running — PREFILL/WARMUP phase. Score is undefined
+             so they go in next, but never displace a forced_running.
+          3. rest_measured — remaining MEASURED requests, sorted by
+             serve descending (urgent first).
+
+        If forced + warmup alone exceed cap, forced runs win — losing a
+        chunk-deadline (deferred MEASURED) is strictly worse than
+        delaying warmup by one step.
+        """
+        defer_constraint = self.sslo_config.mlp_defer_constraint
+        forced: list[Request] = []
+        warmup: list[Request] = []
+        rest: list[Request] = []
+        for req in admitted:
+            state = req.slo_state
+            rid = req.request_id
+            if state is None:
+                # No state yet — treat as warmup (deadline unknown, defer
+                # not measurable).
+                warmup.append(req)
+                continue
+            phase = state.phase
+            if phase != Phase.MEASURED:
+                warmup.append(req)
+                continue
+            d = defer.get(rid)
+            if d is not None and d >= defer_constraint:
+                forced.append(req)
+            else:
+                rest.append(req)
+
+        def _serve_key(r: Request) -> tuple[float, str]:
+            s = serve.get(r.request_id)
+            if s is None:
+                # Should not happen — MEASURED rest path implies serve is
+                # populated. Sort to the back as a defensive tie-breaker.
+                return (-float("inf"), r.request_id)
+            if s == float("inf"):
+                return (-float("inf"), r.request_id)
+            return (-s, r.request_id)
+
+        rest.sort(key=_serve_key)
+
+        # forced > warmup > rest; truncate at cap.
+        ordered = forced + warmup + rest
+        running = ordered[:cap]
+        pending = ordered[cap:]
+        return running, pending
+
+    # SSLO
+    def _mlp_pick_adaptive_n(
+        self,
+        admitted: list[Request],
+        now: float,
+        base_tpot: float,
+    ) -> tuple[
+        int,
+        list[Request],
+        list[Request],
+        dict[str, float | None],
+        dict[str, float | None],
+    ]:
+        """MLP critical-mode cap search. No throughput floor.
+
+        Candidates: base_n ∪ captured sub-base sizes where tpot_ema[n] is
+        populated. For each n we set epoch_s = tpot_ema[n] (matching the
+        plan's epoch_time = tpot definition), partition admitted, and
+        check feasibility: all pending MEASURED requests must satisfy
+        defer < mlp_defer_constraint. Among feasible candidates, pick the
+        one minimizing Σ_running serve + Σ_pending defer (None → 0).
+
+        SRJF fallback when no candidate is feasible: sort admitted by
+        remaining_tokens asc, then pick the candidate with the fewest
+        defer-violators among pending (tiebreak by lowest objective).
+        Partition for the chosen n is always produced by _mlp_partition.
+        """
+        base_n = self.max_num_running_reqs
+        defer_constraint = self.sslo_config.mlp_defer_constraint
+        # Candidate list: base_n plus all sub-base captured sizes with a
+        # populated tpot_ema entry.
+        candidates: list[int] = []
+        if base_tpot > 0:
+            candidates.append(base_n)
+        for n in self._sslo_capture_sizes_below_base:
+            tpot = self.tpot_ema.get(n)
+            if tpot is not None and tpot > 0:
+                candidates.append(n)
+        if not candidates:
+            # Degenerate: no captured sizes profiled yet. Fall back to
+            # base_n at base_tpot — same partition as if there were no
+            # adaptive choice.
+            serve, defer, _ = self._compute_serve_defer_pair(
+                admitted, now, base_tpot, base_tpot)
+            running, pending = self._mlp_partition(
+                admitted, serve, defer, base_n)
+            return base_n, running, pending, serve, defer
+
+        feasible: list[tuple[int, float]] = []
+        cache: dict[int, tuple[
+            list[Request], list[Request],
+            dict[str, float | None], dict[str, float | None]]] = {}
+        for n in candidates:
+            tpot_n = self.tpot_ema.get(n, base_tpot)
+            serve_n, defer_n, _ = self._compute_serve_defer_pair(
+                admitted, now, tpot_n, tpot_n)
+            running, pending = self._mlp_partition(
+                admitted, serve_n, defer_n, n)
+            cache[n] = (running, pending, serve_n, defer_n)
+            # Feasibility: no MEASURED req in pending exceeds the defer
+            # constraint. Warmup pending is fine — they have no defer.
+            infeasible = False
+            for req in pending:
+                state = req.slo_state
+                if state is None or state.phase != Phase.MEASURED:
+                    continue
+                d = defer_n.get(req.request_id)
+                if d is not None and d >= defer_constraint:
+                    infeasible = True
+                    break
+            if infeasible:
+                continue
+            obj_running = sum(
+                (s for rid in (r.request_id for r in running)
+                 if (s := serve_n.get(rid)) is not None
+                    and s != float("inf")),
+                0.0)
+            # Penalise +inf as a large finite value so objective remains
+            # comparable across n; defer +inf only appears for at-deadline
+            # reqs which the partition keeps in running anyway.
+            obj_pending = sum(
+                (d for rid in (r.request_id for r in pending)
+                 if (d := defer_n.get(rid)) is not None
+                    and d != float("inf")),
+                0.0)
+            feasible.append((n, obj_running + obj_pending))
+
+        if feasible:
+            best_n, _ = min(feasible, key=lambda kv: kv[1])
+            running, pending, serve_n, defer_n = cache[best_n]
+            return best_n, running, pending, serve_n, defer_n
+
+        # SRJF fallback: pick the candidate with the fewest pending
+        # MEASURED defer-violators; tiebreak by lowest objective. The
+        # SRJF intuition (shortest-remaining-job-first) is encoded inside
+        # _mlp_partition's serve-descending sort: smaller remaining_tokens
+        # → smaller refill → smaller serve_pressure → sorts later, so the
+        # partition naturally favours nearly-done requests when the
+        # objective ties.
+        def _score(n: int) -> tuple[int, float]:
+            running, pending, serve_n, defer_n = cache[n]
+            violators = 0
+            for req in pending:
+                state = req.slo_state
+                if state is None or state.phase != Phase.MEASURED:
+                    continue
+                d = defer_n.get(req.request_id)
+                if d is not None and d >= defer_constraint:
+                    violators += 1
+            obj = sum(
+                (s for rid in (r.request_id for r in running)
+                 if (s := serve_n.get(rid)) is not None
+                    and s != float("inf")),
+                0.0)
+            obj += sum(
+                (d for rid in (r.request_id for r in pending)
+                 if (d := defer_n.get(rid)) is not None
+                    and d != float("inf")),
+                0.0)
+            return (violators, obj)
+
+        best_n = min(candidates, key=_score)
+        running, pending, serve_n, defer_n = cache[best_n]
+        return best_n, running, pending, serve_n, defer_n
+
+    # SSLO
+    def _apply_sslo_multi_level_pressure(
+        self, now: float
+    ) -> dict[str, float]:
+        """Two-level pressure (serve/defer) placement.
+
+        Three branches:
+          - score-suspend (no tpot signal yet) → mirror _apply_sslo_pressure.
+          - critical (any MEASURED serve ≥ threshold at base_n)
+            → shrink cap via _mlp_pick_adaptive_n, no waiting admission.
+          - non-critical → partition at base_n; admission budget uses
+            measured-only avg pressure so warmup ramp-up doesn't choke
+            the waiting queue.
+        """
+        prev_pending_ids, admitted, base_tpot, _legacy_pressures, _legacy_tiers = (
+            self._sslo_step_setup(now))
+        base_n = self.max_num_running_reqs
+        waiting_count = len(self.waiting) + len(self.skipped_waiting)
+        # MLP installs uniform tier=0 in the decision log (the legacy
+        # tier classification is irrelevant for MLP placement).
+        tiers = {req.request_id: 0 for req in admitted}
+        # Score for the decision log: serve_pressure floor-corrected so
+        # unmeasurable requests fall back to 1.0 (consistent with the
+        # legacy _policy_score_with_fallback contract).
+        pressures: dict[str, float] = {}
+
+        if base_tpot is None:
+            # Branch 1: score-suspend — hold current placement, allow
+            # waiting admission up to slack.
+            self._sslo_step.waiting_admission_budget = min(
+                waiting_count, max(0, base_n - len(self.running)))
+            self._sslo_step.cur_max_num_requests = base_n
+            self._sslo_step.has_critical = False
+            new_running = list(self.running)
+            new_pending = list(self.sslo_pending)
+            # No measurable pressure yet — fallback to 1.0 for the log.
+            for req in admitted:
+                pressures[req.request_id] = 1.0
+            components_for_log = self._sslo_compute_decision_components(
+                admitted, now, base_tpot)
+            self._sslo_commit_step(
+                prev_pending_ids, new_running, new_pending, now,
+                pressures=pressures, tiers=tiers, admitted=admitted,
+                base_tpot=base_tpot,
+                pressure_components=components_for_log)
+            return pressures
+
+        serve_base, defer_base, components_base = (
+            self._compute_serve_defer_pair(
+                admitted, now, base_tpot, base_tpot))
+
+        critical_threshold = self.sslo_config.mlp_critical_serve_threshold
+        # Critical only fires on MEASURED-phase serve pressure crossing
+        # the threshold. Warmup / prefill / unmeasurable do NOT trigger.
+        has_critical = False
+        for req in admitted:
+            state = req.slo_state
+            if state is None or state.phase != Phase.MEASURED:
+                continue
+            s = serve_base.get(req.request_id)
+            if s is not None and s >= critical_threshold:
+                has_critical = True
+                break
+
+        if has_critical:
+            # Branch 2: critical — shrink cap, freeze waiting admission.
+            picked_n, new_running, new_pending, serve_pick, defer_pick = (
+                self._mlp_pick_adaptive_n(admitted, now, base_tpot))
+            self._sslo_step.cur_max_num_requests = picked_n
+            self._sslo_step.has_critical = True
+            self._sslo_step.waiting_admission_budget = 0
+            # Build the log row's pressures from the picked-n serve dict.
+            for req in admitted:
+                s = serve_pick.get(req.request_id)
+                pressures[req.request_id] = 1.0 if s is None else s
+            # Re-compute components at the chosen tpot so the decision
+            # log reflects the actual planning batch.
+            tpot_pick = self.tpot_ema.get(picked_n, base_tpot)
+            components_for_log = {}
+            if self.sslo_config.decision_log_mode != "off":
+                _, _, components_for_log = self._compute_serve_defer_pair(
+                    admitted, now, tpot_pick, tpot_pick)
+            self._sslo_commit_step(
+                prev_pending_ids, new_running, new_pending, now,
+                pressures=pressures, tiers=tiers, admitted=admitted,
+                base_tpot=base_tpot,
+                pressure_components=components_for_log)
+            return pressures
+
+        # Branch 3: non-critical — partition at base_n, compute admission
+        # capacity from measured-only avg pressure.
+        new_running, new_pending = self._mlp_partition(
+            admitted, serve_base, defer_base, base_n)
+        self._sslo_step.cur_max_num_requests = base_n
+        self._sslo_step.has_critical = False
+
+        # avg_p over measured requests only (warmup excluded so admit
+        # ramp-up doesn't choke). Inf dropped to keep the mean finite.
+        measured_running_serves: list[float] = []
+        measured_pending_defers: list[float] = []
+        n_measured = 0
+        for req in admitted:
+            state = req.slo_state
+            if state is None or state.phase != Phase.MEASURED:
+                continue
+            n_measured += 1
+        new_running_ids = {r.request_id for r in new_running}
+        for req in admitted:
+            state = req.slo_state
+            if state is None or state.phase != Phase.MEASURED:
+                continue
+            rid = req.request_id
+            if rid in new_running_ids:
+                s = serve_base.get(rid)
+                if s is not None and s != float("inf"):
+                    measured_running_serves.append(s)
+            else:
+                d = defer_base.get(rid)
+                if d is not None and d != float("inf"):
+                    measured_pending_defers.append(d)
+        eps = self.sslo_config.mlp_pressure_epsilon
+        denom = max(1, n_measured)
+        avg_p = (
+            sum(measured_running_serves) + sum(measured_pending_defers)
+        ) / denom
+        avg_p = max(avg_p, eps)
+        max_capacity = int(base_n // avg_p) if avg_p > 0 else base_n
+        combined = max(n_measured, len(admitted))
+        admission_capacity = max(0, max_capacity - combined)
+        slack = base_n - len(new_running)
+        self._sslo_step.waiting_admission_budget = max(
+            0, min(waiting_count, admission_capacity, slack))
+
+        # Log-side scores: serve_pressure with 1.0 fallback for non-
+        # measurable requests. avg_score/max_score honored via the
+        # _finalize_aggregates call already done in _sslo_step_setup;
+        # overwrite below so MLP-specific aggregates are visible.
+        finite_for_aggregate: list[float] = []
+        for req in admitted:
+            rid = req.request_id
+            s = serve_base.get(rid)
+            score = 1.0 if s is None else s
+            pressures[rid] = score
+            if s is not None and s != float("inf"):
+                finite_for_aggregate.append(s)
+        if finite_for_aggregate:
+            self._sslo_step.avg_score = (
+                sum(finite_for_aggregate) / len(finite_for_aggregate))
+            self._sslo_step.max_score = max(finite_for_aggregate)
+
+        # components_base already captured under base_tpot; reuse for log.
+        components_for_log = (
+            components_base
+            if self.sslo_config.decision_log_mode != "off" else {})
+        self._sslo_commit_step(
+            prev_pending_ids, new_running, new_pending, now,
+            pressures=pressures, tiers=tiers, admitted=admitted,
+            base_tpot=base_tpot,
+            pressure_components=components_for_log)
+        return pressures
 
     # SSLO
     def schedule_sslo(self) -> SchedulerOutput:
