@@ -363,12 +363,11 @@ async def run_one(args: argparse.Namespace) -> None:
         if "offload" in args.run_kind:
             sslo_params["offloading"] = True
         # SSLO: sslo_mlp pins method=sslo with policy=multi_level_pressure
-        # and forces adaptive_batching=True (offload stays off — MLP's
-        # critical branch already shrinks the cap; offload adds noise).
+        # and forces adaptive_batching=True (MLP's critical branch already
+        # shrinks the cap; KV offload connector is wired by needs_kv_offload).
         if args.run_kind == "sslo_mlp":
             sslo_params["policy"] = "multi_level_pressure"
             sslo_params["adaptive_batching"] = True
-            sslo_params["offloading"] = False
 
     # KV transfer config: only enable the CPU-offload connector for the two
     # offload SSLO modes. Non-offload modes (baseline, sslo, sslo_adaptive)
