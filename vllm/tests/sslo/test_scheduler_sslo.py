@@ -861,11 +861,16 @@ def test_mlp_srjf_fallback_when_no_feasible_n():
 
 def test_mlp_non_critical_admission_budget_uses_measured_only():
     # 1 warmup + 3 measured at serve ≈ 0.3 (deadline=10, expected_len=3,
-    # tpot=1.0 from helper). avg_p over MEASURED only = 0.3, so
-    # admission_capacity is large. But the per-step admit count is
-    # bounded by how many running measured reqs can be safely demoted
-    # (defer < mlp_defer_constraint) — here all 3 measured qualify, so
-    # budget = 3 (and those 3 should appear in sslo_pending).
+    # tpot=1.0 from helper). New non-critical flow:
+    #   Step 1: forced=[]; warmup=[w] → running. demotable=[m0,m1,m2]
+    #     (defer ≈ 0.3 < 1) → pending.
+    #   avg_p = sum(serve_run) + sum(defer_pend) over n_measured
+    #         = (0 + 3·0.3) / 3 = 0.3
+    #   max_capacity = floor(32 / 0.3) = 106
+    #   combined = n_measured = 3 (warmup excluded)
+    #   admission_capacity = 106 - 3 = 103
+    #   slack = 32 - 1 = 31
+    #   budget = min(waiting=100, 103, 31) = 31
     warm = make_request("w", make_state(phase=Phase.WARMUP))
     measured = [
         make_request(
@@ -879,10 +884,10 @@ def test_mlp_non_critical_admission_budget_uses_measured_only():
     sched._apply_sslo_policy(0.0)
 
     assert sched._sslo_step.has_critical is False
-    # Voluntary demotion of all 3 demotable measured reqs creates 3
-    # admission slots for this step.
-    assert sched._sslo_step.waiting_admission_budget == 3
-    # The warmup stays in running; the 3 measured are demoted.
+    assert sched._sslo_step.waiting_admission_budget == 31
+    # Warmup keeps its running slot; the 3 measured (defer<1) all go to
+    # pending and stay there because slack is fully consumed by the
+    # planned admission (backfill_slots = 0).
     assert len(sched.running) == 1
     assert len(sched.sslo_pending) == 3
 

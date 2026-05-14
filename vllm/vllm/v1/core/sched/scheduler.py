@@ -2274,84 +2274,97 @@ class Scheduler(SchedulerInterface):
                 pressure_components=components_for_log)
             return pressures
 
-        # Branch 3: non-critical — partition at base_n, compute admission
-        # capacity from measured-only avg pressure.
-        new_running, new_pending = self._mlp_partition(
-            admitted, serve_base, defer_base, base_n)
+        # Branch 3: non-critical.
+        #
+        # Step 1: classify admitted. forced (defer>=1) and warmup/prefill
+        # go straight to running; all measured-with-defer<1 are *initially*
+        # parked in pending. This is what makes the pending pool non-empty
+        # in steady state without resorting to hysteresis bands.
+        defer_thr = self.sslo_config.mlp_defer_constraint
+        forced_running: list[Request] = []
+        warmup_running: list[Request] = []
+        eligible_pending: list[Request] = []
+        for req in admitted:
+            state = req.slo_state
+            if state is None or state.phase != Phase.MEASURED:
+                warmup_running.append(req)
+                continue
+            d = defer_base.get(req.request_id)
+            if d is None or d == float("inf") or d >= defer_thr:
+                forced_running.append(req)
+            else:
+                eligible_pending.append(req)
+
+        cands_running: list[Request] = list(forced_running) + list(
+            warmup_running)
+        cands_pending: list[Request] = list(eligible_pending)
+        # Rare overflow: forced + warmup exceeds cap. Forced is hard-
+        # required; spill excess warmup into pending (the only place left).
+        if len(cands_running) > base_n:
+            excess = len(cands_running) - base_n
+            spill = warmup_running[-excess:] if excess <= len(
+                warmup_running) else warmup_running
+            cands_running = [r for r in cands_running if r not in spill]
+            cands_pending = list(spill) + cands_pending
+
+        # avg_p over MEASURED reqs only: running serves + pending defers,
+        # divided by total measured count.
+        sum_serve_running = 0.0
+        n_measured_running = 0
+        for req in cands_running:
+            state = req.slo_state
+            if state is None or state.phase != Phase.MEASURED:
+                continue
+            s = serve_base.get(req.request_id)
+            if s is None or s == float("inf"):
+                continue
+            sum_serve_running += s
+            n_measured_running += 1
+        sum_defer_pending = 0.0
+        n_measured_pending = 0
+        for req in cands_pending:
+            state = req.slo_state
+            if state is None or state.phase != Phase.MEASURED:
+                continue
+            d = defer_base.get(req.request_id)
+            if d is None or d == float("inf"):
+                continue
+            sum_defer_pending += d
+            n_measured_pending += 1
+        n_measured = n_measured_running + n_measured_pending
+        eps = self.sslo_config.mlp_pressure_epsilon
+        avg_p = max(
+            eps,
+            (sum_serve_running + sum_defer_pending) / max(1, n_measured))
+        max_capacity = int(base_n // avg_p) if avg_p > 0 else base_n
+
+        # Step 2: admission budget. slack = cap - cands_running (room left
+        # after step 1's classification puts everyone into running/pending).
+        combined = n_measured  # warmup excluded; not yet load-contributing
+        admission_capacity = max(0, max_capacity - combined)
+        slack = base_n - len(cands_running)
+        waiting_admission_budget = max(
+            0, min(waiting_count, admission_capacity, slack))
+
+        # Step 3: backfill running from pending by defer DESC — the
+        # highest-defer pending reqs are the closest to becoming forced
+        # (defer>=1) and thus most risky to leave waiting. Fill remaining
+        # slack-minus-admission with these.
+        backfill_slots = max(0, slack - waiting_admission_budget)
+        if backfill_slots > 0 and cands_pending:
+            cands_pending_sorted = sorted(
+                cands_pending,
+                key=lambda r: defer_base.get(r.request_id, 0.0) or 0.0,
+                reverse=True)
+            promoted = cands_pending_sorted[:backfill_slots]
+            cands_pending = cands_pending_sorted[backfill_slots:]
+            cands_running.extend(promoted)
+
+        new_running = cands_running
+        new_pending = cands_pending
         self._sslo_step.cur_max_num_requests = base_n
         self._sslo_step.has_critical = False
-
-        # avg_p over measured requests only (warmup excluded so admit
-        # ramp-up doesn't choke). Inf dropped to keep the mean finite.
-        measured_running_serves: list[float] = []
-        measured_pending_defers: list[float] = []
-        n_measured = 0
-        for req in admitted:
-            state = req.slo_state
-            if state is None or state.phase != Phase.MEASURED:
-                continue
-            n_measured += 1
-        new_running_ids = {r.request_id for r in new_running}
-        for req in admitted:
-            state = req.slo_state
-            if state is None or state.phase != Phase.MEASURED:
-                continue
-            rid = req.request_id
-            if rid in new_running_ids:
-                s = serve_base.get(rid)
-                if s is not None and s != float("inf"):
-                    measured_running_serves.append(s)
-            else:
-                d = defer_base.get(rid)
-                if d is not None and d != float("inf"):
-                    measured_pending_defers.append(d)
-        eps = self.sslo_config.mlp_pressure_epsilon
-        denom = max(1, n_measured)
-        avg_p = (
-            sum(measured_running_serves) + sum(measured_pending_defers)
-        ) / denom
-        avg_p = max(avg_p, eps)
-        max_capacity = int(base_n // avg_p) if avg_p > 0 else base_n
-        # admission ceiling: max_capacity - n_measured (warmup not counted
-        # toward load until it produces tokens).
-        combined = n_measured
-        admission_capacity = max(0, max_capacity - combined)
-        plan_admit = max(0, min(waiting_count, admission_capacity))
-
-        # Engine's admission loop (schedule_sslo:~2591) breaks when
-        # len(self.running) == max_num_running_reqs. If non-critical
-        # partition keeps everyone in running (no forced+defer<1), slack
-        # stays 0 and waiting can't enter — handling_users freezes at
-        # base_n. To open the gate without reintroducing hysteresis, we
-        # voluntarily move the `plan_admit` lowest-serve MEASURED reqs
-        # whose defer < mlp_defer_constraint from new_running to
-        # new_pending. This creates slack equal to the planned admit
-        # count; the defer feasibility check guarantees the demoted reqs
-        # are still safe to wait one epoch.
-        defer_thr = self.sslo_config.mlp_defer_constraint
-        if plan_admit > 0 and new_pending == []:
-            demotable: list[tuple[float, Request]] = []
-            for req in new_running:
-                state = req.slo_state
-                if state is None or state.phase != Phase.MEASURED:
-                    continue
-                d = defer_base.get(req.request_id)
-                if d is None or d == float("inf") or d >= defer_thr:
-                    continue
-                s = serve_base.get(req.request_id)
-                if s is None:
-                    continue
-                demotable.append((s, req))
-            demotable.sort(key=lambda x: x[0])
-            n_demote = min(plan_admit, len(demotable))
-            if n_demote > 0:
-                demoted_reqs = [req for _, req in demotable[:n_demote]]
-                new_running = [r for r in new_running if r not in demoted_reqs]
-                new_pending = list(new_pending) + demoted_reqs
-                plan_admit = n_demote  # admit only as many as we made room for
-            else:
-                plan_admit = 0
-        self._sslo_step.waiting_admission_budget = plan_admit
+        self._sslo_step.waiting_admission_budget = waiting_admission_budget
 
         # Log-side scores: serve_pressure with 1.0 fallback for non-
         # measurable requests. avg_score/max_score honored via the
