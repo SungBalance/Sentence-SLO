@@ -251,15 +251,29 @@ def test_non_critical_pending_to_running_at_07():
 
 
 def test_non_critical_running_to_pending_at_03():
-    # Demoted req stays in pending only when waiting blocks the backfill —
-    # otherwise the next step backfills it right back to keep batch at cap.
-    req = make_request("running", make_state(deadline=10, expected_len=2))
-    scheduler = make_scheduler(running=[req], max_num_running_reqs=1)
-    scheduler.waiting = [object()]  # waiting reserves the backfill slot
+    # Demoted req stays in pending only when admission claims the backfill
+    # slot. Under the new chunk-SLO admission formula
+    # (admission_capacity = cap - Σ pressures), a 1-slot system with a
+    # single low-pressure req has Σ pressures ≈ 0.2 < cap=1, so the budget
+    # is min(waiting, int(1 - 0.2), slack) = min(1, 0, 1) = 0 → no slack
+    # consumed by admission → backfill pulls the req back to running. To
+    # exercise the "stays-in-pending" branch we widen cap so admission
+    # actually fits (cap=2, two waiting reqs, single demoted req).
+    reqs = [
+        make_request(f"r{i}", make_state(deadline=10, expected_len=2))
+        for i in range(2)
+    ]
+    scheduler = make_scheduler(running=reqs, max_num_running_reqs=2)
+    scheduler.waiting = [object(), object()]
 
     scheduler._apply_sslo_policy(0.0)
 
-    assert scheduler.sslo_pending == [req]
+    # All reqs at pressure 0.2 (≤ in_thr=0.3): classified to pending.
+    # Σ pressures = 0.4, cap=2 → admission_capacity = int(2-0.4) = 1, slack
+    # = 2 → budget=min(2, 1, 2)=1. backfill = slack - budget = 1, so one
+    # req returns to running, the other stays pending.
+    assert len(scheduler.sslo_pending) == 1
+    assert len(scheduler.running) == 1
 
 
 def test_non_critical_hysteresis_keeps_state_in_band():
@@ -861,16 +875,15 @@ def test_mlp_srjf_fallback_when_no_feasible_n():
 
 def test_mlp_non_critical_admission_budget_uses_measured_only():
     # 1 warmup + 3 measured at serve ≈ 0.3 (deadline=10, expected_len=3,
-    # tpot=1.0 from helper). New non-critical flow:
+    # tpot=1.0 from helper). New chunk-SLO admission flow:
     #   Step 1: forced=[]; warmup=[w] → running. demotable=[m0,m1,m2]
     #     (defer ≈ 0.3 < 1) → pending.
-    #   avg_p = sum(serve_run) + sum(defer_pend) over n_measured
-    #         = (0 + 3·0.3) / 3 = 0.3
-    #   max_capacity = floor(32 / 0.3) = 106
-    #   combined = n_measured = 3 (warmup excluded)
-    #   admission_capacity = 106 - 3 = 103
+    #   load = Σ serve_running (0) + Σ defer_pending (3·0.3=0.9)
+    #        + unmeasured_running (warmup=1) + unmeasured_pending (0)
+    #        = 1.9
+    #   admission_capacity = int(32 - 1.9) = 30
     #   slack = 32 - 1 = 31
-    #   budget = min(waiting=100, 103, 31) = 31
+    #   budget = min(waiting=100, 30, 31) = 30
     warm = make_request("w", make_state(phase=Phase.WARMUP))
     measured = [
         make_request(
@@ -884,12 +897,12 @@ def test_mlp_non_critical_admission_budget_uses_measured_only():
     sched._apply_sslo_policy(0.0)
 
     assert sched._sslo_step.has_critical is False
-    assert sched._sslo_step.waiting_admission_budget == 31
+    assert sched._sslo_step.waiting_admission_budget == 30
     # Warmup keeps its running slot; the 3 measured (defer<1) all go to
-    # pending and stay there because slack is fully consumed by the
-    # planned admission (backfill_slots = 0).
-    assert len(sched.running) == 1
-    assert len(sched.sslo_pending) == 3
+    # pending. slack=31, budget=30, backfill_slots=1 → one pending req
+    # promoted back, so 2 stay in pending.
+    assert len(sched.running) == 2
+    assert len(sched.sslo_pending) == 2
 
 
 def test_mlp_non_critical_no_admit_when_all_warmup_running():

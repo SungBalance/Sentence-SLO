@@ -1749,25 +1749,23 @@ class Scheduler(SchedulerInterface):
         cands_pending: list[Request],
         pressures: dict[str, float],
     ) -> None:
-        # Intent: when avg_pressure < 1, the system can sustain more than
-        # `cap` concurrent admitted requests on average, so admission is
-        # opened up to the full `slack` (cap - len(cands_running)). The
-        # N/avg_p formula expresses that ceiling; the `slack` arg in the
-        # min(...) below is the effective floor when slack is the binding
-        # bound — that's deliberate, not a degeneracy.
+        # Chunk-SLO admission: each admitted req contributes ~p_i units of
+        # slot demand. To keep the system serviceable, the total demand
+        # Σ p_i must stay ≤ cap. Unmeasurable phase requests (no pressure
+        # yet) are billed at 1.0 each so admission doesn't over-admit
+        # while their pressure is still 0. Compare with the old N/avg_p
+        # bound which only enforces *average* sustainability.
         cap = self._sslo_step.cur_max_num_requests
         slack = cap - len(cands_running)
         waiting_count = len(self.waiting) + len(self.skipped_waiting)
-        combined = len(cands_running) + len(cands_pending)
-        avg_p = self._sslo_step.avg_score
-        if avg_p is not None and avg_p > 0:
-            # Use cur_max_num_requests (the step's effective cap) rather
-            # than the hard max_num_running_reqs ceiling, so an adaptive
-            # cap shrink propagates correctly.
-            max_capacity = int(cap / avg_p)
-            admission_capacity = max(0, max_capacity - combined)
-        else:
-            admission_capacity = slack
+        load = 0.0
+        for req in cands_running + cands_pending:
+            p = pressures.get(req.request_id)
+            if p is None or p == float("inf"):
+                load += 1.0
+            else:
+                load += p
+        admission_capacity = max(0, int(cap - load))
         self._sslo_step.waiting_admission_budget = min(
             waiting_count, admission_capacity, slack)
         backfill_budget = max(
@@ -2309,39 +2307,43 @@ class Scheduler(SchedulerInterface):
 
         # avg_p over MEASURED reqs only: running serves + pending defers,
         # divided by total measured count.
+        # Chunk-SLO admission: total slot demand Σ(serve over running) +
+        # Σ(defer over pending) + 1.0 per unmeasurable (warmup/PREFILL)
+        # request must stay ≤ cap. Unmeasurable load is billed at 1.0 so
+        # admission can't ramp unboundedly during the warmup window. inf
+        # contributions are clipped to 1.0 (a single req can't cost more
+        # than one full slot at this scale).
         sum_serve_running = 0.0
-        n_measured_running = 0
+        unmeasured_running = 0
         for req in cands_running:
             state = req.slo_state
             if state is None or state.phase != Phase.MEASURED:
+                unmeasured_running += 1
                 continue
             s = serve_base.get(req.request_id)
             if s is None or s == float("inf"):
+                unmeasured_running += 1
                 continue
             sum_serve_running += s
-            n_measured_running += 1
         sum_defer_pending = 0.0
-        n_measured_pending = 0
+        unmeasured_pending = 0
         for req in cands_pending:
             state = req.slo_state
             if state is None or state.phase != Phase.MEASURED:
+                unmeasured_pending += 1
                 continue
             d = defer_base.get(req.request_id)
             if d is None or d == float("inf"):
+                unmeasured_pending += 1
                 continue
             sum_defer_pending += d
-            n_measured_pending += 1
-        n_measured = n_measured_running + n_measured_pending
-        eps = self.sslo_config.mlp_pressure_epsilon
-        avg_p = max(
-            eps,
-            (sum_serve_running + sum_defer_pending) / max(1, n_measured))
-        max_capacity = int(base_n // avg_p) if avg_p > 0 else base_n
+        load = (
+            sum_serve_running + sum_defer_pending
+            + unmeasured_running + unmeasured_pending)
 
         # Step 2: admission budget. slack = cap - cands_running (room left
         # after step 1's classification puts everyone into running/pending).
-        combined = n_measured  # warmup excluded; not yet load-contributing
-        admission_capacity = max(0, max_capacity - combined)
+        admission_capacity = max(0, int(base_n - load))
         slack = base_n - len(cands_running)
         waiting_admission_budget = max(
             0, min(waiting_count, admission_capacity, slack))
