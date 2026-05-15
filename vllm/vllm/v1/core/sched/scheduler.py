@@ -1530,7 +1530,7 @@ class Scheduler(SchedulerInterface):
                 cands_pending.extend(overflow)
             self._sslo_step.cur_max_num_requests = cap
             self._compute_admission_budget_and_backfill(
-                cands_running, cands_pending, pressures)
+                cands_running, cands_pending, pressures, now, base_tpot)
             new_running = cands_running
             new_pending = cands_pending
 
@@ -1748,6 +1748,8 @@ class Scheduler(SchedulerInterface):
         cands_running: list[Request],
         cands_pending: list[Request],
         pressures: dict[str, float],
+        now: float,
+        base_tpot: float | None,
     ) -> None:
         # Chunk-SLO admission: each admitted req contributes ~p_i units of
         # slot demand. To keep the system serviceable, the total demand
@@ -1772,10 +1774,19 @@ class Scheduler(SchedulerInterface):
             0, slack - self._sslo_step.waiting_admission_budget)
         if backfill_budget <= 0 or not cands_pending:
             return
-        pending_pool = sorted(
-            cands_pending,
-            key=lambda r: self._priority_key(
-                pressures[r.request_id], r.request_id))
+        # Backfill order: defer DESC (highest-defer pending → running) so
+        # the reqs closest to becoming forced (defer ≥ 1) are pulled back
+        # first. Unmeasurable reqs (no state / no tpot / PREFILL / WARMUP)
+        # have no defer signal — rank them lowest.
+        def _defer_key(req: Request) -> float:
+            state = req.slo_state
+            if state is None or base_tpot is None:
+                return -1.0
+            d = state.defer_pressure(now, base_tpot, base_tpot)
+            if d is None:
+                return -1.0
+            return d
+        pending_pool = sorted(cands_pending, key=_defer_key, reverse=True)
         for pick in pending_pool[:backfill_budget]:
             cands_pending.remove(pick)
             cands_running.append(pick)
