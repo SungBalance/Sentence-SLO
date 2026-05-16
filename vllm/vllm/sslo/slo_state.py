@@ -109,9 +109,12 @@ class ChunkLengthPredictor:
         self._history: deque[int] = deque(maxlen=history_max)
         self._ema: float | None = None
         self.value: float | None = None
-        # p99 companion value, populated only when strategy == "p90".
-        # expected_remaining_len() falls back to it when generated tokens
-        # exceed the p90 prediction so pressure() doesn't collapse to 1.
+        # Escalation ladder for strategy == "p90": when the running
+        # chunk's generated_len overshoots the p90 prediction we step up
+        # to value_mid (p95); past that we step up to value_high (p99).
+        # Other strategies leave both companions at None so the floor
+        # logic in expected_remaining_len() falls through.
+        self.value_mid: float | None = None
         self.value_high: float | None = None
         if strategy == "ema":
             self.update = self.update_ema
@@ -132,6 +135,8 @@ class ChunkLengthPredictor:
         percentile = 90.0 if self.strategy == "p90" else 99.0
         self.value = float(np.percentile(arr, percentile, method="nearest"))
         if self.strategy == "p90":
+            self.value_mid = float(
+                np.percentile(arr, 95.0, method="nearest"))
             self.value_high = float(
                 np.percentile(arr, 99.0, method="nearest"))
 
@@ -515,20 +520,26 @@ class RequestSLOState:
         return None if deadline is None else deadline - now
 
     def expected_remaining_len(self) -> float | None:
-        predicted = self._chunk_len_predictor.value
-        if predicted is None:
+        # Predictor ladder (strategy=="p90"): pressure() starts using the
+        # p90 estimate; once the current chunk has produced more tokens
+        # than p90 we escalate to p95, and past p95 we escalate to p99.
+        # This keeps the residual estimate non-trivial as the chunk
+        # overshoots its typical size without depending on the 1.0 floor.
+        # Other strategies leave value_mid / value_high at None so the
+        # logic falls through to the original single-level estimate.
+        pred = self._chunk_len_predictor
+        if pred.value is None:
             return None
-        remaining = predicted - self.current_chunk_generated_len
-        if remaining <= 0:
-            # Over-shoot: this chunk is already longer than the p90
-            # prediction. Fall back to the p99 companion so pressure()
-            # keeps reflecting real remaining work instead of collapsing
-            # to the 1.0 floor below. value_high is only populated under
-            # strategy="p90"; for other strategies the floor is used.
-            high = self._chunk_len_predictor.value_high
-            if high is not None:
-                return max(1.0, high - self.current_chunk_generated_len)
-        return max(1.0, remaining)
+        cur = self.current_chunk_generated_len
+        if cur < pred.value:
+            return max(1.0, pred.value - cur)
+        mid = pred.value_mid
+        if mid is not None and cur < mid:
+            return max(1.0, mid - cur)
+        high = pred.value_high
+        if high is not None and cur < high:
+            return max(1.0, high - cur)
+        return 1.0
 
     def pressure_components(
         self, now: float, tpot_s: float | None
