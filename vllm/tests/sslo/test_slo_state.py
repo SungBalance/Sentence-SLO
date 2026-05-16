@@ -3,7 +3,12 @@
 
 import pytest
 
-from vllm.sslo.slo_state import ChunkRecord, Phase, RequestSLOState
+from vllm.sslo.slo_state import (
+    ChunkRecord,
+    ChunkSeparator,
+    Phase,
+    RequestSLOState,
+)
 
 
 def measured_state() -> RequestSLOState:
@@ -196,6 +201,70 @@ def test_min_chunk_tokens_resets_after_flush():
     # Counter must reset; another 10-token sentence flushes again.
     state.on_text_delta(" Another long sentence here too.", 1.1, num_tokens=10)
     assert len(state.chunk_records) == 2
+
+
+def test_chunk_separator_newline_is_sentence_boundary():
+    # In sentence mode, a single `\n` is a boundary even without ASCII
+    # sentence-end punctuation. Each line is 16+ tokens so neither is held back.
+    sep = ChunkSeparator(chunk_unit="sentence", min_chunk_tokens=16)
+    chunks = list(sep.feed("Line one with enough words to clear min\n", 16))
+    chunks += list(sep.feed("Line two also with enough words to clear\n", 16))
+    assert len(chunks) == 2
+    assert chunks[0].endswith("\n")
+    assert chunks[1].endswith("\n")
+
+
+def test_chunk_separator_newline_under_min_chunk_merges():
+    # Short `\n`-separated fragments merge until they hit min_chunk_tokens.
+    sep = ChunkSeparator(chunk_unit="sentence", min_chunk_tokens=16)
+    out = []
+    for _ in range(4):
+        out += list(sep.feed("Hi\n", 1))
+    assert out == [], "fragments under min_chunk_tokens must not emit"
+    # 12 more tokens push us above min_chunk_tokens and the next `\n` flushes.
+    out += list(sep.feed(
+        "Now the cumulative tokens reach min and we flush.\n", 12))
+    assert len(out) == 1
+
+
+def test_chunk_separator_paragraph_mode_newline_unchanged():
+    # Paragraph mode still requires `\n\n`; lone `\n` does not break.
+    sep = ChunkSeparator(chunk_unit="paragraph", min_chunk_tokens=0)
+    out = list(sep.feed("Single line break only\n", 5))
+    assert out == []
+    out += list(sep.feed("After paragraph break.\n\n", 5))
+    assert len(out) == 1
+    assert out[0].endswith("\n\n")
+
+
+def test_chunk_separator_breaks_degenerate_repetition():
+    # `\\boxed{No}\n` repeated — previously grew to ~1000 tokens because no
+    # sentence-end punctuation fired. With newline boundary it splits per line.
+    sep = ChunkSeparator(chunk_unit="sentence", min_chunk_tokens=16)
+    chunks = []
+    # 50 lines × 5 tokens = 250 tokens. With min=16 they merge in groups
+    # of ~4 lines → ~13 chunks, none above ~30 tokens.
+    for _ in range(50):
+        chunks += list(sep.feed("\\boxed{No}\n", 5))
+    chunks.append(sep.flush() or "")
+    # No chunk grew past a few lines' worth of text.
+    assert all(len(c) < 120 for c in chunks if c), (
+        f"a chunk grew unbounded: max len {max(len(c) for c in chunks if c)}")
+    # We DID emit multiple chunks (i.e. the input wasn't one giant chunk).
+    assert sum(1 for c in chunks if c) >= 3
+
+
+def test_chunk_separator_breaks_thai_bullet_list():
+    # Non-Latin bullets without `.` — boundary fires on `\n` per line.
+    sep = ChunkSeparator(chunk_unit="sentence", min_chunk_tokens=0)
+    text = (
+        "- ตรวจจับเร็ว\n"
+        "- การใช้ที่ปรึกษาทางไกล\n"
+        "- การวางแผนระยะยาว\n"
+    )
+    chunks = list(sep.feed(text, 30))
+    assert len(chunks) == 3
+    assert all(c.endswith("\n") for c in chunks)
 
 
 def test_chunk0_slack_zero_by_structure():

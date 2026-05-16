@@ -133,6 +133,7 @@ def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
             "stall_start_ts": _val(record, "stall_start_ts"),
             "stall_end_ts": _val(record, "stall_end_ts"),
             "stall_duration_s": _val(record, "stall_duration_s"),
+            "text": _val(record, "text"),
         })
     return normalized
 
@@ -406,9 +407,14 @@ async def run_one(args: argparse.Namespace) -> None:
         engine_kwargs["enable_prefix_caching"] = True
     engine_args = AsyncEngineArgs(**engine_kwargs)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
-    # Use the model's HF generation_config defaults; only override max_tokens
-    # so all runs produce the same response budget.
-    sampling_params = SamplingParams(max_tokens=args.generation_max_tokens)
+    # Pull HF generation_config diff (temperature/top_p/top_k/repetition_penalty/min_p).
+    # SamplingParams() does NOT auto-merge engine generation_config="auto" on the
+    # AsyncLLM path — do it explicitly so all runs sample with the model's intended
+    # distribution rather than vLLM's neutral defaults (1.0/1.0/-1).
+    sampling_kwargs = dict(engine.model_config.get_diff_sampling_param())
+    sampling_kwargs["max_tokens"] = args.generation_max_tokens
+    sampling_params = SamplingParams.from_optional(**sampling_kwargs)
+    print(f"{args.run_kind}: sampling_params={sampling_params}")
 
     # Generate Poisson inter-arrival offsets relative to t0.
     rate = args.request_rate

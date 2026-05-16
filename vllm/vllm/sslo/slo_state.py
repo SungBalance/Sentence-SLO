@@ -238,10 +238,21 @@ class ChunkSeparator:
             idx = text.find("\n\n")
             return None if idx == -1 else idx + 2
 
+        # Sentence mode boundaries (whichever appears first):
+        #   (a) one or more sentence-end chars followed by whitespace/EOS
+        #   (b) any newline `\n` — handles scripts/structures without ASCII
+        #       sentence-end punctuation (Thai/Korean lists, markdown table
+        #       rows, `=keyword=` lists, degenerate `\boxed{X}\n` repetitions).
+        # `min_chunk_tokens` already merges short newline-separated
+        # fragments (table cells, code lines) into the next chunk, so the
+        # newline rule does not over-fragment normal prose.
         i = 0
         n = len(text)
         while i < n:
-            if text[i] in _SENTENCE_END_CHARS:
+            ch = text[i]
+            if ch == "\n":
+                return i + 1
+            if ch in _SENTENCE_END_CHARS:
                 j = i + 1
                 while j < n and text[j] in _SENTENCE_END_CHARS:
                     j += 1
@@ -296,6 +307,11 @@ class ChunkRecord:
     expected_chunk_len_high: float | None = None
     # Which predictor strategy produced expected_len.
     predictor_source: str = ""
+    # Raw chunk text — used for diagnostics (e.g. inspect what kind of
+    # text drives outlier-length chunks). Off the critical path; kept
+    # because chunks.jsonl is already large enough that one more field
+    # doesn't materially affect dump size.
+    text: str = ""
 
 
 class ChunkStatCollector:
@@ -336,6 +352,7 @@ class ChunkStatCollector:
         demand_window_end_ts: float,
         expected_chunk_len_high: float | None,
         predictor_source: str,
+        text: str = "",
     ) -> None:
         running_iters = self._current_running_iters
         pending_iters = self._current_pending_iters
@@ -364,6 +381,7 @@ class ChunkStatCollector:
                 demand_window_end_ts=demand_window_end_ts,
                 expected_chunk_len_high=expected_chunk_len_high,
                 predictor_source=predictor_source,
+                text=text,
             ))
         # Aggregate stall = max(0, -slack); positive only when late.
         self.stall_time_total += max(0.0, -slack_s)
@@ -764,6 +782,7 @@ class RequestSLOState:
         now: float,
         word_count: int,
         chunk_consume_time_s: float,
+        text: str = "",
     ) -> None:
         self._ensure_decoding_started(now)
 
@@ -824,6 +843,7 @@ class RequestSLOState:
             demand_window_end_ts=deadline + chunk_consume_time_s,
             expected_chunk_len_high=self._chunk_len_predictor.value_high,
             predictor_source=self._chunk_len_predictor.strategy,
+            text=text,
         )
         self._chunk_len_predictor.update(num_token)
 
@@ -883,6 +903,7 @@ class RequestSLOState:
                 word_count=word_count,
                 chunk_consume_time_s=self.consume_estimator.estimate(
                     chunk_text, word_count),
+                text=chunk_text,
             )
 
     def on_finish(self, now: float) -> None:
@@ -901,6 +922,7 @@ class RequestSLOState:
                 word_count=word_count,
                 chunk_consume_time_s=self.consume_estimator.estimate(
                     remaining, word_count),
+                text=remaining,
             )
         elif self.decoding_start_ts is None:
             self.decoding_start_ts = now
