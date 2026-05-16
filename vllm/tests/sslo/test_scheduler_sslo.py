@@ -785,9 +785,11 @@ def test_mlp_critical_only_measured_phase_triggers():
 
 
 def test_mlp_critical_fires_on_measured_serve_ge_one():
-    # serve = remaining*tpot/ttd = 1.5*1.0/1.0 = 1.5 ≥ 1.0 → critical.
+    # System-scaled serve = raw_serve * (N / base_n). With N=1, base_n=32
+    # we need raw ≥ 32 to push scaled ≥ 1.0. expected_len=50, tpot=1.0,
+    # ttd=1.0 → raw = 50; scaled = 50/32 ≈ 1.56 → critical.
     measured = make_request(
-        "m", make_state(deadline=1.0, expected_len=1.5))
+        "m", make_state(deadline=1.0, expected_len=50))
     sched = _make_mlp_scheduler(
         running=[measured], max_num_running_reqs=32)
     sched.tpot_ema = {32: 1.0, 24: 0.5, 16: 0.5, 8: 0.5}

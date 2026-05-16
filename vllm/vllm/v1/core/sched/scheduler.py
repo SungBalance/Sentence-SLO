@@ -1751,12 +1751,13 @@ class Scheduler(SchedulerInterface):
         now: float,
         base_tpot: float | None,
     ) -> None:
-        # Chunk-SLO admission: each admitted req contributes ~p_i units of
-        # slot demand. To keep the system serviceable, the total demand
-        # Σ p_i must stay ≤ cap. Unmeasurable phase requests (no pressure
-        # yet) are billed at 1.0 each so admission doesn't over-admit
-        # while their pressure is still 0. Compare with the old N/avg_p
-        # bound which only enforces *average* sustainability.
+        # Chunk-SLO admission with contention scaling: each admitted req
+        # contributes p_i units of slot demand, but in a system with N
+        # admitted and cap slots, the effective per-req contention is
+        # N/cap times the solo demand (each req only gets a cap/N share
+        # of the GPU). Scaling the load by max(1, N/cap) makes admission
+        # tighten naturally as N grows past cap; below cap the bound is
+        # unchanged so we don't artificially reject when there's room.
         cap = self._sslo_step.cur_max_num_requests
         slack = cap - len(cands_running)
         waiting_count = len(self.waiting) + len(self.skipped_waiting)
@@ -1767,6 +1768,9 @@ class Scheduler(SchedulerInterface):
                 load += 1.0
             else:
                 load += p
+        n_admitted = len(cands_running) + len(cands_pending)
+        scale = max(1.0, n_admitted / max(1, cap))
+        load *= scale
         admission_capacity = max(0, int(cap - load))
         self._sslo_step.waiting_admission_budget = min(
             waiting_count, admission_capacity, slack)
@@ -1990,6 +1994,17 @@ class Scheduler(SchedulerInterface):
         PressureComponents returned by RequestSLOState for decision-log
         emission.
         """
+        # System-scaled pressure: each req shares cap slots with the
+        # N admitted reqs, so its effective decode rate is cap/N of its
+        # solo rate. Scale the raw pressure by N/cap to capture this
+        # contention. With this scaling, serve and defer collapse to the
+        # same value (the "one epoch" defer adjustment is dominated by
+        # the long-run N/cap share); we return them as equal so the
+        # downstream partition/admission code keeps its existing shape
+        # but is now interpreted as a single unified pressure.
+        n_admitted = len(admitted)
+        base_n = self.max_num_running_reqs
+        scale = n_admitted / max(1, base_n)
         serve: dict[str, float | None] = {}
         defer: dict[str, float | None] = {}
         components: dict[str, PressureComponents] = {}
@@ -2002,8 +2017,15 @@ class Scheduler(SchedulerInterface):
             comp = state.multi_level_pressure_components(
                 now, tpot_s, epoch_s)
             components[req.request_id] = comp
-            serve[req.request_id] = comp.serve_pressure
-            defer[req.request_id] = comp.defer_pressure
+            raw = comp.serve_pressure
+            if raw is None:
+                scaled: float | None = None
+            elif raw == float("inf"):
+                scaled = float("inf")
+            else:
+                scaled = raw * scale
+            serve[req.request_id] = scaled
+            defer[req.request_id] = scaled
         return serve, defer, components
 
     # SSLO
