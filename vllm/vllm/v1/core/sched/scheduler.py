@@ -2338,14 +2338,14 @@ class Scheduler(SchedulerInterface):
             cands_running = [r for r in cands_running if r not in spill]
             cands_pending = list(spill) + cands_pending
 
-        # avg_p over MEASURED reqs only: running serves + pending defers,
-        # divided by total measured count.
-        # Chunk-SLO admission: total slot demand Σ(serve over running) +
-        # Σ(defer over pending) + 1.0 per unmeasurable (warmup/PREFILL)
-        # request must stay ≤ cap. Unmeasurable load is billed at 1.0 so
-        # admission can't ramp unboundedly during the warmup window. inf
-        # contributions are clipped to 1.0 (a single req can't cost more
-        # than one full slot at this scale).
+        # Chunk-SLO admission. Measured-pressure (serve/defer) values
+        # already include the N/cap contention scaling applied inside
+        # _compute_serve_defer_pair, so they represent each req's
+        # shared-slot demand. Unmeasurable (warmup/PREFILL) requests are
+        # billed at 1.0 × scale so they're treated symmetrically with a
+        # measured req at raw pressure 1.0 — without the explicit scale
+        # warmup would under-bill versus measured peers and let the
+        # admission queue ramp unboundedly during the warmup window.
         sum_serve_running = 0.0
         unmeasured_running = 0
         for req in cands_running:
@@ -2372,7 +2372,8 @@ class Scheduler(SchedulerInterface):
             sum_defer_pending += d
         load = (
             sum_serve_running + sum_defer_pending
-            + unmeasured_running + unmeasured_pending)
+            + (unmeasured_running + unmeasured_pending)
+            * (len(admitted) / max(1, base_n)))
 
         # Step 2: admission budget. slack = cap - cands_running (room left
         # after step 1's classification puts everyone into running/pending).

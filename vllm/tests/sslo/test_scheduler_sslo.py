@@ -876,16 +876,14 @@ def test_mlp_srjf_fallback_when_no_feasible_n():
 
 
 def test_mlp_non_critical_admission_budget_uses_measured_only():
-    # 1 warmup + 3 measured at serve ≈ 0.3 (deadline=10, expected_len=3,
-    # tpot=1.0 from helper). New chunk-SLO admission flow:
-    #   Step 1: forced=[]; warmup=[w] → running. demotable=[m0,m1,m2]
-    #     (defer ≈ 0.3 < 1) → pending.
-    #   load = Σ serve_running (0) + Σ defer_pending (3·0.3=0.9)
-    #        + unmeasured_running (warmup=1) + unmeasured_pending (0)
-    #        = 1.9
-    #   admission_capacity = int(32 - 1.9) = 30
-    #   slack = 32 - 1 = 31
-    #   budget = min(waiting=100, 30, 31) = 30
+    # 1 warmup + 3 measured (deadline=10, expected_len=3, tpot=1.0 from
+    # helper). N=4 admitted, base_n=32 → scale = 4/32 = 0.125.
+    #   Step 1: warmup=[w] → running. measured=[m0,m1,m2] (defer<1) → pending.
+    #   serve/defer scaling: raw 0.3 → scaled 0.3 * 0.125 = 0.0375 each.
+    #   load = Σ serve_running (0) + Σ defer_pending (3·0.0375 = 0.1125)
+    #        + unmeasured (warmup=1) × scale (0.125) = 0.2375
+    #   admission_capacity = int(32 - 0.2375) = 31
+    #   slack = 32 - 1 = 31 → budget = min(100, 31, 31) = 31
     warm = make_request("w", make_state(phase=Phase.WARMUP))
     measured = [
         make_request(
@@ -894,17 +892,17 @@ def test_mlp_non_critical_admission_budget_uses_measured_only():
     ]
     sched = _make_mlp_scheduler(
         running=[warm] + measured, max_num_running_reqs=32)
-    sched.waiting = [object()] * 100  # plenty of waiting
+    sched.waiting = [object()] * 100
 
     sched._apply_sslo_policy(0.0)
 
     assert sched._sslo_step.has_critical is False
-    assert sched._sslo_step.waiting_admission_budget == 30
-    # Warmup keeps its running slot; the 3 measured (defer<1) all go to
-    # pending. slack=31, budget=30, backfill_slots=1 → one pending req
-    # promoted back, so 2 stay in pending.
-    assert len(sched.running) == 2
-    assert len(sched.sslo_pending) == 2
+    assert sched._sslo_step.waiting_admission_budget == 31
+    # Warmup keeps its running slot; the 3 measured (defer<1) initially
+    # all go to pending. slack=31, budget=31, backfill_slots=0 → no
+    # backfill, all 3 stay in pending.
+    assert len(sched.running) == 1
+    assert len(sched.sslo_pending) == 3
 
 
 def test_mlp_non_critical_no_admit_when_all_warmup_running():
