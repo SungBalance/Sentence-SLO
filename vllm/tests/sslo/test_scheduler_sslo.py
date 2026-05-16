@@ -881,9 +881,10 @@ def test_mlp_non_critical_admission_budget_uses_measured_only():
     #   Step 1: warmup=[w] → running. measured=[m0,m1,m2] (defer<1) → pending.
     #   serve/defer scaling: raw 0.3 → scaled 0.3 * 0.125 = 0.0375 each.
     #   load = Σ serve_running (0) + Σ defer_pending (3·0.0375 = 0.1125)
-    #        + unmeasured (warmup=1) × scale (0.125) = 0.2375
-    #   admission_capacity = int(32 - 0.2375) = 31
-    #   slack = 32 - 1 = 31 → budget = min(100, 31, 31) = 31
+    #        + unmeasured_running (warmup, raw 1.0) + unmeasured_pending (0)
+    #        = 1.1125
+    #   admission_capacity = int(32 - 1.1125) = 30
+    #   slack = 32 - 1 = 31 → budget = min(100, 30, 31) = 30
     warm = make_request("w", make_state(phase=Phase.WARMUP))
     measured = [
         make_request(
@@ -897,12 +898,12 @@ def test_mlp_non_critical_admission_budget_uses_measured_only():
     sched._apply_sslo_policy(0.0)
 
     assert sched._sslo_step.has_critical is False
-    assert sched._sslo_step.waiting_admission_budget == 31
-    # Warmup keeps its running slot; the 3 measured (defer<1) initially
-    # all go to pending. slack=31, budget=31, backfill_slots=0 → no
-    # backfill, all 3 stay in pending.
-    assert len(sched.running) == 1
-    assert len(sched.sslo_pending) == 3
+    assert sched._sslo_step.waiting_admission_budget == 30
+    # Warmup keeps its running slot; the 3 measured (defer<1) all go to
+    # pending. slack=31, budget=30, backfill_slots=1 → one pending
+    # backfilled to running, so 2 stay in pending.
+    assert len(sched.running) == 2
+    assert len(sched.sslo_pending) == 2
 
 
 def test_mlp_non_critical_no_admit_when_all_warmup_running():

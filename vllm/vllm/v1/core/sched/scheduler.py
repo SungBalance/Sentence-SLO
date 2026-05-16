@@ -2342,10 +2342,10 @@ class Scheduler(SchedulerInterface):
         # already include the N/cap contention scaling applied inside
         # _compute_serve_defer_pair, so they represent each req's
         # shared-slot demand. Unmeasurable (warmup/PREFILL) requests are
-        # billed at 1.0 × scale so they're treated symmetrically with a
-        # measured req at raw pressure 1.0 — without the explicit scale
-        # warmup would under-bill versus measured peers and let the
-        # admission queue ramp unboundedly during the warmup window.
+        # billed at a raw 1.0 each — scaling warmup by N/cap on top of
+        # measured scaling empirically regressed sslo_mlp at cap=32 r=64
+        # (sigma3 viol 28.9% vs sigma2 19.3%); the asymmetric treatment
+        # mirrors what worked best on the worst-case smoke.
         sum_serve_running = 0.0
         unmeasured_running = 0
         for req in cands_running:
@@ -2372,8 +2372,7 @@ class Scheduler(SchedulerInterface):
             sum_defer_pending += d
         load = (
             sum_serve_running + sum_defer_pending
-            + (unmeasured_running + unmeasured_pending)
-            * (len(admitted) / max(1, base_n)))
+            + unmeasured_running + unmeasured_pending)
 
         # Step 2: admission budget. slack = cap - cands_running (room left
         # after step 1's classification puts everyone into running/pending).
