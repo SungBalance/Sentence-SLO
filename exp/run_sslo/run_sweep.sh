@@ -40,6 +40,10 @@ set -- "${POSITIONAL[@]}"
 
 NUM_RUNS="${1:-3}"
 PARALLEL="${PARALLEL:-4}"
+# Start index for the inner run loop. Default 1 (fresh sweep). Set to
+# >1 to extend an existing sweep without re-running earlier indices —
+# e.g. START_RUN_INDEX=2 with NUM_RUNS=3 only writes run_2 and run_3.
+START_RUN_INDEX="${START_RUN_INDEX:-1}"
 
 MODEL="${MODEL:-Qwen/Qwen3.5-35B-A3B}"
 NUM_PROMPTS="${NUM_PROMPTS:-256}"
@@ -180,7 +184,7 @@ run_subset() {
   shift 2
   for rate in "$@"; do
     for seqs in "${MAX_NUM_SEQS_VALUES[@]}"; do
-      for (( i=1; i<=NUM_RUNS; i++ )); do
+      for (( i=START_RUN_INDEX; i<=NUM_RUNS; i++ )); do
         echo
         echo "[${unit}${gpu:+ GPU${gpu}}] rate=${rate} seqs=${seqs} run=${i}/${NUM_RUNS}"
         run_cell "${unit}" "${gpu}" "${rate}" "${seqs}" "${i}"

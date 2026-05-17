@@ -60,6 +60,31 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Seed for the Poisson inter-arrival sampler (reproducibility).",
     )
+    thinking_group = parser.add_mutually_exclusive_group()
+    thinking_group.add_argument(
+        "--enable-thinking", dest="enable_thinking", action="store_true",
+        help="Apply chat template with enable_thinking=True (unified "
+             "Instruct+Thinking models like Qwen3.5).",
+    )
+    thinking_group.add_argument(
+        "--no-thinking", dest="enable_thinking", action="store_false",
+        help="Apply chat template with enable_thinking=False (default).",
+    )
+    parser.set_defaults(enable_thinking=False)
+    parser.add_argument(
+        "--no-chat-template", dest="apply_chat_template", action="store_false",
+        help="Skip chat template application — send raw user text as completion.",
+    )
+    parser.set_defaults(apply_chat_template=True)
+    # Sampling overrides — when set, supersede model HF generation_config
+    # defaults. Use to pin sampling across heterogeneous model families
+    # (e.g. Qwen3.5-9B has no generation_config.json while 27B does).
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--min-p", type=float, default=None)
+    parser.add_argument("--presence-penalty", type=float, default=None)
+    parser.add_argument("--repetition-penalty", type=float, default=None)
     return parser.parse_args()
 
 
@@ -78,6 +103,31 @@ def load_workload(dataset_name: str, num_prompts: int) -> list[str]:
     while len(repeated) < num_prompts:
         repeated.extend(prompts)
     return repeated[:num_prompts]
+
+
+def apply_chat_template_to_prompts(
+    prompts: list[str],
+    model: str,
+    *,
+    enable_thinking: bool,
+) -> list[str]:
+    """Wrap each user prompt with the model's chat template.
+
+    For unified Instruct+Thinking models (Qwen3.5), enable_thinking=False
+    emits the empty `<think>\\n\\n</think>\\n\\n` block in the template so
+    the assistant starts directly with the response.
+    """
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    out = []
+    for p in prompts:
+        out.append(tok.apply_chat_template(
+            [{"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        ))
+    return out
 
 
 def positive_number(value: Any) -> float | None:
@@ -344,6 +394,12 @@ async def run_one(args: argparse.Namespace) -> None:
 
     prompts = load_workload(args.dataset_name, args.num_prompts)
     print(f"{args.run_kind}: loaded {len(prompts)} prompts from {args.dataset_name}")
+    if args.apply_chat_template:
+        prompts = apply_chat_template_to_prompts(
+            prompts, args.model, enable_thinking=args.enable_thinking)
+        print(f"{args.run_kind}: applied chat template "
+              f"enable_thinking={args.enable_thinking}, "
+              f"mean_prompt_chars={sum(len(p) for p in prompts) // len(prompts)}")
 
     # Build sslo_params. Both baseline and sslo modes run through
     # schedule_sslo() so chunk records / scheduler_stats / tpot EMA are
@@ -412,6 +468,13 @@ async def run_one(args: argparse.Namespace) -> None:
     # AsyncLLM path — do it explicitly so all runs sample with the model's intended
     # distribution rather than vLLM's neutral defaults (1.0/1.0/-1).
     sampling_kwargs = dict(engine.model_config.get_diff_sampling_param())
+    # CLI overrides win over model HF defaults — used to pin sampling across
+    # heterogeneous models (e.g. Qwen3.5-9B has no generation_config.json).
+    for name in ("temperature", "top_p", "top_k", "min_p",
+                 "presence_penalty", "repetition_penalty"):
+        v = getattr(args, name)
+        if v is not None:
+            sampling_kwargs[name] = v
     sampling_kwargs["max_tokens"] = args.generation_max_tokens
     sampling_params = SamplingParams.from_optional(**sampling_kwargs)
     print(f"{args.run_kind}: sampling_params={sampling_params}")

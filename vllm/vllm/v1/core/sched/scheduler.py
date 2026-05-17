@@ -1981,6 +1981,7 @@ class Scheduler(SchedulerInterface):
         now: float,
         tpot_s: float | None,
         epoch_s: float | None,
+        cap_n: int | None = None,
     ) -> tuple[
         dict[str, float | None],
         dict[str, float | None],
@@ -1993,6 +1994,12 @@ class Scheduler(SchedulerInterface):
         the None case explicitly. The components dict mirrors the
         PressureComponents returned by RequestSLOState for decision-log
         emission.
+
+        ``cap_n`` overrides the contention denominator for the system-scale
+        pressure. Default ``None`` uses ``max_num_running_reqs`` (the static
+        base cap); pass an explicit ``cap_n`` to evaluate pressure at a
+        candidate cap (e.g. _mlp_pick_adaptive_n choosing among captured
+        batch sizes).
         """
         # System-scaled pressure: each req shares cap slots with the
         # N admitted reqs, so its effective decode rate is cap/N of its
@@ -2003,8 +2010,8 @@ class Scheduler(SchedulerInterface):
         # downstream partition/admission code keeps its existing shape
         # but is now interpreted as a single unified pressure.
         n_admitted = len(admitted)
-        base_n = self.max_num_running_reqs
-        scale = n_admitted / max(1, base_n)
+        denom_cap = cap_n if cap_n is not None else self.max_num_running_reqs
+        scale = n_admitted / max(1, denom_cap)
         serve: dict[str, float | None] = {}
         defer: dict[str, float | None] = {}
         components: dict[str, PressureComponents] = {}
@@ -2145,8 +2152,13 @@ class Scheduler(SchedulerInterface):
             dict[str, float | None], dict[str, float | None]]] = {}
         for n in candidates:
             tpot_n = self.tpot_ema.get(n, base_tpot)
+            # Pass cap_n=n so the system-scale denominator reflects this
+            # candidate's actual serving capacity (admitted/n). Without
+            # this, every candidate sees scale=admitted/base_n → cap
+            # shrink looks "free" on memory-bound dense models, the
+            # death-spiral 진단 in _diag_worst.py.
             serve_n, defer_n, _ = self._compute_serve_defer_pair(
-                admitted, now, tpot_n, tpot_n)
+                admitted, now, tpot_n, tpot_n, cap_n=n)
             running, pending = self._mlp_partition(
                 admitted, serve_n, defer_n, n)
             cache[n] = (running, pending, serve_n, defer_n)

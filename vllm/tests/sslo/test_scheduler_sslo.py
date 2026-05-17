@@ -819,6 +819,48 @@ def test_mlp_pick_n_no_throughput_floor():
     assert running  # the measured req lands in running
 
 
+def test_mlp_pick_n_system_scale_blocks_pointless_shrink():
+    # Memory-bound simulation: tpot[32] == tpot[8] (small batch saves
+    # no step time). With 32 admitted reqs evaluated at cap=8, system
+    # scale = 32/8 = 4 → effective pressure 4× larger than at cap=32.
+    # MLP objective should naturally pick cap=32, not cap=8.
+    reqs = [
+        make_request(f"r{i}", make_state(deadline=1.0, expected_len=2.0))
+        for i in range(32)
+    ]
+    sched = _make_mlp_scheduler(
+        running=reqs, max_num_running_reqs=32)
+    sched.tpot_ema = {32: 1.0, 8: 1.0}  # memory-bound
+
+    picked_n, _running, _pending, _serve, _defer = sched._mlp_pick_adaptive_n(
+        reqs, now=0.0, base_tpot=1.0)
+    assert picked_n == 32, (
+        "system-scale must reject pointless shrink: smaller cap inflates "
+        f"per-req scale by admitted/cap; picked={picked_n}")
+
+
+def test_mlp_pick_n_system_scale_allows_meaningful_shrink():
+    # Compute-bound simulation: tpot scales linearly with batch size.
+    # tpot[32]=8.0 vs tpot[8]=1.0 → per-req refill at cap=8 is 1/8 of
+    # cap=32. After multiplying by system scale (32/8=4 at cap=8 vs 1.0
+    # at cap=32), effective per-req pressure at cap=8 is 4/8 = 0.5× of
+    # cap=32. Use generous deadline=100 so defer stays < 1 at both caps
+    # (feasibility check passes for both); MLP then picks by objective.
+    reqs = [
+        make_request(f"r{i}", make_state(deadline=100.0, expected_len=2.0))
+        for i in range(32)
+    ]
+    sched = _make_mlp_scheduler(
+        running=reqs, max_num_running_reqs=32)
+    sched.tpot_ema = {32: 8.0, 8: 1.0}  # compute-bound (linear scaling)
+
+    picked_n, _running, _pending, _serve, _defer = sched._mlp_pick_adaptive_n(
+        reqs, now=0.0, base_tpot=8.0)
+    assert picked_n == 8, (
+        "system-scale must still permit shrink when smaller cap genuinely "
+        f"saves step time; picked={picked_n}")
+
+
 def test_mlp_defer_constraint_forces_running():
     # ttd = 0.5, epoch_s (= tpot_ema[base]) = 1.0 → defer_buffer = -0.5
     # → defer = inf ≥ mlp_defer_constraint (1.0). Even with low serve

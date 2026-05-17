@@ -443,3 +443,43 @@ existing outputs):
 
 Under the new basis SSLO modes are within ±10% of baseline at this
 load, matching the per-step Δts evidence (mode-independent ~21 ms).
+
+## 2026-05-17 — MLP cap-shrink fix (system_factor) + Qwen3.5 chat-template plumbing
+
+### Modified
+- `vllm/vllm/v1/core/sched/scheduler.py`: `_compute_serve_defer_pair`에
+  optional `cap_n` 파라미터 추가. `_mlp_pick_adaptive_n` 후보 평가 루프
+  (line 2160)에서 `cap_n=n` 전달 → 각 후보 cap의 contention scale을
+  `admitted/n`으로 산출. 기존엔 항상 `admitted/base_n`이라 작은 n 후보가
+  shrink해도 effective throughput 손실이 pressure에 반영 안 됨.
+- `vllm/tests/sslo/test_scheduler_sslo.py`: `_mlp_pick_adaptive_n` cap_n
+  scaling 양방향 테스트 2개 추가 (`test_mlp_pick_n_system_scale_blocks_
+  pointless_shrink`, `..._allows_meaningful_shrink`).
+- `exp/run_sslo/run_test.py`: `--enable-thinking` / `--no-thinking` 플래그 +
+  `apply_chat_template_to_prompts` helper. Qwen3.5 unified Instruct+Thinking
+  모델에서 chat template `enable_thinking=False` 적용. Sampling override
+  CLI args (`--temperature`, `--top-p`, `--top-k`, `--min-p`,
+  `--presence-penalty`, `--repetition-penalty`) 추가.
+- `exp/run_sslo/run_test.sh`: `ENABLE_THINKING`, `TEMPERATURE`/`TOP_P`/
+  `TOP_K`/`MIN_P`/`PRESENCE_PENALTY`/`REPETITION_PENALTY` env vars →
+  CLI args 전달.
+- `exp/run_sslo/run_sweep.sh`: `START_RUN_INDEX` env var (default 1) — 기존
+  runs를 덮지 않고 추가 run만 실행 가능.
+
+### Added
+- `exp/run_sslo/_diag_worst.py` — worst-case 셀 진단 (cap shrink rate,
+  critical mode 비율, violating chunks 텍스트).
+- `exp/run_sslo/_diag_tpot.py` — `decisions.jsonl`에서 batch별 step time
+  추출해 memory-vs-compute-bound 판정.
+
+### Findings (cap=64 r=128 sslo_mlp on Qwen3.5-27B)
+- Before fix: tput 654 tok/s (-28.5% vs baseline 916), viol@τ=1 7.54%,
+  cap_p50=24, has_critical=81% — death spiral.
+- After fix: tput 929 tok/s (+1.4% vs baseline), viol@τ=1 0.79%,
+  cap_p50=64, has_critical=59% (감지는 함, shrink만 자연 reject).
+- 9B control (cap=128 r=64): tput 3705 vs baseline 3162 (+17%),
+  viol 0% — fix이 compute-bound 케이스 무회귀.
+
+### Verification
+- `pytest tests/sslo/` 109/109 pass (이전 107 + 신규 2).
+- Smoke 27B + 9B 모두 합격 기준 만족.
