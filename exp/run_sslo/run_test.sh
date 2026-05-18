@@ -65,6 +65,13 @@ SAMPLING_ARGS=""
 [[ -n "${MIN_P:-}" ]]              && SAMPLING_ARGS+=" --min-p ${MIN_P}"
 [[ -n "${PRESENCE_PENALTY:-}" ]]   && SAMPLING_ARGS+=" --presence-penalty ${PRESENCE_PENALTY}"
 [[ -n "${REPETITION_PENALTY:-}" ]] && SAMPLING_ARGS+=" --repetition-penalty ${REPETITION_PENALTY}"
+# Dataset selection + code-gen exclusion.
+DATASET_NAME="${DATASET_NAME:-koala}"
+if [[ "${EXCLUDE_CODE:-0}" == "1" ]]; then
+  EXCLUDE_CODE_FLAG="--exclude-code"
+else
+  EXCLUDE_CODE_FLAG=""
+fi
 
 export HF_HOME=/cache
 export HF_HUB_CACHE=/cache/hub
@@ -91,5 +98,7 @@ python3 exp/run_sslo/run_test.py \
   --request-rate "${REQUEST_RATE}" \
   --request-rate-seed "${REQUEST_RATE_SEED}" \
   --seconds-per-word "${SECONDS_PER_WORD}" \
+  --dataset-name "${DATASET_NAME}" \
+  ${EXCLUDE_CODE_FLAG} \
   ${THINKING_FLAG} \
   ${SAMPLING_ARGS}

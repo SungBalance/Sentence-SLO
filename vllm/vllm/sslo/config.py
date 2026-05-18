@@ -99,6 +99,7 @@ class SsloConfig:
     # — keep enough to stabilise percentile estimates.
     chunk_len_predictor_history_max: int = 4096
 
+
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
             raise ValueError(

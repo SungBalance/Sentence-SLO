@@ -34,7 +34,14 @@ def parse_args() -> argparse.Namespace:
         choices=list(MODES_DEFAULT),
     )
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
-    parser.add_argument("--dataset-name", default="koala")
+    parser.add_argument("--dataset-name", default="koala",
+                        choices=["koala", "wildchat", "lmsys"])
+    parser.add_argument(
+        "--exclude-code", action="store_true",
+        help="Filter out code-generation prompts (prompt regex + first "
+             "assistant-response check). Reduces long markdown/code chunks "
+             "that strain the chunk-length predictor.",
+    )
     parser.add_argument("--num-prompts", type=int, default=256)
     parser.add_argument(
         "--max-model-len", type=int, default=0,
@@ -95,8 +102,11 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row) + "\n")
 
 
-def load_workload(dataset_name: str, num_prompts: int) -> list[str]:
-    prompts = load_prompts(dataset_name, num_prompts=num_prompts)
+def load_workload(
+    dataset_name: str, num_prompts: int, *, exclude_code: bool = False,
+) -> list[str]:
+    prompts = load_prompts(
+        dataset_name, num_prompts=num_prompts, exclude_code=exclude_code)
     if len(prompts) >= num_prompts:
         return prompts[:num_prompts]
     repeated: list[str] = []
@@ -392,8 +402,11 @@ async def run_one(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    prompts = load_workload(args.dataset_name, args.num_prompts)
-    print(f"{args.run_kind}: loaded {len(prompts)} prompts from {args.dataset_name}")
+    prompts = load_workload(
+        args.dataset_name, args.num_prompts,
+        exclude_code=args.exclude_code)
+    print(f"{args.run_kind}: loaded {len(prompts)} prompts from {args.dataset_name}"
+          + (" (exclude_code=True)" if args.exclude_code else ""))
     if args.apply_chat_template:
         prompts = apply_chat_template_to_prompts(
             prompts, args.model, enable_thinking=args.enable_thinking)

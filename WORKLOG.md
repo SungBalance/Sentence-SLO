@@ -589,3 +589,31 @@ Backfill loop이 86.2% step에서 진입했지만 그 중 **48.2%가 promoted=0*
 - Phase A (backfill을 waiting admit **앞**으로 reorder) 시도 → trade-off
   불리. bf_kv_full=0 / tput 동등 / **TTFC 54s → 84s** (waiting 정체).
   Codex 검토 후 revert.
+
+## 2026-05-18 (cont.) — dataset code-gen 필터 + dataset 선택
+
+### Modified
+- `exp/tools/lm_datasets.py`:
+  - `_CODE_PROMPT_PATTERN` regex + `_is_code_request(prompt, response)`
+    helper.
+  - `load_prompts(..., exclude_code=False)` 새 kwarg.
+  - 모든 3개 loader (`_load_koala`, `_load_wildchat`, `_load_lmsys`)에
+    `exclude_code` 파라미터 + filter 적용.
+  - WildChat/LMSYS는 `_first_user_and_assistant` helper로 첫 user prompt +
+    첫 assistant response 추출 → response 코드 블럭(```) 확인.
+  - Koala는 응답 없음 → prompt regex만.
+- `exp/run_sslo/run_test.py`:
+  - `--dataset-name` choices에 `koala|wildchat|lmsys` 명시.
+  - 새 `--exclude-code` flag (기본 off).
+  - `load_workload`에 `exclude_code` 전달.
+- `exp/run_sslo/run_test.sh`:
+  - `DATASET_NAME` env var (default `koala`).
+  - `EXCLUDE_CODE=1` env → `--exclude-code` flag.
+
+### Regex coverage 검증 (인라인 10/10 PASS)
+- 정상 채팅: "What is the capital of France?", "Tell me about Python
+  history", "Python vs Ruby 차이" → not flagged.
+- 코드 요청: "Write a Python function", "Implement a binary search
+  algorithm in Java", "Generate a JavaScript class", "Build a HTML form",
+  "def foo(x):" → flagged.
+- Response 기반: "How are you?" + ```python 응답 → flagged.
