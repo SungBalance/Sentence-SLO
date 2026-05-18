@@ -27,6 +27,9 @@ SUPPORTED_DATASETS: dict[str, str] = {
     WILDCHAT_DATASET_ID: WILDCHAT_DATASET_ID,
     "lmsys": LMSYS_DATASET_ID,
     LMSYS_DATASET_ID: LMSYS_DATASET_ID,
+    # SSLO: synthetic mix of koala + wildchat + lmsys, seed-shuffled.
+    "combine": "__combine__",
+    "COMBINE": "__combine__",
 }
 
 # Default eval splits per dataset.
@@ -34,6 +37,7 @@ _DEFAULT_SPLITS: dict[str, str] = {
     KOALA_DATASET_ID: "test",
     WILDCHAT_DATASET_ID: "train",
     LMSYS_DATASET_ID: "train",
+    "__combine__": "train",  # passed to streaming sources; koala ignores it
 }
 
 
@@ -77,19 +81,23 @@ def load_prompts(
     split: str | None = None,
     num_prompts: int | None = None,
     exclude_code: bool = False,
+    seed: int = 42,
 ) -> list[str]:
     """Return a list of clean prompt strings from the named dataset.
 
     Args:
         dataset_name: Canonical HF dataset ID or short alias
-                      ('koala', 'wildchat', 'lmsys').
+                      ('koala', 'wildchat', 'lmsys', 'combine').
         split: Dataset split. Defaults to each dataset's natural eval split
-               ('test' for Koala, 'train' for WildChat / LMSYS).
+               ('test' for Koala, 'train' for WildChat / LMSYS). Ignored
+               by `combine`.
         num_prompts: Maximum prompts to return. None returns all available.
         exclude_code: If True, filter out prompts that look like code-gen
             requests (prompt regex + first assistant response check when
             available). Streaming datasets keep iterating until enough
             non-code prompts are collected.
+        seed: Random seed used by the `combine` dataset shuffle.
+            Ignored for single-source datasets.
 
     Returns:
         List of cleaned, non-empty prompt strings.
@@ -109,6 +117,9 @@ def load_prompts(
         return _load_lmsys(
             split=resolved_split, num_prompts=num_prompts,
             exclude_code=exclude_code)
+    if dataset_id == "__combine__":
+        return _load_combine(
+            num_prompts=num_prompts, exclude_code=exclude_code, seed=seed)
     raise ValueError(f"No loader implemented for dataset id: {dataset_id}")
 
 
@@ -231,3 +242,52 @@ def _load_lmsys(
     if not prompts:
         raise ValueError(f"{LMSYS_DATASET_ID} split={split!r} returned no prompts.")
     return prompts
+
+
+def _load_combine(
+    *,
+    num_prompts: int | None,
+    exclude_code: bool = False,
+    seed: int = 42,
+) -> list[str]:
+    """Mix prompts from koala + wildchat + lmsys, shuffled by `seed`.
+
+    Each source contributes roughly num_prompts/3 prompts (with a 20%
+    over-sample to absorb shuffle/filter losses). The combined pool is
+    shuffled with a seeded RNG so the same `seed` always returns the
+    same ordering — useful for reproducible sweeps.
+    """
+    import random
+
+    if num_prompts is None or num_prompts <= 0:
+        per_source = 200  # arbitrary default when caller asks for "all"
+    else:
+        per_source = max(1, (num_prompts + 2) // 3)
+    over = max(1, int(per_source * 1.2))
+
+    pool: list[str] = []
+    try:
+        pool += _load_koala(split="test", num_prompts=over,
+                            exclude_code=exclude_code)
+    except ValueError:
+        pass
+    try:
+        pool += _load_wildchat(split="train", num_prompts=over,
+                               exclude_code=exclude_code)
+    except ValueError:
+        pass
+    try:
+        pool += _load_lmsys(split="train", num_prompts=over,
+                            exclude_code=exclude_code)
+    except ValueError:
+        pass
+
+    if not pool:
+        raise ValueError(
+            "combine dataset: all three sources returned no prompts.")
+
+    rng = random.Random(seed)
+    rng.shuffle(pool)
+    if num_prompts is not None and num_prompts > 0:
+        return pool[:num_prompts]
+    return pool

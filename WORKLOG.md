@@ -617,3 +617,27 @@ Backfill loop이 86.2% step에서 진입했지만 그 중 **48.2%가 promoted=0*
   algorithm in Java", "Generate a JavaScript class", "Build a HTML form",
   "def foo(x):" → flagged.
 - Response 기반: "How are you?" + ```python 응답 → flagged.
+
+## 2026-05-18 (cont.) — combine dataset (seed-shuffled mix)
+
+### Added
+- `exp/tools/lm_datasets.py`:
+  - `combine` / `COMBINE` aliases in `SUPPORTED_DATASETS`.
+  - `_load_combine(num_prompts, exclude_code, seed)`: oversamples ~20% per
+    source (koala + wildchat + lmsys), pools, shuffles with seeded RNG,
+    returns top `num_prompts`. If any source fails, falls back to the
+    others.
+  - `load_prompts(..., seed=42)` kwarg threaded into `_load_combine`
+    (ignored elsewhere).
+- `exp/run_sslo/run_test.py`:
+  - `--dataset-name choices` now includes `combine`.
+  - New `--dataset-seed` (default 42).
+  - `load_workload` passes seed through.
+- `exp/run_sslo/run_test.sh`:
+  - New `DATASET_SEED` env var (default 42).
+
+### Usage
+```bash
+DATASET_NAME=combine DATASET_SEED=42 EXCLUDE_CODE=1 \
+  bash exp/run_sslo/run_test.sh sslo_mlp 128 Qwen/Qwen3.5-35B-A3B
+```

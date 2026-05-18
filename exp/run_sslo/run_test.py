@@ -35,12 +35,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--dataset-name", default="koala",
-                        choices=["koala", "wildchat", "lmsys"])
+                        choices=["koala", "wildchat", "lmsys", "combine"])
     parser.add_argument(
         "--exclude-code", action="store_true",
         help="Filter out code-generation prompts (prompt regex + first "
              "assistant-response check). Reduces long markdown/code chunks "
              "that strain the chunk-length predictor.",
+    )
+    parser.add_argument(
+        "--dataset-seed", type=int, default=42,
+        help="Seed used by the `combine` dataset's shuffle. Ignored for "
+             "single-source datasets.",
     )
     parser.add_argument("--num-prompts", type=int, default=256)
     parser.add_argument(
@@ -103,10 +108,12 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def load_workload(
-    dataset_name: str, num_prompts: int, *, exclude_code: bool = False,
+    dataset_name: str, num_prompts: int, *,
+    exclude_code: bool = False, dataset_seed: int = 42,
 ) -> list[str]:
     prompts = load_prompts(
-        dataset_name, num_prompts=num_prompts, exclude_code=exclude_code)
+        dataset_name, num_prompts=num_prompts,
+        exclude_code=exclude_code, seed=dataset_seed)
     if len(prompts) >= num_prompts:
         return prompts[:num_prompts]
     repeated: list[str] = []
@@ -404,9 +411,12 @@ async def run_one(args: argparse.Namespace) -> None:
 
     prompts = load_workload(
         args.dataset_name, args.num_prompts,
-        exclude_code=args.exclude_code)
+        exclude_code=args.exclude_code,
+        dataset_seed=args.dataset_seed)
     print(f"{args.run_kind}: loaded {len(prompts)} prompts from {args.dataset_name}"
-          + (" (exclude_code=True)" if args.exclude_code else ""))
+          + (" (exclude_code=True)" if args.exclude_code else "")
+          + (f" seed={args.dataset_seed}"
+             if args.dataset_name == "combine" else ""))
     if args.apply_chat_template:
         prompts = apply_chat_template_to_prompts(
             prompts, args.model, enable_thinking=args.enable_thinking)

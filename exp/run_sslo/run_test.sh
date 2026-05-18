@@ -67,6 +67,7 @@ SAMPLING_ARGS=""
 [[ -n "${REPETITION_PENALTY:-}" ]] && SAMPLING_ARGS+=" --repetition-penalty ${REPETITION_PENALTY}"
 # Dataset selection + code-gen exclusion.
 DATASET_NAME="${DATASET_NAME:-koala}"
+DATASET_SEED="${DATASET_SEED:-42}"
 if [[ "${EXCLUDE_CODE:-0}" == "1" ]]; then
   EXCLUDE_CODE_FLAG="--exclude-code"
 else
@@ -99,6 +100,7 @@ python3 exp/run_sslo/run_test.py \
   --request-rate-seed "${REQUEST_RATE_SEED}" \
   --seconds-per-word "${SECONDS_PER_WORD}" \
   --dataset-name "${DATASET_NAME}" \
+  --dataset-seed "${DATASET_SEED}" \
   ${EXCLUDE_CODE_FLAG} \
   ${THINKING_FLAG} \
   ${SAMPLING_ARGS}
