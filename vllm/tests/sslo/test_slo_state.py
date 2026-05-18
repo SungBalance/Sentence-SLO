@@ -127,6 +127,88 @@ def test_chunk_len_strategy_validates():
         RequestSLOState(chunk_len_strategy="median")
 
 
+def test_expected_remaining_escalates_at_90pct_threshold():
+    # Seed predictor with synthetic tiers: p90=10, p95=15, p99=20.
+    state = RequestSLOState(
+        num_warmup_chunks=1,
+        predictor_escalate_threshold=0.9,
+        predictor_overshoot_safety_factor=2.5)
+    state.decoding_start_ts = 0.0
+    state.next_deadline_ts = 100.0
+    state.chunks_completed = 1  # MEASURED phase
+    pred = state._chunk_len_predictor
+    pred.value = 10.0
+    pred.value_mid = 15.0
+    pred.value_high = 20.0
+
+    # cur=8 (< 10×0.9=9): use p90 tier → remaining = 10 - 8 = 2.
+    state.current_chunk_generated_len = 8
+    assert state.expected_remaining_len() == pytest.approx(2.0)
+    # cur=9 (>= 9, < 15×0.9=13.5): escalate to p95 → remaining = 15 - 9 = 6.
+    state.current_chunk_generated_len = 9
+    assert state.expected_remaining_len() == pytest.approx(6.0)
+    # cur=14 (>= 13.5, < 20×0.9=18): escalate to p99 → remaining = 20 - 14 = 6.
+    state.current_chunk_generated_len = 14
+    assert state.expected_remaining_len() == pytest.approx(6.0)
+    # cur=18 (>= 18): overshoot branch → (18 - 20) × 2.5 clipped to 1.0.
+    state.current_chunk_generated_len = 18
+    assert state.expected_remaining_len() == pytest.approx(1.0)
+
+
+def test_expected_remaining_overshoot_grows_past_topmost():
+    # cur way above p99: remaining = (cur - p99) × factor (no 1.0 floor).
+    state = RequestSLOState(
+        num_warmup_chunks=1,
+        predictor_overshoot_safety_factor=2.5)
+    state.decoding_start_ts = 0.0
+    state.next_deadline_ts = 100.0
+    state.chunks_completed = 1
+    pred = state._chunk_len_predictor
+    pred.value = 10.0
+    pred.value_mid = 15.0
+    pred.value_high = 20.0
+
+    state.current_chunk_generated_len = 30
+    assert state.expected_remaining_len() == pytest.approx((30 - 20) * 2.5)
+    state.current_chunk_generated_len = 100
+    assert state.expected_remaining_len() == pytest.approx((100 - 20) * 2.5)
+
+
+def test_expected_remaining_legacy_threshold_and_factor():
+    # threshold=1.0, factor=1.0 → cur > p99 yields (cur - p99) ≈ 1.0 for
+    # small overshoots; matches the legacy 1.0 floor closely.
+    state = RequestSLOState(
+        num_warmup_chunks=1,
+        predictor_escalate_threshold=1.0,
+        predictor_overshoot_safety_factor=1.0)
+    state.decoding_start_ts = 0.0
+    state.next_deadline_ts = 100.0
+    state.chunks_completed = 1
+    pred = state._chunk_len_predictor
+    pred.value = 10.0
+    pred.value_mid = 15.0
+    pred.value_high = 20.0
+
+    # cur=9 (< 10): legacy uses p90 → remaining = 10 - 9 = 1.
+    state.current_chunk_generated_len = 9
+    assert state.expected_remaining_len() == pytest.approx(1.0)
+    # cur=20 (== high, not strict <): overshoot branch → max(1, 0*1) = 1.
+    state.current_chunk_generated_len = 20
+    assert state.expected_remaining_len() == pytest.approx(1.0)
+    # cur=25: (25 - 20) × 1.0 = 5.
+    state.current_chunk_generated_len = 25
+    assert state.expected_remaining_len() == pytest.approx(5.0)
+
+
+def test_predictor_knob_validation():
+    with pytest.raises(ValueError):
+        RequestSLOState(predictor_escalate_threshold=0.0)
+    with pytest.raises(ValueError):
+        RequestSLOState(predictor_escalate_threshold=1.5)
+    with pytest.raises(ValueError):
+        RequestSLOState(predictor_overshoot_safety_factor=-0.1)
+
+
 def test_score_formula_and_deadline_sign():
     state = measured_state()
     for _ in range(4):
@@ -134,9 +216,12 @@ def test_score_formula_and_deadline_sign():
 
     # measured_state(): chunk 0 finishes at 0.1 with consume=10.0. Under
     # stall-aware propagation: deadline(1) = max(0.1, 0.1) + 10.0 = 10.1.
+    # Predictor.value=1.0 after the first chunk (1 token observed). cur=4
+    # is past every tier (1.0 × 0.9 escalate threshold), so the overshoot
+    # branch fires: remaining = (cur - anchor) * 2.5 = (4 - 1) * 2.5 = 7.5.
     assert state.time_to_deadline(5.1) == pytest.approx(5.0)
-    assert state.expected_remaining_len() == pytest.approx(1.0)
-    assert state.pressure(5.1, tpot_s=0.2) == pytest.approx(0.2 / 5.0)
+    assert state.expected_remaining_len() == pytest.approx(7.5)
+    assert state.pressure(5.1, tpot_s=0.2) == pytest.approx(7.5 * 0.2 / 5.0)
     assert state.pressure(20.0, tpot_s=0.2) == float("inf")
 
 

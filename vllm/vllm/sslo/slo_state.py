@@ -98,14 +98,27 @@ class ChunkLengthPredictor:
         strategy: str = _DEFAULT_CHUNK_LEN_STRATEGY,
         history_max: int = _CHUNK_LEN_HISTORY_MAX,
         alpha: float = _CHUNK_LEN_EMA_ALPHA,
+        escalate_threshold: float = 0.9,
+        overshoot_safety_factor: float = 2.5,
     ) -> None:
         if strategy not in _VALID_CHUNK_LEN_STRATEGIES:
             raise ValueError(
                 f"chunk_len_strategy must be one of "
                 f"{sorted(_VALID_CHUNK_LEN_STRATEGIES)}, got {strategy!r}")
+        if not (0 < escalate_threshold <= 1.0):
+            raise ValueError(
+                "escalate_threshold must be in (0, 1], "
+                f"got {escalate_threshold}")
+        if overshoot_safety_factor < 0:
+            raise ValueError(
+                "overshoot_safety_factor must be >= 0, "
+                f"got {overshoot_safety_factor}")
         self.strategy = strategy
         self.history_max = history_max
         self.alpha = alpha
+        # SSLO: tier escalation + post-topmost overshoot knobs.
+        self.escalate_threshold = escalate_threshold
+        self.overshoot_safety_factor = overshoot_safety_factor
         self._history: deque[int] = deque(maxlen=history_max)
         self._ema: float | None = None
         self.value: float | None = None
@@ -467,6 +480,9 @@ class RequestSLOState:
     chunk_unit: InitVar[str] = "sentence"
     chunk_len_strategy: InitVar[str] = _DEFAULT_CHUNK_LEN_STRATEGY
     min_chunk_tokens: InitVar[int] = 16
+    # SSLO: predictor escalation knobs (default = legacy 0.9/2.5).
+    predictor_escalate_threshold: InitVar[float] = 0.9
+    predictor_overshoot_safety_factor: InitVar[float] = 2.5
     # Override hooks — resolved in __post_init__ into non-Optional
     # instance attributes so callers don't have to None-check on use.
     chunk_separator: InitVar[ChunkSeparator | None] = None
@@ -478,6 +494,8 @@ class RequestSLOState:
         chunk_unit: str,
         chunk_len_strategy: str,
         min_chunk_tokens: int,
+        predictor_escalate_threshold: float,
+        predictor_overshoot_safety_factor: float,
         chunk_separator: ChunkSeparator | None,
         consume_estimator: ChunkConsumeEstimator | None,
     ) -> None:
@@ -492,7 +510,9 @@ class RequestSLOState:
             consume_estimator if consume_estimator is not None
             else ChunkConsumeEstimator(seconds_per_word=seconds_per_word))
         self._chunk_len_predictor = ChunkLengthPredictor(
-            strategy=chunk_len_strategy)
+            strategy=chunk_len_strategy,
+            escalate_threshold=predictor_escalate_threshold,
+            overshoot_safety_factor=predictor_overshoot_safety_factor)
         # Running cumulative token count; reset at each chunk boundary.
         self._cumulative_tokens: int = 0
 
@@ -504,6 +524,12 @@ class RequestSLOState:
             chunk_unit=config.chunk_unit,
             chunk_len_strategy=config.chunk_len_strategy,
             min_chunk_tokens=config.min_chunk_tokens,
+            # SSLO
+            predictor_escalate_threshold=(
+                config.mlp_predictor_escalate_threshold),
+            # SSLO
+            predictor_overshoot_safety_factor=(
+                config.mlp_predictor_overshoot_safety_factor),
         )
 
     @property
@@ -538,26 +564,30 @@ class RequestSLOState:
         return None if deadline is None else deadline - now
 
     def expected_remaining_len(self) -> float | None:
-        # Predictor ladder (strategy=="p90"): pressure() starts using the
-        # p90 estimate; once the current chunk has produced more tokens
-        # than p90 we escalate to p95, and past p95 we escalate to p99.
-        # This keeps the residual estimate non-trivial as the chunk
-        # overshoots its typical size without depending on the 1.0 floor.
-        # Other strategies leave value_mid / value_high at None so the
-        # logic falls through to the original single-level estimate.
+        # SSLO: predictor ladder (strategy=="p90") with early escalation
+        # and post-topmost overshoot. cur가 현재 tier value의
+        # `escalate_threshold` 비율(default 0.9)에 도달하면 다음 tier
+        # (p90 → p95 → p99)로 진입한다. cur > topmost tier value 이후엔
+        # `(cur - anchor) × overshoot_safety_factor` 로 remaining 산출 —
+        # 1.0 saturate를 막아 long-tail chunks에서도 MLP가 pressure를
+        # 반영. Other strategies (ema, p99) leave value_mid / value_high
+        # at None so the topmost-tier branch fires directly.
         pred = self._chunk_len_predictor
         if pred.value is None:
             return None
         cur = self.current_chunk_generated_len
-        if cur < pred.value:
+        thr = pred.escalate_threshold
+        if cur < pred.value * thr:
             return max(1.0, pred.value - cur)
         mid = pred.value_mid
-        if mid is not None and cur < mid:
+        if mid is not None and cur < mid * thr:
             return max(1.0, mid - cur)
         high = pred.value_high
-        if high is not None and cur < high:
+        if high is not None and cur < high * thr:
             return max(1.0, high - cur)
-        return 1.0
+        anchor = high if high is not None else (
+            mid if mid is not None else pred.value)
+        return max(1.0, (cur - anchor) * pred.overshoot_safety_factor)
 
     def pressure_components(
         self, now: float, tpot_s: float | None

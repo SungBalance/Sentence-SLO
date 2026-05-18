@@ -84,6 +84,24 @@ class SsloStepState:
     avg_score: float | None = None
     max_score: float | None = None
     waiting_admission_budget: int = 0
+    # SSLO: defer_pressure snapshot kept for post-waiting backfill sort.
+    # Populated by `_apply_sslo_multi_level_pressure` non-critical branch
+    # so the main schedule() loop can rank sslo_pending requests when
+    # backfilling leftover token_budget after waiting admission.
+    defer_base: dict[str, float | None] | None = None
+    # SSLO: backfill diagnostics for stats. bf_skip_reason is "preempted"/
+    # "paused"/"critical"/"no_budget"/"no_pending"/None (entered loop).
+    # bf_promoted = actually appended to running; bf_kv_full = how many
+    # had allocate_slots return None; bf_too_few_tokens = how many had
+    # num_new_tokens<=0; bf_encoder_skipped = how many skipped for
+    # has_encoder_inputs; bf_slack = base_n - len(running) at entry.
+    bf_skip_reason: str | None = "not_entered"
+    bf_slack: int = 0
+    bf_promoted: int = 0
+    bf_kv_full: int = 0
+    bf_too_few_tokens: int = 0
+    bf_encoder_skipped: int = 0
+    bf_budget_exhausted: int = 0
 
 
 logger = init_logger(__name__)
@@ -1233,13 +1251,19 @@ class Scheduler(SchedulerInterface):
         pressure_components: dict[str, PressureComponents] | None = None,
     ) -> None:
         """Common per-step commit: install placement, fire lifecycle
-        events, account per-chunk steps, and dump per-step stats."""
+        events, account per-chunk steps.
+
+        SSLO: per-step stats are dumped at the END of schedule() so they
+        reflect the final running set after post-waiting-admit backfill,
+        NOT the MLP-intent snapshot captured here. The decision-log emit
+        below still belongs here because per-admitted decisions are
+        policy state (unaffected by backfill).
+        """
         self.running = new_running
         self.sslo_pending = new_pending
         self._fire_pending_lifecycle(
             prev_pending_ids, new_running, new_pending, now)
         self._account_per_chunk_step(new_running, new_pending)
-        self._sslo_dump_step_stats(now)
         # SSLO: per-(step, admitted) decision log. Only emits when the
         # policy passes the full kwargs; legacy callers (none, but kept
         # for safety) skip it.
@@ -1816,6 +1840,14 @@ class Scheduler(SchedulerInterface):
             "max_score": self._sslo_step.max_score,
             "step_wall_ema_cells": sum(
                 len(cells) for cells in self._sslo_step_wall_ema.values()),
+            # SSLO: post-waiting backfill diagnostics
+            "bf_skip_reason": self._sslo_step.bf_skip_reason,
+            "bf_slack": self._sslo_step.bf_slack,
+            "bf_promoted": self._sslo_step.bf_promoted,
+            "bf_kv_full": self._sslo_step.bf_kv_full,
+            "bf_too_few_tokens": self._sslo_step.bf_too_few_tokens,
+            "bf_encoder_skipped": self._sslo_step.bf_encoder_skipped,
+            "bf_budget_exhausted": self._sslo_step.bf_budget_exhausted,
         }
         with open(log_path, "a") as f:
             f.write(json.dumps(stats_row) + "\n")
@@ -2393,25 +2425,22 @@ class Scheduler(SchedulerInterface):
         waiting_admission_budget = max(
             0, min(waiting_count, admission_capacity, slack))
 
-        # Step 3: backfill running from pending by defer DESC — the
-        # highest-defer pending reqs are the closest to becoming forced
-        # (defer>=1) and thus most risky to leave waiting. Fill remaining
-        # slack-minus-admission with these.
-        backfill_slots = max(0, slack - waiting_admission_budget)
-        if backfill_slots > 0 and cands_pending:
-            cands_pending_sorted = sorted(
-                cands_pending,
-                key=lambda r: defer_base.get(r.request_id, 0.0) or 0.0,
-                reverse=True)
-            promoted = cands_pending_sorted[:backfill_slots]
-            cands_pending = cands_pending_sorted[backfill_slots:]
-            cands_running.extend(promoted)
+        # SSLO: backfill moved to post-waiting-admit (schedule() main
+        # loop, after the waiting admission while-loop). MLP here keeps
+        # only forced + warmup in new_running and leaves all eligible
+        # in new_pending; the main loop uses leftover token_budget to
+        # backfill from sslo_pending by defer DESC. This avoids the
+        # "running starvation" pattern where backfill_slots reserves
+        # space for waiting admits that vLLM can't actually fill within
+        # a single step's token_budget.
 
         new_running = cands_running
         new_pending = cands_pending
         self._sslo_step.cur_max_num_requests = base_n
         self._sslo_step.has_critical = False
         self._sslo_step.waiting_admission_budget = waiting_admission_budget
+        # SSLO: snapshot defer_base for post-waiting backfill ranking.
+        self._sslo_step.defer_base = defer_base
 
         # Log-side scores: serve_pressure with 1.0 fallback for non-
         # measurable requests. avg_score/max_score honored via the
@@ -2974,9 +3003,87 @@ class Scheduler(SchedulerInterface):
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
-        # SSLO: pending-backfill happens inside _apply_sslo_policy (BEFORE
-        # the running loop) so backfilled requests get tokens this step and
-        # batch size stays at cap in non-adaptive mode.
+        # SSLO: backfill self.running from sslo_pending using whatever
+        # token_budget remains after waiting admission. Pending reqs
+        # already hold KV cache → only need 1 decode-step worth of
+        # tokens. Sort by defer DESC so most-urgent reqs land first.
+        # Moved here (from inside _apply_sslo_policy) so backfill
+        # competes for leftover budget instead of reserving slots that
+        # vLLM can't fill within one step's prefill budget.
+        if preempted_reqs:
+            self._sslo_step.bf_skip_reason = "preempted"
+        elif self._pause_state != PauseState.UNPAUSED:
+            self._sslo_step.bf_skip_reason = "paused"
+        elif self._sslo_step.has_critical:
+            self._sslo_step.bf_skip_reason = "critical"
+        elif token_budget <= 0:
+            self._sslo_step.bf_skip_reason = "no_budget"
+        elif not self.sslo_pending:
+            self._sslo_step.bf_skip_reason = "no_pending"
+        else:
+            self._sslo_step.bf_skip_reason = None  # entered
+            slack = self.max_num_running_reqs - len(self.running)
+            self._sslo_step.bf_slack = slack
+            if slack <= 0:
+                self._sslo_step.bf_skip_reason = "no_slack"
+            else:
+                defer_base = self._sslo_step.defer_base or {}
+                sorted_pending = sorted(
+                    self.sslo_pending,
+                    key=lambda r: defer_base.get(r.request_id, 0.0) or 0.0,
+                    reverse=True,
+                )
+                backfilled: list[Request] = []
+                for request in sorted_pending[:slack]:
+                    if token_budget <= 0:
+                        self._sslo_step.bf_budget_exhausted += 1
+                        break
+                    # Skip reqs with active encoder inputs to avoid
+                    # duplicating the running loop's encoder cache /
+                    # compute-budget bookkeeping — they'll be backfilled
+                    # next step via the normal running loop after MLP
+                    # restores them.
+                    if request.has_encoder_inputs:
+                        self._sslo_step.bf_encoder_skipped += 1
+                        continue
+                    num_new_tokens = (
+                        request.num_tokens_with_spec
+                        + request.num_output_placeholders
+                        - request.num_computed_tokens
+                    )
+                    num_new_tokens = min(num_new_tokens, token_budget)
+                    num_new_tokens = min(
+                        num_new_tokens,
+                        self.max_model_len - 1 - request.num_computed_tokens,
+                    )
+                    if num_new_tokens <= 0:
+                        self._sslo_step.bf_too_few_tokens += 1
+                        continue
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_lookahead_tokens=self.num_lookahead_tokens,
+                    )
+                    if new_blocks is None:
+                        # KV exhausted — stop backfill this step.
+                        self._sslo_step.bf_kv_full += 1
+                        break
+                    req_to_new_blocks[request.request_id] = new_blocks
+                    num_scheduled_tokens[request.request_id] = num_new_tokens
+                    token_budget -= num_new_tokens
+                    scheduled_running_reqs.append(request)
+                    backfilled.append(request)
+                for r in backfilled:
+                    self.sslo_pending.remove(r)
+                    self.running.append(r)
+                self._sslo_step.bf_promoted = len(backfilled)
+
+        # SSLO: single per-step stats dump, AFTER backfill. running /
+        # pending reflect what the engine actually executes this step.
+        # SsloStepState fields (cur_max_num_requests / has_critical /
+        # waiting_admission_budget / defer_base) were set by the policy
+        # during _sslo_commit_step and remain valid here.
+        self._sslo_dump_step_stats(scheduled_timestamp)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

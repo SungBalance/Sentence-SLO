@@ -483,3 +483,75 @@ load, matching the per-step Δts evidence (mode-independent ~21 ms).
 ### Verification
 - `pytest tests/sslo/` 109/109 pass (이전 107 + 신규 2).
 - Smoke 27B + 9B 모두 합격 기준 만족.
+
+## 2026-05-18 — MLP backfill 후 stats single-dump + predictor escalate/overshoot fix
+
+### Modified (`vllm/vllm/v1/core/sched/scheduler.py`)
+- `SsloStepState`: 새 필드 `defer_base` — non-critical에서 stash해 post-waiting
+  backfill ranking에 사용.
+- `_apply_sslo_multi_level_pressure` non-critical (line 2320~): backfill 제거.
+  `new_running = forced + warmup` 만 commit. `_sslo_step.defer_base = defer_base`
+  로 snapshot.
+- `schedule()` 메인 loop (line ~2980): waiting admit 후 새 backfill block 추가
+  — `self.sslo_pending`에서 `defer_base` DESC 순으로 cap까지 채움. 각 backfilled
+  req에 대해 KV alloc + decode token 배정 → 해당 step에 실제 실행됨.
+  - `request.has_encoder_inputs` 케이스 skip (다음 step 처리).
+- `_sslo_commit_step` (line 1228~): `_sslo_dump_step_stats` 호출 제거. docstring
+  업데이트.
+- `schedule()` 메인 loop 끝 (backfill 후): `_sslo_dump_step_stats(
+  scheduled_timestamp)` 단일 호출 추가 → stats가 최종 running 반영.
+
+### Modified (`vllm/vllm/sslo/config.py`, `slo_state.py`)
+- `SsloConfig`: 새 knob 2개.
+  - `mlp_predictor_escalate_threshold: float = 0.9` — 현재 tier 예측치의 90%에
+    도달하면 다음 tier(p90 → p95 → p99)로 진입.
+  - `mlp_predictor_overshoot_safety_factor: float = 2.5` — `cur > topmost tier`
+    이후 `remaining = (cur - anchor) × factor` 산출 (1.0 saturate 제거).
+- `ChunkLengthPredictor.__init__` + `RequestSLOState.expected_remaining_len`
+  재작성: 위 두 knob 적용.
+- `RequestSLOState.from_config`에 knobs 전달.
+
+### Modified (`vllm/tests/sslo/`)
+- `test_slo_state.py`: 신규 4 (`test_expected_remaining_escalates_at_90pct_threshold`,
+  `_overshoot_grows_past_topmost`, `_legacy_threshold_and_factor`,
+  `test_predictor_knob_validation`). `test_score_formula_and_deadline_sign`
+  예상치 갱신 (1.0 floor → 7.5 overshoot).
+- `test_scheduler_sslo.py`: `test_mlp_non_critical_admission_budget_uses_measured_only`
+  업데이트 — backfill이 main loop으로 이동했으므로 MLP가 commit하는
+  `new_running == 1` (warmup only), pending 3 + defer_base 검증.
+
+### Verification
+
+**Unit tests**: `pytest tests/sslo/` 113/113 pass.
+
+**Worst-case smoke** (35B-A3B cap=128 r=128 sslo_mlp × 3 runs vs v3):
+| metric | v3 (3-run avg) | v4 (3-run avg) | Δ |
+|---|---|---|---|
+| tput | 1620 | 1651 | +1.9% |
+| TTFC mean | 64.0s | 60.0s | -6.3% |
+| **viol@τ=1** | **1.40%** | **0.53%** | **-62%** |
+| crit% | 21% | 12% | -43% |
+
+**Stats dump fix** (v5, post-backfill dump):
+| 지표 | v4 (pre-backfill dump) | v5 (post-backfill dump) |
+|---|---|---|
+| running p75 | 6 | 120 |
+| cap=128 step 비율 | 11% | 24% |
+
+→ stats가 backfill 후 실제 실행 시점을 정확히 반영.
+
+**Controls (1 run)**:
+- 27B cap=64 r=128 mlp: tput 972 (v3 932, +4%), viol 0.79% (v3 0.6%, 동등).
+- 9B cap=128 r=64 mlp: tput 3685 (v3 3660, +0.7%), viol 0% (v3 0.2%, 동등).
+
+### Added — backfill diagnostics
+- `SsloStepState`에 `bf_skip_reason / bf_slack / bf_promoted / bf_kv_full /
+  bf_too_few_tokens / bf_encoder_skipped / bf_budget_exhausted` 필드 추가.
+- `schedule()` 메인 loop의 backfill block을 instrumented (skip 이유, KV alloc
+  실패 카운터 등) — scheduler_stats.jsonl에 dump.
+
+### Diag finding (35B-A3B cap=128 r=128)
+Backfill loop이 86.2% step에서 진입했지만 그 중 **48.2%가 promoted=0**.
+원인: **KV cache full** — `kv_cache_manager.allocate_slots()`가 6026 events
+에서 None 반환. sslo_pending 260 reqs 분량 KV가 살아있어 추가 decode 슬롯
+없음. → 후속 fix: pending pool size 제한 + KV 압력 기반 eviction.

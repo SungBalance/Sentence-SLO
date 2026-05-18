@@ -941,11 +941,15 @@ def test_mlp_non_critical_admission_budget_uses_measured_only():
 
     assert sched._sslo_step.has_critical is False
     assert sched._sslo_step.waiting_admission_budget == 30
-    # Warmup keeps its running slot; the 3 measured (defer<1) all go to
-    # pending. slack=31, budget=30, backfill_slots=1 → one pending
-    # backfilled to running, so 2 stay in pending.
-    assert len(sched.running) == 2
-    assert len(sched.sslo_pending) == 2
+    # Backfill moved to schedule() main loop (post-waiting-admit).
+    # MLP non-critical now leaves only forced+warmup in running; all
+    # eligible measured stay in pending until the main-loop backfill
+    # claims them with leftover token_budget.
+    assert len(sched.running) == 1
+    assert len(sched.sslo_pending) == 3
+    # defer_base snapshot stored for downstream backfill ranking.
+    assert sched._sslo_step.defer_base is not None
+    assert len(sched._sslo_step.defer_base) == 4
 
 
 def test_mlp_non_critical_no_admit_when_all_warmup_running():

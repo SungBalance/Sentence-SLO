@@ -78,6 +78,15 @@ class SsloConfig:
     mlp_pressure_epsilon: float = 1e-9
     mlp_critical_serve_threshold: float = 1.0
     mlp_defer_constraint: float = 1.0
+    # Predictor escalation knobs (used by ChunkLengthPredictor).
+    # mlp_predictor_escalate_threshold: current tier prediction의 이 비율에
+    # cur가 도달하면 다음 tier(p90 → p95 → p99)로 진입. 1.0 = legacy
+    # (cur == tier value).
+    # mlp_predictor_overshoot_safety_factor: cur > topmost tier value 후
+    # remaining = (cur - anchor) × factor 로 산출. 1.0 → 거의 legacy
+    # (saturate at 1.0); 2.5 → long-tail chunks도 MLP가 인식.
+    mlp_predictor_escalate_threshold: float = 0.9
+    mlp_predictor_overshoot_safety_factor: float = 2.5
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
@@ -143,6 +152,14 @@ class SsloConfig:
             value = getattr(self, name)
             if value < 0:
                 raise ValueError(f"{name} must be >= 0, got {value}")
+        if not (0 < self.mlp_predictor_escalate_threshold <= 1.0):
+            raise ValueError(
+                "mlp_predictor_escalate_threshold must be in (0, 1], "
+                f"got {self.mlp_predictor_escalate_threshold}")
+        if self.mlp_predictor_overshoot_safety_factor < 0:
+            raise ValueError(
+                "mlp_predictor_overshoot_safety_factor must be >= 0, "
+                f"got {self.mlp_predictor_overshoot_safety_factor}")
         if (
             self.method == "sslo"
             and self.policy == "multi_level_pressure"
