@@ -265,22 +265,22 @@ def _load_combine(
         per_source = max(1, (num_prompts + 2) // 3)
     over = max(1, int(per_source * 1.5))
 
+    # Catch broad Exception so one source failing (HF auth, gated dataset,
+    # network) doesn't kill the others. LMSYS is gated and may raise
+    # `DatasetNotFoundError` if HF_TOKEN isn't set.
+    import sys
     pool: list[str] = []
-    try:
-        pool += _load_koala(split="test", num_prompts=over,
-                            exclude_code=exclude_code)
-    except ValueError:
-        pass
-    try:
-        pool += _load_wildchat(split="train", num_prompts=over,
-                               exclude_code=exclude_code)
-    except ValueError:
-        pass
-    try:
-        pool += _load_lmsys(split="train", num_prompts=over,
-                            exclude_code=exclude_code)
-    except ValueError:
-        pass
+    for name, loader, split in (
+        ("koala", _load_koala, "test"),
+        ("wildchat", _load_wildchat, "train"),
+        ("lmsys", _load_lmsys, "train"),
+    ):
+        try:
+            pool += loader(split=split, num_prompts=over,
+                           exclude_code=exclude_code)
+        except Exception as e:  # noqa: BLE001 — intentional broad catch
+            print(f"[combine] {name} skipped: {type(e).__name__}: {e}",
+                  file=sys.stderr)
 
     if not pool:
         raise ValueError(
