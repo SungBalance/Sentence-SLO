@@ -252,7 +252,7 @@ def _load_combine(
 ) -> list[str]:
     """Mix prompts from koala + wildchat + lmsys, shuffled by `seed`.
 
-    Each source contributes roughly num_prompts/3 prompts (with a 20%
+    Each source contributes roughly num_prompts/3 prompts (with a 50%
     over-sample to absorb shuffle/filter losses). The combined pool is
     shuffled with a seeded RNG so the same `seed` always returns the
     same ordering — useful for reproducible sweeps.
@@ -263,7 +263,7 @@ def _load_combine(
         per_source = 200  # arbitrary default when caller asks for "all"
     else:
         per_source = max(1, (num_prompts + 2) // 3)
-    over = max(1, int(per_source * 1.2))
+    over = max(1, int(per_source * 1.5))
 
     pool: list[str] = []
     try:
