@@ -180,12 +180,3 @@ class SsloConfig:
             raise ValueError(
                 "chunk_len_predictor_history_max must be >= 1, "
                 f"got {self.chunk_len_predictor_history_max}")
-        if (
-            self.method == "sslo"
-            and self.policy == "multi_level_pressure"
-            and not self.adaptive_batching
-        ):
-            raise ValueError(
-                "policy='multi_level_pressure' requires "
-                "adaptive_batching=True (the policy's critical branch "
-                "shrinks the cap to clear deadline misses)")

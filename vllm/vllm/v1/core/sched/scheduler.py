@@ -2341,9 +2341,21 @@ class Scheduler(SchedulerInterface):
                 break
 
         if has_critical:
-            # Branch 2: critical — shrink cap, freeze waiting admission.
-            picked_n, new_running, new_pending, serve_pick, defer_pick = (
-                self._mlp_pick_adaptive_n(admitted, now, base_tpot))
+            # Branch 2: critical — freeze waiting admission. With
+            # adaptive_batching, _mlp_pick_adaptive_n searches sub-base
+            # captured sizes (sum_serve+sum_defer naturally penalises
+            # throughput-losing shrinks). Without it, partition stays at
+            # base_n and only serve-DESC sorting reorders the running set.
+            # SSLO
+            if self.sslo_config.adaptive_batching:
+                picked_n, new_running, new_pending, serve_pick, defer_pick = (
+                    self._mlp_pick_adaptive_n(admitted, now, base_tpot))
+            else:
+                # SSLO
+                new_running, new_pending = self._mlp_partition(
+                    admitted, serve_base, defer_base, base_n)
+                picked_n = base_n
+                serve_pick, defer_pick = serve_base, defer_base
             self._sslo_step.cur_max_num_requests = picked_n
             self._sslo_step.has_critical = True
             self._sslo_step.waiting_admission_budget = 0
