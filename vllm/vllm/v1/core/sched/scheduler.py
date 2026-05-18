@@ -2424,6 +2424,19 @@ class Scheduler(SchedulerInterface):
         slack = base_n - len(cands_running)
         waiting_admission_budget = max(
             0, min(waiting_count, admission_capacity, slack))
+        # SSLO: KV-aware admission cap. sslo_pending holds KV without
+        # decoding → admitting too many at once can fill KV and starve
+        # later backfill (`allocate_slots` returns None). Bound new
+        # admissions to what the free KV pool can absorb, assuming each
+        # admit costs ~mlp_kv_blocks_per_new_admit blocks (prompt + first
+        # decode). Set knob to 0 to disable.
+        kv_blocks_per_admit = self.sslo_config.mlp_kv_blocks_per_new_admit
+        if kv_blocks_per_admit > 0:
+            free_blocks = (
+                self.kv_cache_manager.block_pool.get_num_free_blocks())
+            kv_admit_max = max(0, free_blocks // kv_blocks_per_admit)
+            waiting_admission_budget = min(
+                waiting_admission_budget, kv_admit_max)
 
         # SSLO: backfill moved to post-waiting-admit (schedule() main
         # loop, after the waiting admission while-loop). MLP here keeps

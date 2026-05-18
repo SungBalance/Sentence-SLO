@@ -87,6 +87,12 @@ class SsloConfig:
     # (saturate at 1.0); 2.5 → long-tail chunks도 MLP가 인식.
     mlp_predictor_escalate_threshold: float = 0.9
     mlp_predictor_overshoot_safety_factor: float = 2.5
+    # KV-aware admission cap for MLP non-critical. waiting_admission_budget
+    # is capped at `free_kv_blocks // mlp_kv_blocks_per_new_admit` so we
+    # don't admit more reqs from waiting than the KV pool can absorb. Each
+    # admit needs prompt blocks (~7-10 for ShareGPT) + 1 first-decode block,
+    # so 8 is a moderate default. Set 0 to disable (no KV cap).
+    mlp_kv_blocks_per_new_admit: int = 8
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
@@ -160,6 +166,10 @@ class SsloConfig:
             raise ValueError(
                 "mlp_predictor_overshoot_safety_factor must be >= 0, "
                 f"got {self.mlp_predictor_overshoot_safety_factor}")
+        if self.mlp_kv_blocks_per_new_admit < 0:
+            raise ValueError(
+                "mlp_kv_blocks_per_new_admit must be >= 0 (0 disables), "
+                f"got {self.mlp_kv_blocks_per_new_admit}")
         if (
             self.method == "sslo"
             and self.policy == "multi_level_pressure"

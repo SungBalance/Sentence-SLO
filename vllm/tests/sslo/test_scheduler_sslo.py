@@ -52,6 +52,13 @@ class FakeKVCacheManager:
     empty_kv_cache_blocks = None
     freed = None
 
+    def __init__(self):
+        # SSLO: mlp_kv_blocks_per_new_admit reads
+        # block_pool.get_num_free_blocks(). Mock with a generous pool so
+        # the KV cap doesn't artificially throttle test admission.
+        self.block_pool = SimpleNamespace(
+            get_num_free_blocks=lambda: 1_000_000)
+
     def new_step_starts(self):
         pass
 
