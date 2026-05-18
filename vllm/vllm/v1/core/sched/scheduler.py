@@ -2725,11 +2725,21 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Next, schedule the WAITING requests.
+        # SSLO: 2-phase waiting admission with backfill in between (Approach A).
+        # Phase 0 admits up to (budget - 1) so backfill has a guaranteed
+        # 1-slot KV/cap window even when the waiting queue is hot.
+        # Phase 1 (after backfill) admits 1 more if any KV remains —
+        # recovers the reserved slot when backfill didn't claim it.
+        # If budget is 0, both phases skip naturally.
+        saved_admission_budget = self._sslo_step.waiting_admission_budget
+        phase1_budget = 1 if saved_admission_budget > 0 else 0
+        phase0_budget = max(0, saved_admission_budget - phase1_budget)
+
+        # Next, schedule the WAITING requests (PHASE 0: budget - 1).
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
             # SSLO: budget-driven admission (computed in _apply_sslo_policy).
-            sslo_admit_remaining = self._sslo_step.waiting_admission_budget
+            sslo_admit_remaining = phase0_budget
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # SSLO
@@ -3106,6 +3116,84 @@ class Scheduler(SchedulerInterface):
                     self.sslo_pending.remove(r)
                     self.running.append(r)
                 self._sslo_step.bf_promoted = len(backfilled)
+
+        # SSLO: Phase A — post-backfill +1 admit (Approach A spec).
+        # Recovers the slot reserved by phase0_budget = budget - 1 when
+        # backfill didn't fully claim it. Uses a SIMPLIFIED admit path
+        # (no LoRA / encoder / blocked / KV-connector edge cases) —
+        # those reqs stay in waiting and get admitted next step via
+        # phase 0.
+        if (
+            phase1_budget > 0
+            and not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and not self._sslo_step.has_critical
+            and len(self.running) < self.max_num_running_reqs
+            and (self.waiting or self.skipped_waiting)
+            and token_budget > 0
+        ):
+            phase1_q = self._select_waiting_queue_for_scheduling()
+            phase1_req = (
+                phase1_q.peek_request() if phase1_q is not None else None)
+            phase1_ok = (
+                phase1_req is not None
+                and not phase1_req.has_encoder_inputs
+                and not self._is_blocked_waiting_status(phase1_req.status)
+                and not (
+                    self.lora_config and phase1_req.lora_request
+                    and len(scheduled_loras) == self.lora_config.max_loras
+                    and phase1_req.lora_request.lora_int_id
+                    not in scheduled_loras
+                )
+                and self.connector is None
+                and not self.need_mamba_block_aligned_split
+            )
+            if phase1_ok:
+                if phase1_req.num_computed_tokens == 0:
+                    phase1_new_blocks_cached, phase1_n_local = (
+                        self.kv_cache_manager.get_computed_blocks(phase1_req)
+                    )
+                    phase1_computed = phase1_n_local
+                else:
+                    phase1_new_blocks_cached = (
+                        self.kv_cache_manager.empty_kv_cache_blocks)
+                    phase1_n_local = 0
+                    phase1_computed = phase1_req.num_computed_tokens
+                phase1_new_tokens = min(
+                    phase1_req.num_tokens - phase1_computed, token_budget)
+                if phase1_new_tokens > 0:
+                    phase1_lookahead = (
+                        0 if phase1_req.num_computed_tokens == 0
+                        else self.num_lookahead_tokens)
+                    phase1_blocks = self.kv_cache_manager.allocate_slots(
+                        phase1_req,
+                        phase1_new_tokens,
+                        num_new_computed_tokens=phase1_n_local,
+                        new_computed_blocks=phase1_new_blocks_cached,
+                        num_lookahead_tokens=phase1_lookahead,
+                    )
+                    if phase1_blocks is not None:
+                        phase1_req = phase1_q.pop_request()
+                        self.running.append(phase1_req)
+                        if phase1_req.slo_state is not None:
+                            phase1_req.slo_state.mark_admitted(
+                                scheduled_timestamp)
+                        if phase1_req.status == RequestStatus.WAITING:
+                            scheduled_new_reqs.append(phase1_req)
+                        elif phase1_req.status == RequestStatus.PREEMPTED:
+                            scheduled_resumed_reqs.append(phase1_req)
+                        if (self.lora_config
+                                and phase1_req.lora_request):
+                            scheduled_loras.add(
+                                phase1_req.lora_request.lora_int_id)
+                        req_to_new_blocks[phase1_req.request_id] = (
+                            self.kv_cache_manager.get_blocks(
+                                phase1_req.request_id))
+                        num_scheduled_tokens[phase1_req.request_id] = (
+                            phase1_new_tokens)
+                        token_budget -= phase1_new_tokens
+                        phase1_req.status = RequestStatus.RUNNING
+                        phase1_req.num_computed_tokens = phase1_computed
 
         # SSLO: single per-step stats dump, AFTER backfill. running /
         # pending reflect what the engine actually executes this step.
