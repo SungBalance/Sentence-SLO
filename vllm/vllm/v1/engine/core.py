@@ -346,7 +346,12 @@ class EngineCore:
         # SSLO
         from vllm.sslo.slo_state import RequestSLOState
         request.slo_state = RequestSLOState.from_config(
-            self.vllm_config.sslo_config)
+            self.vllm_config.sslo_config,
+            # SSLO: scheduler-owned global predictor used as warm-up
+            # substitute when this req's per-req predictor is cold.
+            global_chunk_len_predictor=(
+                self.scheduler._sslo_global_chunk_len_predictor),
+        )
         self.scheduler.add_request(request)
 
     def abort_requests(self, request_ids: list[str]):

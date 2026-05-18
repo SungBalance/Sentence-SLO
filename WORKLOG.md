@@ -555,3 +555,37 @@ Backfill loop이 86.2% step에서 진입했지만 그 중 **48.2%가 promoted=0*
 원인: **KV cache full** — `kv_cache_manager.allocate_slots()`가 6026 events
 에서 None 반환. sslo_pending 260 reqs 분량 KV가 살아있어 추가 decode 슬롯
 없음. → 후속 fix: pending pool size 제한 + KV 압력 기반 eviction.
+
+## 2026-05-18 — hybrid predictor (global + per-request)
+
+### Modified
+- `vllm/vllm/sslo/slo_state.py`:
+  - `_CHUNK_LEN_HISTORY_MAX`: 64 → 4096 (per-req history cap 완화).
+  - `_GLOBAL_PREDICTOR_WARMUP_SAMPLES = 16` (per-req sample이 16 미만이면
+    global predictor 사용).
+  - `ChunkLengthPredictor`: `sample_count` property + 모든 strategy에서
+    `_sample_count` 추적.
+  - `RequestSLOState`: 새 InitVar `global_chunk_len_predictor`. 
+    `on_chunk_boundary`에서 per-req + global 둘 다 update.
+  - `expected_remaining_len()`: per-req sample_count < 16 이면 global,
+    그 외엔 per-req (hard switch).
+  - `from_config`에 `global_chunk_len_predictor` kwarg 추가.
+- `vllm/vllm/sslo/config.py`: `chunk_len_predictor_history_max: int = 4096`
+  knob + validation.
+- `vllm/vllm/v1/core/sched/scheduler.py`: `Scheduler.__init__`이
+  `_sslo_global_chunk_len_predictor` 인스턴스 생성 (EngineCore subprocess
+  안, single thread → lock 불필요).
+- `vllm/vllm/v1/engine/core.py`: `add_request`가 scheduler의 global
+  predictor 참조를 `from_config`에 전달.
+- `vllm/tests/sslo/test_slo_state.py`: 신규 3 tests (warmup 사용, 16-sample
+  switchover, on_chunk_boundary가 global update).
+
+### Verification
+- `pytest tests/sslo/` 116/116 pass.
+- Worst-case smoke (35B-A3B cap=128 r=128 sslo_mlp × 3 runs vs B1):
+  tput 1814 → 1842 (+1.5%), viol@τ=1 0.80% → 0.60% (-25%).
+
+### Notes (다른 시도)
+- Phase A (backfill을 waiting admit **앞**으로 reorder) 시도 → trade-off
+  불리. bf_kv_full=0 / tput 동등 / **TTFC 54s → 84s** (waiting 정체).
+  Codex 검토 후 revert.

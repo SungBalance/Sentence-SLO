@@ -4,6 +4,7 @@
 import pytest
 
 from vllm.sslo.slo_state import (
+    ChunkLengthPredictor,
     ChunkRecord,
     ChunkSeparator,
     Phase,
@@ -207,6 +208,59 @@ def test_predictor_knob_validation():
         RequestSLOState(predictor_escalate_threshold=1.5)
     with pytest.raises(ValueError):
         RequestSLOState(predictor_overshoot_safety_factor=-0.1)
+
+
+def test_predictor_uses_global_when_per_req_below_16_samples():
+    # Global predictor warmed up with many samples (p90=50).
+    glob = ChunkLengthPredictor(strategy="p90")
+    for v in [50] * 32:
+        glob.update(v)
+    assert glob.value == 50.0
+
+    state = RequestSLOState(
+        num_warmup_chunks=1,
+        global_chunk_len_predictor=glob,
+    )
+    state.decoding_start_ts = 0.0
+    state.next_deadline_ts = 100.0
+    state.chunks_completed = 1
+    # Per-req sample_count == 0 < 16 → use global. cur=0, p90=50.
+    assert state.expected_remaining_len() == pytest.approx(50.0)
+    # Even after 1 per-req sample, still below 16 → still global.
+    state._chunk_len_predictor.update(10)
+    assert state.expected_remaining_len() == pytest.approx(50.0)
+
+
+def test_predictor_switches_to_per_req_at_16_samples():
+    glob = ChunkLengthPredictor(strategy="p90")
+    for _ in range(32):
+        glob.update(50)
+    state = RequestSLOState(
+        num_warmup_chunks=1,
+        global_chunk_len_predictor=glob,
+    )
+    state.decoding_start_ts = 0.0
+    state.next_deadline_ts = 100.0
+    state.chunks_completed = 1
+    # Feed 16 per-req samples — all 10s → per-req p90=10.
+    for _ in range(16):
+        state._chunk_len_predictor.update(10)
+    # sample_count == 16, threshold hit, use per-req (p90=10).
+    assert state.expected_remaining_len() == pytest.approx(10.0)
+
+
+def test_on_chunk_boundary_updates_global_predictor():
+    glob = ChunkLengthPredictor(strategy="p90")
+    state = RequestSLOState(
+        num_warmup_chunks=1,
+        global_chunk_len_predictor=glob,
+    )
+    state.on_token(0.0)
+    state.on_chunk_boundary(1.0, word_count=2, chunk_consume_time_s=1.0)
+    # Both per-req and global should have one sample now.
+    assert state._chunk_len_predictor.sample_count == 1
+    assert glob.sample_count == 1
+    assert glob.value == 1.0  # only one sample of value 1 (single on_token)
 
 
 def test_score_formula_and_deadline_sign():

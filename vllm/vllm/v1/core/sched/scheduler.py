@@ -222,6 +222,22 @@ class Scheduler(SchedulerInterface):
         self.running: list[Request] = []
         # SSLO
         self.sslo_pending: list[Request] = []
+        # SSLO: shared global chunk-length predictor — accumulates samples
+        # from every chunk completion across all requests. Each
+        # RequestSLOState holds a reference and falls back to this
+        # predictor when its own sample count is below
+        # _GLOBAL_PREDICTOR_WARMUP_SAMPLES (default 16). Lives inside the
+        # EngineCore subprocess (same process as the scheduler) — no
+        # cross-process IPC needed.
+        from vllm.sslo.slo_state import ChunkLengthPredictor
+        sslo_cfg = self.vllm_config.sslo_config
+        self._sslo_global_chunk_len_predictor = ChunkLengthPredictor(
+            strategy=sslo_cfg.chunk_len_strategy,
+            history_max=sslo_cfg.chunk_len_predictor_history_max,
+            escalate_threshold=sslo_cfg.mlp_predictor_escalate_threshold,
+            overshoot_safety_factor=(
+                sslo_cfg.mlp_predictor_overshoot_safety_factor),
+        )
         # SSLO: per-batch-size decode-only TPOT (used by adaptive batching).
         # Keys are restricted to CUDA-graph-captured batch sizes — running
         # an adaptive cap at a non-graph size would fall back to eager

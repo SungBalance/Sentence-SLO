@@ -18,8 +18,15 @@ _VALID_CHUNK_UNITS = frozenset({"sentence", "paragraph"})
 
 _VALID_CHUNK_LEN_STRATEGIES = frozenset({"ema", "p90", "p99", "past-future"})
 _DEFAULT_CHUNK_LEN_STRATEGY = "p90"
-_CHUNK_LEN_HISTORY_MAX = 64
+# SSLO: lifted from 64 → 4096. ShareGPT-style reqs only yield ~10 chunks,
+# but the global predictor (shared across reqs) accumulates many more —
+# keep enough history to stabilise percentile estimates over long runs.
+_CHUNK_LEN_HISTORY_MAX = 4096
 _CHUNK_LEN_EMA_ALPHA = 0.2
+# SSLO: number of per-req chunk samples below which expected_remaining_len
+# uses the global predictor as a warm-up substitute. At sample_count >=
+# this threshold the per-req predictor takes over (hard switch).
+_GLOBAL_PREDICTOR_WARMUP_SAMPLES = 16
 
 
 class Phase(IntEnum):
@@ -129,6 +136,9 @@ class ChunkLengthPredictor:
         # logic in expected_remaining_len() falls through.
         self.value_mid: float | None = None
         self.value_high: float | None = None
+        # SSLO: strategy-agnostic sample counter (deque length is wrong
+        # for ema strategy where _history isn't used).
+        self._sample_count: int = 0
         if strategy == "ema":
             self.update = self.update_ema
         elif strategy in ("p90", "p99"):
@@ -136,14 +146,22 @@ class ChunkLengthPredictor:
         elif strategy == "past-future":
             self.update = self.update_past_future
 
+    @property
+    def sample_count(self) -> int:
+        # SSLO: number of observed chunks. Used by RequestSLOState to
+        # decide whether to fall back to the global predictor.
+        return self._sample_count
+
     def update_ema(self, generated_len: int) -> None:
         n = int(generated_len)
         self._ema = float(n) if self._ema is None else (
             self.alpha * n + (1.0 - self.alpha) * self._ema)
         self.value = self._ema
+        self._sample_count += 1
 
     def update_percentile(self, generated_len: int) -> None:
         self._history.append(int(generated_len))
+        self._sample_count += 1
         arr = np.fromiter(self._history, dtype=float)
         percentile = 90.0 if self.strategy == "p90" else 99.0
         self.value = float(np.percentile(arr, percentile, method="nearest"))
@@ -483,6 +501,11 @@ class RequestSLOState:
     # SSLO: predictor escalation knobs (default = legacy 0.9/2.5).
     predictor_escalate_threshold: InitVar[float] = 0.9
     predictor_overshoot_safety_factor: InitVar[float] = 2.5
+    # SSLO: optional global predictor reference shared across reqs. When
+    # the per-req predictor has fewer than _GLOBAL_PREDICTOR_WARMUP_SAMPLES
+    # samples, expected_remaining_len falls back to this. Updated on every
+    # chunk completion across all requests (system-wide distribution).
+    global_chunk_len_predictor: InitVar["ChunkLengthPredictor | None"] = None
     # Override hooks — resolved in __post_init__ into non-Optional
     # instance attributes so callers don't have to None-check on use.
     chunk_separator: InitVar[ChunkSeparator | None] = None
@@ -496,6 +519,7 @@ class RequestSLOState:
         min_chunk_tokens: int,
         predictor_escalate_threshold: float,
         predictor_overshoot_safety_factor: float,
+        global_chunk_len_predictor: "ChunkLengthPredictor | None",
         chunk_separator: ChunkSeparator | None,
         consume_estimator: ChunkConsumeEstimator | None,
     ) -> None:
@@ -513,11 +537,17 @@ class RequestSLOState:
             strategy=chunk_len_strategy,
             escalate_threshold=predictor_escalate_threshold,
             overshoot_safety_factor=predictor_overshoot_safety_factor)
+        # SSLO: shared global predictor (set by Scheduler via from_config).
+        self._global_chunk_len_predictor = global_chunk_len_predictor
         # Running cumulative token count; reset at each chunk boundary.
         self._cumulative_tokens: int = 0
 
     @classmethod
-    def from_config(cls, config: "SsloConfig") -> "RequestSLOState":
+    def from_config(
+        cls,
+        config: "SsloConfig",
+        global_chunk_len_predictor: "ChunkLengthPredictor | None" = None,
+    ) -> "RequestSLOState":
         return cls(
             seconds_per_word=config.seconds_per_word,
             num_warmup_chunks=config.num_warmup_chunks,
@@ -530,6 +560,8 @@ class RequestSLOState:
             # SSLO
             predictor_overshoot_safety_factor=(
                 config.mlp_predictor_overshoot_safety_factor),
+            # SSLO: shared system-wide predictor for warm-up substitute.
+            global_chunk_len_predictor=global_chunk_len_predictor,
         )
 
     @property
@@ -572,7 +604,18 @@ class RequestSLOState:
         # 1.0 saturate를 막아 long-tail chunks에서도 MLP가 pressure를
         # 반영. Other strategies (ema, p99) leave value_mid / value_high
         # at None so the topmost-tier branch fires directly.
-        pred = self._chunk_len_predictor
+        #
+        # SSLO: hybrid predictor — use global predictor as warm-up
+        # substitute when per-req has fewer than
+        # _GLOBAL_PREDICTOR_WARMUP_SAMPLES samples. Hard switch (not
+        # blended) per user spec.
+        per = self._chunk_len_predictor
+        glob = self._global_chunk_len_predictor
+        if (glob is not None and glob.value is not None
+                and per.sample_count < _GLOBAL_PREDICTOR_WARMUP_SAMPLES):
+            pred = glob
+        else:
+            pred = per
         if pred.value is None:
             return None
         cur = self.current_chunk_generated_len
@@ -876,6 +919,10 @@ class RequestSLOState:
             text=text,
         )
         self._chunk_len_predictor.update(num_token)
+        # SSLO: feed the global predictor too so other reqs benefit from
+        # this sample during their warm-up window.
+        if self._global_chunk_len_predictor is not None:
+            self._global_chunk_len_predictor.update(num_token)
 
         # Stall-aware deadline recurrence (t = chunk index just completed):
         #   deadline(t+1) = max(deadline(t), finish(t)) + consume(t)

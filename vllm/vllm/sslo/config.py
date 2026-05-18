@@ -93,6 +93,11 @@ class SsloConfig:
     # admit needs prompt blocks (~7-10 for ShareGPT) + 1 first-decode block,
     # so 8 is a moderate default. Set 0 to disable (no KV cap).
     mlp_kv_blocks_per_new_admit: int = 8
+    # Max samples retained by ChunkLengthPredictor's percentile history.
+    # Per-req history rarely exceeds ~10 in ShareGPT-style workloads, but
+    # the shared global predictor (one per Scheduler) can accumulate many
+    # — keep enough to stabilise percentile estimates.
+    chunk_len_predictor_history_max: int = 4096
 
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
@@ -170,6 +175,10 @@ class SsloConfig:
             raise ValueError(
                 "mlp_kv_blocks_per_new_admit must be >= 0 (0 disables), "
                 f"got {self.mlp_kv_blocks_per_new_admit}")
+        if self.chunk_len_predictor_history_max < 1:
+            raise ValueError(
+                "chunk_len_predictor_history_max must be >= 1, "
+                f"got {self.chunk_len_predictor_history_max}")
         if (
             self.method == "sslo"
             and self.policy == "multi_level_pressure"
