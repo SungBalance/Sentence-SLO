@@ -26,7 +26,8 @@ _CHUNK_LEN_EMA_ALPHA = 0.2
 # SSLO: number of per-req chunk samples below which expected_remaining_len
 # uses the global predictor as a warm-up substitute. At sample_count >=
 # this threshold the per-req predictor takes over (hard switch).
-_GLOBAL_PREDICTOR_WARMUP_SAMPLES = 16
+# SSLO: hybrid-predictor warmup threshold now lives in SsloConfig as
+# `num_warmup_chunks` (read via RequestSLOState.num_warmup_chunks).
 
 
 class Phase(IntEnum):
@@ -489,11 +490,12 @@ class RequestSLOState:
     total_step_count: int = 0
     prefill_step_count: int = 0
 
-    # num_warmup_chunks lives on the instance because `phase` reads it
-    # every call. The other config knobs are consumed only at construction
-    # to build chunk_separator / consume_estimator / predictor, so they're
-    # InitVars and don't persist as instance attributes.
-    num_warmup_chunks: int = 4
+    # num_warmup_chunks: threshold (in chunk samples) at which the per-req
+    # chunk-length predictor is considered stable. Below this count
+    # expected_remaining_len falls back to the shared global predictor.
+    # No longer gates phase transitions — phase=MEASURED triggers as soon
+    # as chunks_completed >= 1.
+    num_warmup_chunks: int = 8
     seconds_per_word: InitVar[float] = 0.28
     chunk_unit: InitVar[str] = "sentence"
     chunk_len_strategy: InitVar[str] = _DEFAULT_CHUNK_LEN_STRATEGY
@@ -568,9 +570,13 @@ class RequestSLOState:
     def phase(self) -> Phase:
         if self.decoding_start_ts is None:
             return Phase.PREFILL
-        if self.chunks_completed >= self.num_warmup_chunks:
-            return Phase.MEASURED
-        return Phase.WARMUP
+        # SSLO: WARMUP only while the first chunk hasn't completed.
+        # As soon as chunks_completed >= 1 the per-req predictor has a
+        # sample and the hybrid predictor can fall through to global,
+        # so the policy treats the request as MEASURED.
+        if self.chunks_completed == 0:
+            return Phase.WARMUP
+        return Phase.MEASURED
 
     @property
     def chunk_records(self) -> list[ChunkRecord]:
@@ -606,13 +612,12 @@ class RequestSLOState:
         # at None so the topmost-tier branch fires directly.
         #
         # SSLO: hybrid predictor — use global predictor as warm-up
-        # substitute when per-req has fewer than
-        # _GLOBAL_PREDICTOR_WARMUP_SAMPLES samples. Hard switch (not
-        # blended) per user spec.
+        # substitute when per-req has fewer than num_warmup_chunks
+        # samples. Hard switch (not blended) per user spec.
         per = self._chunk_len_predictor
         glob = self._global_chunk_len_predictor
         if (glob is not None and glob.value is not None
-                and per.sample_count < _GLOBAL_PREDICTOR_WARMUP_SAMPLES):
+                and per.sample_count < self.num_warmup_chunks):
             pred = glob
         else:
             pred = per

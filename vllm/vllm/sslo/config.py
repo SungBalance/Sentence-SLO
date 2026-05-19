@@ -27,7 +27,12 @@ class SsloConfig:
     #   "pressure"  — pressure-budget admission.
     policy: str | None = "threshold"
     adaptive_batching: bool = False
-    num_warmup_chunks: int = 4
+    # Threshold (in chunk samples) at which the per-request chunk-length
+    # predictor is considered stable; until then the hybrid predictor
+    # substitutes the shared global predictor's value. No longer gates
+    # phase transitions (phase=MEASURED triggers as soon as the first
+    # chunk completes).
+    num_warmup_chunks: int = 8
     tpot_ema_alpha: float = 0.1
     critical_threshold: float = 1.0
     # Hysteresis thresholds for non-critical placement under

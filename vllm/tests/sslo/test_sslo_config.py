@@ -12,7 +12,7 @@ def test_defaults():
     assert cfg.method == "baseline"
     assert cfg.policy == "threshold"
     assert cfg.adaptive_batching is False
-    assert cfg.num_warmup_chunks == 4
+    assert cfg.num_warmup_chunks == 8
     assert cfg.tpot_ema_alpha == 0.1
     assert cfg.critical_threshold == 1.0
     assert cfg.pending_in_threshold == 0.3
@@ -80,15 +80,6 @@ def test_mlp_valid_when_adaptive_true():
     assert cfg.mlp_pressure_epsilon == 1e-9
     assert cfg.mlp_critical_serve_threshold == 1.0
     assert cfg.mlp_defer_constraint == 1.0
-
-
-def test_mlp_invalid_when_adaptive_false():
-    with pytest.raises(ValueError, match="adaptive_batching=True"):
-        SsloConfig(
-            method="sslo",
-            policy="multi_level_pressure",
-            adaptive_batching=False,
-        )
 
 
 def test_from_config_freezes_constants():

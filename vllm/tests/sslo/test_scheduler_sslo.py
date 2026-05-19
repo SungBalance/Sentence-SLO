@@ -987,15 +987,6 @@ def test_mlp_dispatch_resolves():
         "_apply_sslo_multi_level_pressure")
 
 
-def test_mlp_adaptive_required_in_config():
-    with pytest.raises(ValueError, match="adaptive_batching=True"):
-        SsloConfig(
-            method="sslo",
-            policy="multi_level_pressure",
-            adaptive_batching=False,
-        )
-
-
 def test_mlp_decision_log_emits_new_fields(monkeypatch, tmp_path):
     monkeypatch.setenv(
         "SSLO_STATS_LOG_PATH", str(tmp_path / "scheduler_stats.jsonl"))

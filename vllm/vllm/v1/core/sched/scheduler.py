@@ -2094,22 +2094,25 @@ class Scheduler(SchedulerInterface):
         """Partition admitted into (running, pending) under MLP rules.
 
         Priority bands (filled in order until cap is reached):
-          1. forced_running_measured — MEASURED requests with
-             defer ≥ mlp_defer_constraint. Deferring one step would push
-             these past the deadline, so they MUST run this step.
-          2. warmup_running — PREFILL/WARMUP phase. Score is undefined
-             so they go in next, but never displace a forced_running.
-          3. rest_measured — remaining MEASURED requests, sorted by
-             serve descending (urgent first).
+          1. forced — MEASURED with defer ≥ mlp_defer_constraint.
+             Deferring one step would push these past the deadline.
+          2. hi_pressure_measured — MEASURED with serve ≥ critical
+             threshold, sorted by serve DESC. Already at/above the
+             critical-mode trigger; protect before warmup.
+          3. warmup — PREFILL / WARMUP (chunks_completed == 0). Score
+             undefined; placed after high-pressure measured so admission
+             stalls on warmup don't displace at-deadline reqs.
+          4. lo_pressure_measured — remaining MEASURED, serve DESC.
 
-        If forced + warmup alone exceed cap, forced runs win — losing a
-        chunk-deadline (deferred MEASURED) is strictly worse than
-        delaying warmup by one step.
+        cap-truncation drops the bottom of this ordering (low-pressure
+        measured first, then warmup, etc.).
         """
         defer_constraint = self.sslo_config.mlp_defer_constraint
+        critical_threshold = self.sslo_config.mlp_critical_serve_threshold
         forced: list[Request] = []
         warmup: list[Request] = []
-        rest: list[Request] = []
+        hi_pressure: list[Request] = []
+        lo_pressure: list[Request] = []
         for req in admitted:
             state = req.slo_state
             rid = req.request_id
@@ -2125,23 +2128,28 @@ class Scheduler(SchedulerInterface):
             d = defer.get(rid)
             if d is not None and d >= defer_constraint:
                 forced.append(req)
+                continue
+            s = serve.get(rid)
+            if s is not None and (s == float("inf") or s >= critical_threshold):
+                hi_pressure.append(req)
             else:
-                rest.append(req)
+                lo_pressure.append(req)
 
         def _serve_key(r: Request) -> tuple[float, str]:
             s = serve.get(r.request_id)
             if s is None:
-                # Should not happen — MEASURED rest path implies serve is
+                # Should not happen — MEASURED path implies serve is
                 # populated. Sort to the back as a defensive tie-breaker.
                 return (-float("inf"), r.request_id)
             if s == float("inf"):
                 return (-float("inf"), r.request_id)
             return (-s, r.request_id)
 
-        rest.sort(key=_serve_key)
+        hi_pressure.sort(key=_serve_key)
+        lo_pressure.sort(key=_serve_key)
 
-        # forced > warmup > rest; truncate at cap.
-        ordered = forced + warmup + rest
+        # forced > hi-pressure measured > warmup > lo-pressure measured.
+        ordered = forced + hi_pressure + warmup + lo_pressure
         running = ordered[:cap]
         pending = ordered[cap:]
         return running, pending

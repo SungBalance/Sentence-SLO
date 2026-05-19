@@ -20,15 +20,19 @@ def measured_state() -> RequestSLOState:
 
 
 def test_phase_transitions_on_token_and_chunk_boundary():
+    # num_warmup_chunks no longer gates phase; it only controls when the
+    # hybrid predictor switches off the global fallback.
     state = RequestSLOState(num_warmup_chunks=2)
 
     assert state.phase == Phase.PREFILL
     state.on_token(1.0)
-    assert state.phase == Phase.WARMUP
+    assert state.phase == Phase.WARMUP  # decode started, first chunk not done
     assert state.decoding_start_ts == pytest.approx(1.0)
 
     state.on_chunk_boundary(1.2, word_count=1, chunk_consume_time_s=0.5)
-    assert state.phase == Phase.WARMUP
+    # First chunk completed → MEASURED immediately (regardless of num_warmup_chunks).
+    assert state.phase == Phase.MEASURED
+    assert state.chunks_completed == 1
     state.on_token(1.3)
     state.on_chunk_boundary(1.4, word_count=2, chunk_consume_time_s=0.7)
     assert state.phase == Phase.MEASURED
@@ -217,8 +221,9 @@ def test_predictor_uses_global_when_per_req_below_16_samples():
         glob.update(v)
     assert glob.value == 50.0
 
+    # num_warmup_chunks now controls the hybrid switch threshold.
     state = RequestSLOState(
-        num_warmup_chunks=1,
+        num_warmup_chunks=16,
         global_chunk_len_predictor=glob,
     )
     state.decoding_start_ts = 0.0
@@ -231,12 +236,12 @@ def test_predictor_uses_global_when_per_req_below_16_samples():
     assert state.expected_remaining_len() == pytest.approx(50.0)
 
 
-def test_predictor_switches_to_per_req_at_16_samples():
+def test_predictor_switches_to_per_req_at_warmup_threshold():
     glob = ChunkLengthPredictor(strategy="p90")
     for _ in range(32):
         glob.update(50)
     state = RequestSLOState(
-        num_warmup_chunks=1,
+        num_warmup_chunks=16,
         global_chunk_len_predictor=glob,
     )
     state.decoding_start_ts = 0.0
@@ -245,7 +250,7 @@ def test_predictor_switches_to_per_req_at_16_samples():
     # Feed 16 per-req samples — all 10s → per-req p90=10.
     for _ in range(16):
         state._chunk_len_predictor.update(10)
-    # sample_count == 16, threshold hit, use per-req (p90=10).
+    # sample_count == num_warmup_chunks → use per-req (p90=10).
     assert state.expected_remaining_len() == pytest.approx(10.0)
 
 
@@ -280,10 +285,10 @@ def test_score_formula_and_deadline_sign():
 
 
 def test_score_none_during_warmup_or_missing_inputs():
+    # WARMUP now means chunks_completed == 0 (first chunk not yet done).
     warmup = RequestSLOState(num_warmup_chunks=4)
     warmup.on_token(0.0)
-    warmup.on_chunk_boundary(0.1, word_count=1, chunk_consume_time_s=1.0)
-    assert warmup.pressure(0.2, 0.1) is None
+    assert warmup.pressure(0.05, 0.1) is None  # still WARMUP — no chunks yet
 
     measured = measured_state()
     assert measured.pressure(0.2, None) is None
