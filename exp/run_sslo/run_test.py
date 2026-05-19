@@ -43,6 +43,13 @@ def parse_args() -> argparse.Namespace:
              "that strain the chunk-length predictor.",
     )
     parser.add_argument(
+        "--conversation-only", action="store_true",
+        help="Keep only multi-turn conversation rows (≥2 user, ≥2 "
+             "assistant messages). Koala is single-turn — passing this "
+             "flag with --dataset-name koala raises; combine drops koala "
+             "regardless.",
+    )
+    parser.add_argument(
         "--dataset-seed", type=int, default=42,
         help="Seed used by the `combine` dataset's shuffle. Ignored for "
              "single-source datasets.",
@@ -110,10 +117,12 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 def load_workload(
     dataset_name: str, num_prompts: int, *,
     exclude_code: bool = False, dataset_seed: int = 42,
+    conversation_only: bool = False,
 ) -> list[str]:
     prompts = load_prompts(
         dataset_name, num_prompts=num_prompts,
-        exclude_code=exclude_code, seed=dataset_seed)
+        exclude_code=exclude_code, seed=dataset_seed,
+        conversation_only=conversation_only)
     if len(prompts) >= num_prompts:
         return prompts[:num_prompts]
     repeated: list[str] = []
@@ -412,7 +421,8 @@ async def run_one(args: argparse.Namespace) -> None:
     prompts = load_workload(
         args.dataset_name, args.num_prompts,
         exclude_code=args.exclude_code,
-        dataset_seed=args.dataset_seed)
+        dataset_seed=args.dataset_seed,
+        conversation_only=args.conversation_only)
     print(f"{args.run_kind}: loaded {len(prompts)} prompts from {args.dataset_name}"
           + (" (exclude_code=True)" if args.exclude_code else "")
           + (f" seed={args.dataset_seed}"
@@ -518,12 +528,18 @@ async def run_one(args: argparse.Namespace) -> None:
             f"last_offset={arrival_offsets[-1]:.2f}s, seed={args.request_rate_seed}"
         )
 
+    def _per_req_sampling_params(seed: int):
+        p = sampling_params.clone()
+        p.seed = seed
+        return p
+
     try:
         run_started_ts = time.time()
         t0 = time.monotonic()
         tasks = [
             asyncio.create_task(collect_request_with_delay(
-                engine, i, prompt, sampling_params, arrival_offsets[i]))
+                engine, i, prompt, _per_req_sampling_params(i),
+                arrival_offsets[i]))
             for i, prompt in enumerate(prompts)
         ]
         rows = await asyncio.gather(*tasks)

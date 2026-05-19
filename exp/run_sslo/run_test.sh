@@ -73,6 +73,11 @@ if [[ "${EXCLUDE_CODE:-0}" == "1" ]]; then
 else
   EXCLUDE_CODE_FLAG=""
 fi
+if [[ "${CONVERSATION_ONLY:-0}" == "1" ]]; then
+  CONVERSATION_ONLY_FLAG="--conversation-only"
+else
+  CONVERSATION_ONLY_FLAG=""
+fi
 
 export HF_HOME=/cache
 export HF_HUB_CACHE=/cache/hub
@@ -102,5 +107,6 @@ python3 exp/run_sslo/run_test.py \
   --dataset-name "${DATASET_NAME}" \
   --dataset-seed "${DATASET_SEED}" \
   ${EXCLUDE_CODE_FLAG} \
+  ${CONVERSATION_ONLY_FLAG} \
   ${THINKING_FLAG} \
   ${SAMPLING_ARGS}
