@@ -79,17 +79,11 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Seed for the Poisson inter-arrival sampler (reproducibility).",
     )
-    thinking_group = parser.add_mutually_exclusive_group()
-    thinking_group.add_argument(
-        "--enable-thinking", dest="enable_thinking", action="store_true",
+    parser.add_argument(
+        "--enable-thinking", action="store_true",
         help="Apply chat template with enable_thinking=True (unified "
-             "Instruct+Thinking models like Qwen3.5).",
+             "Instruct+Thinking models like Qwen3.5). Default: False.",
     )
-    thinking_group.add_argument(
-        "--no-thinking", dest="enable_thinking", action="store_false",
-        help="Apply chat template with enable_thinking=False (default).",
-    )
-    parser.set_defaults(enable_thinking=False)
     parser.add_argument(
         "--no-chat-template", dest="apply_chat_template", action="store_false",
         help="Skip chat template application — send raw user text as completion.",
@@ -487,6 +481,7 @@ async def run_one(args: argparse.Namespace) -> None:
         # Auto-load HF model's generation_config so SamplingParams defaults
         # (temperature, top_p, top_k, etc.) come from the model.
         generation_config="auto",
+        language_model_only=True,
     )
     if args.max_model_len > 0:
         engine_kwargs["max_model_len"] = args.max_model_len
@@ -495,15 +490,17 @@ async def run_one(args: argparse.Namespace) -> None:
         engine_kwargs["kv_transfer_config"] = kv_transfer_config
         engine_kwargs["disable_hybrid_kv_cache_manager"] = False
         engine_kwargs["enable_prefix_caching"] = True
+    if args.enable_thinking:
+        engine_kwargs["reasoning_parser"] = "qwen3"
     engine_args = AsyncEngineArgs(**engine_kwargs)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
-    # Pull HF generation_config diff (temperature/top_p/top_k/repetition_penalty/min_p).
-    # SamplingParams() does NOT auto-merge engine generation_config="auto" on the
-    # AsyncLLM path — do it explicitly so all runs sample with the model's intended
-    # distribution rather than vLLM's neutral defaults (1.0/1.0/-1).
-    sampling_kwargs = dict(engine.model_config.get_diff_sampling_param())
-    # CLI overrides win over model HF defaults — used to pin sampling across
-    # heterogeneous models (e.g. Qwen3.5-9B has no generation_config.json).
+    if args.enable_thinking:
+        sampling_kwargs = {"temperature": 1.0, "top_p": 0.95, "top_k": 20,
+                           "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0}
+    else:
+        sampling_kwargs = {"temperature": 0.7, "top_p": 0.8, "top_k": 20,
+                           "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0}
+    # CLI overrides win over the defaults above.
     for name in ("temperature", "top_p", "top_k", "min_p",
                  "presence_penalty", "repetition_penalty"):
         v = getattr(args, name)

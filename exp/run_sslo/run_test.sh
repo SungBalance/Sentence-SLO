@@ -49,12 +49,12 @@ SECONDS_PER_WORD="${SECONDS_PER_WORD:-0.28}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 SSLO_KV_OFFLOAD_EXTRA="${SSLO_KV_OFFLOAD_EXTRA:-{\"cpu_bytes_to_use\": 17179869184}}"
 # Thinking control for unified Instruct+Thinking models (Qwen3.5).
-# ENABLE_THINKING=1 → --enable-thinking; 0 (default) → --no-thinking.
+# ENABLE_THINKING=1 → --enable-thinking; 0/unset (default) → flag omitted.
 ENABLE_THINKING="${ENABLE_THINKING:-0}"
 if [[ "${ENABLE_THINKING}" == "1" ]]; then
   THINKING_FLAG="--enable-thinking"
 else
-  THINKING_FLAG="--no-thinking"
+  THINKING_FLAG=""
 fi
 # Sampling overrides (empty = use model HF defaults). For heterogeneous
 # model families pin these to keep cells comparable.
