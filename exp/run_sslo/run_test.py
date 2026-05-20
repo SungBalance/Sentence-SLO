@@ -252,9 +252,11 @@ async def collect_one(
     prompt: str,
     sampling_params: Any,
     injection_ts: float,
-    first_completion_event: asyncio.Event,
+    warmup_event: asyncio.Event,
+    warmup_counter: list[int],
+    warmup_target: int,
 ) -> dict[str, Any]:
-    """Stream one request; set first_completion_event on first completed response."""
+    """Stream one request; set warmup_event once warmup_target completions reached."""
     request_id = str(request_idx)
     last_output = None
 
@@ -329,9 +331,12 @@ async def collect_one(
         getattr(sslo_metrics, "terminal_outcome", "in_progress") if sslo_metrics else "in_progress"
     )
 
-    # Signal the first completed response.
+    # Tally completions and open the warmup gate at the threshold.
     if terminal_outcome_val == "completed":
-        first_completion_event.set()
+        warmup_counter[0] += 1
+        if (warmup_counter[0] >= warmup_target
+                and not warmup_event.is_set()):
+            warmup_event.set()
 
     queue_stall_s = (
         float(admitted_ts_val) - float(queued)
@@ -493,6 +498,9 @@ async def run_one(args: argparse.Namespace) -> None:
             sslo_params["policy"] = "multi_level_pressure"
             sslo_params["adaptive_batching"] = (
                 os.environ.get("SSLO_ADAPTIVE_BATCHING", "1") != "0")
+            # SSLO: optional waiting-admission floor under critical mode.
+            if os.environ.get("MLP_CRITICAL_WAITING_FLOOR", "0") == "1":
+                sslo_params["mlp_critical_waiting_floor"] = True
 
     # KV transfer config: only enable the CPU-offload connector for the two
     # offload SSLO modes. Non-offload modes (baseline, sslo, sslo_adaptive)
@@ -573,7 +581,9 @@ async def run_one(args: argparse.Namespace) -> None:
         cursor += 1
         return p
 
-    first_completion_event = asyncio.Event()
+    warmup_event = asyncio.Event()
+    warmup_counter: list[int] = [0]
+    warmup_target = args.max_num_seqs
     window_start_ts: float | None = None
     window_end_ts: float | None = None
     injected: list[tuple[int, asyncio.Task, float]] = []
@@ -581,7 +591,7 @@ async def run_one(args: argparse.Namespace) -> None:
 
     async def watcher() -> None:
         nonlocal window_start_ts, window_end_ts
-        await first_completion_event.wait()
+        await warmup_event.wait()
         window_start_ts = time.time()
         window_end_ts = window_start_ts + args.measurement_window_s
 
@@ -595,7 +605,7 @@ async def run_one(args: argparse.Namespace) -> None:
             task = asyncio.create_task(collect_one(
                 engine, idx, prompt,
                 _per_req_sampling_params(idx),
-                inj_ts, first_completion_event))
+                inj_ts, warmup_event, warmup_counter, warmup_target))
             injected.append((idx, task, inj_ts))
             await asyncio.sleep(rng.expovariate(args.request_rate))
 

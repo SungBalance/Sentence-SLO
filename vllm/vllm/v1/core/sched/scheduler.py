@@ -2366,7 +2366,23 @@ class Scheduler(SchedulerInterface):
                 serve_pick, defer_pick = serve_base, defer_base
             self._sslo_step.cur_max_num_requests = picked_n
             self._sslo_step.has_critical = True
-            self._sslo_step.waiting_admission_budget = 0
+            # SSLO: critical waiting-admission policy. Default freezes the
+            # queue; mlp_critical_waiting_floor=True lets new admits fill
+            # the cap-vs-admitted gap so the GPU stays loaded near base_n.
+            if self.sslo_config.mlp_critical_waiting_floor:
+                slack = base_n - len(new_running)
+                budget = max(0, min(waiting_count, slack))
+                kv_blocks_per_admit = (
+                    self.sslo_config.mlp_kv_blocks_per_new_admit)
+                if kv_blocks_per_admit > 0:
+                    free_blocks = (
+                        self.kv_cache_manager.block_pool
+                        .get_num_free_blocks())
+                    kv_admit_max = max(0, free_blocks // kv_blocks_per_admit)
+                    budget = min(budget, kv_admit_max)
+                self._sslo_step.waiting_admission_budget = budget
+            else:
+                self._sslo_step.waiting_admission_budget = 0
             # Build the log row's pressures from the picked-n serve dict.
             for req in admitted:
                 s = serve_pick.get(req.request_id)

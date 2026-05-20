@@ -12,7 +12,7 @@ def test_defaults():
     assert cfg.method == "baseline"
     assert cfg.policy == "threshold"
     assert cfg.adaptive_batching is False
-    assert cfg.num_warmup_chunks == 8
+    assert cfg.num_warmup_chunks == 16
     assert cfg.tpot_ema_alpha == 0.1
     assert cfg.critical_threshold == 1.0
     assert cfg.pending_in_threshold == 0.3

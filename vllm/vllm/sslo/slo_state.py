@@ -495,7 +495,7 @@ class RequestSLOState:
     # expected_remaining_len falls back to the shared global predictor.
     # No longer gates phase transitions — phase=MEASURED triggers as soon
     # as chunks_completed >= 1.
-    num_warmup_chunks: int = 8
+    num_warmup_chunks: int = 16
     seconds_per_word: InitVar[float] = 0.28
     chunk_unit: InitVar[str] = "sentence"
     chunk_len_strategy: InitVar[str] = _DEFAULT_CHUNK_LEN_STRATEGY

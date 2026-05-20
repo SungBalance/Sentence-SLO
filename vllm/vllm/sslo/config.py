@@ -32,7 +32,7 @@ class SsloConfig:
     # substitutes the shared global predictor's value. No longer gates
     # phase transitions (phase=MEASURED triggers as soon as the first
     # chunk completes).
-    num_warmup_chunks: int = 8
+    num_warmup_chunks: int = 16
     tpot_ema_alpha: float = 0.1
     critical_threshold: float = 1.0
     # Hysteresis thresholds for non-critical placement under
@@ -83,6 +83,13 @@ class SsloConfig:
     mlp_pressure_epsilon: float = 1e-9
     mlp_critical_serve_threshold: float = 1.0
     mlp_defer_constraint: float = 1.0
+    # Critical-mode waiting admission floor. Default False = full freeze
+    # (waiting_admission_budget = 0). True = allow admit up to
+    # (base_n - len(admitted)) so the GPU stays loaded near cap when
+    # critical reqs alone don't fill it. Safety floor against the
+    # admit-rate collapse observed in 9B cap=256 (running_mean=96 vs
+    # cap 256 under full freeze).
+    mlp_critical_waiting_floor: bool = False
     # Predictor escalation knobs (used by ChunkLengthPredictor).
     # mlp_predictor_escalate_threshold: current tier prediction의 이 비율에
     # cur가 도달하면 다음 tier(p90 → p95 → p99)로 진입. 1.0 = legacy
