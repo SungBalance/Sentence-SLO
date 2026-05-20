@@ -2367,10 +2367,10 @@ class Scheduler(SchedulerInterface):
             self._sslo_step.cur_max_num_requests = picked_n
             self._sslo_step.has_critical = True
             # SSLO: critical waiting-admission policy. Default freezes the
-            # queue; mlp_critical_waiting_floor=True lets new admits fill
-            # the cap-vs-admitted gap so the GPU stays loaded near base_n.
-            if self.sslo_config.mlp_critical_waiting_floor:
-                slack = base_n - len(new_running)
+            # queue; allow_admit_critical=True lets new admits fill
+            # the cap-vs-admitted gap so the GPU stays loaded near picked_n.
+            if self.sslo_config.allow_admit_critical:
+                slack = picked_n - len(new_running)
                 budget = max(0, min(waiting_count, slack))
                 kv_blocks_per_admit = (
                     self.sslo_config.mlp_kv_blocks_per_new_admit)
@@ -2778,9 +2778,10 @@ class Scheduler(SchedulerInterface):
             sslo_admit_remaining = phase0_budget
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                # SSLO
-                if self._sslo_step.has_critical:
-                    break
+                # SSLO: critical-mode gating is now via waiting_admission_budget
+                # (set to 0 by default in critical, or to slack when the
+                # waiting-floor knob is on). Removed the unconditional
+                # `has_critical → break` so the budget alone controls admission.
                 if len(self.running) == self.max_num_running_reqs:
                     break
                 # SSLO: stop when this step's admission budget is exhausted.

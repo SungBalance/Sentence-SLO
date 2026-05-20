@@ -498,9 +498,9 @@ async def run_one(args: argparse.Namespace) -> None:
             sslo_params["policy"] = "multi_level_pressure"
             sslo_params["adaptive_batching"] = (
                 os.environ.get("SSLO_ADAPTIVE_BATCHING", "1") != "0")
-            # SSLO: optional waiting-admission floor under critical mode.
-            if os.environ.get("MLP_CRITICAL_WAITING_FLOOR", "0") == "1":
-                sslo_params["mlp_critical_waiting_floor"] = True
+            # SSLO: allow waiting admission under critical mode.
+            if os.environ.get("ALLOW_ADMIT_CRITICAL", "0") == "1":
+                sslo_params["allow_admit_critical"] = True
 
     # KV transfer config: only enable the CPU-offload connector for the two
     # offload SSLO modes. Non-offload modes (baseline, sslo, sslo_adaptive)
