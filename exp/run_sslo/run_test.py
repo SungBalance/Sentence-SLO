@@ -16,7 +16,7 @@ import random as _random
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
-from lm_datasets import load_prompts
+from lm_datasets import load_prompts, _load_wildchat, _load_lmsys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from metrics_utils import MODES_DEFAULT
@@ -51,10 +51,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dataset-seed", type=int, default=42,
-        help="Seed used by the `combine` dataset's shuffle. Ignored for "
-             "single-source datasets.",
+        help="Seed used by the pool builder shuffle.",
     )
-    parser.add_argument("--num-prompts", type=int, default=256)
+    parser.add_argument("--num-prompts", type=int, default=4000,
+                        help="Pool size (prompts loaded into the sampling pool).")
     parser.add_argument(
         "--max-model-len", type=int, default=0,
         help="Max model context length. 0 (default) = auto, "
@@ -70,14 +70,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--request-rate",
         type=float,
-        default=0.0,
-        help="Poisson arrival rate in reqs/sec. 0 (default) submits all prompts at once.",
+        default=4.0,
+        help="Poisson arrival rate in reqs/sec. Must be > 0.",
     )
     parser.add_argument(
         "--request-rate-seed",
         type=int,
         default=42,
         help="Seed for the Poisson inter-arrival sampler (reproducibility).",
+    )
+    parser.add_argument(
+        "--measurement-window-s",
+        type=float,
+        default=180.0,
+        help="Measurement window duration in seconds, starting from the first completed request.",
+    )
+    parser.add_argument(
+        "--sampling-seed",
+        type=int,
+        default=None,
+        help="Seed for pool sampling order. Defaults to --request-rate-seed.",
     )
     parser.add_argument(
         "--enable-thinking", action="store_true",
@@ -98,7 +110,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-p", type=float, default=None)
     parser.add_argument("--presence-penalty", type=float, default=None)
     parser.add_argument("--repetition-penalty", type=float, default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.request_rate <= 0:
+        raise ValueError(
+            f"--request-rate must be > 0 (got {args.request_rate}). "
+            "The zero-rate batch mode is no longer supported."
+        )
+    return args
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -123,6 +141,26 @@ def load_workload(
     while len(repeated) < num_prompts:
         repeated.extend(prompts)
     return repeated[:num_prompts]
+
+
+def _build_pool(args: argparse.Namespace) -> list[str]:
+    """Build the 4000-prompt sampling pool: wildchat 2000 + lmsys 2000."""
+    wildchat_raw = _load_wildchat(
+        split="train", num_prompts=2500,
+        exclude_code=True, conversation_only=True)
+    lmsys_raw = _load_lmsys(
+        split="train", num_prompts=2500,
+        exclude_code=True, conversation_only=True)
+    wildchat_trimmed = wildchat_raw[:2000]
+    lmsys_trimmed = lmsys_raw[:2000]
+    combined = wildchat_trimmed + lmsys_trimmed
+    rng = _random.Random(args.dataset_seed)
+    rng.shuffle(combined)
+    if args.apply_chat_template:
+        combined = apply_chat_template_to_prompts(
+            combined, args.model, enable_thinking=args.enable_thinking)
+    assert len(combined) == 4000, f"Expected 4000 prompts, got {len(combined)}"
+    return combined
 
 
 def apply_chat_template_to_prompts(
@@ -208,25 +246,15 @@ def extract_chunk_records(request_output: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-async def collect_request_with_delay(
+async def collect_one(
     engine: Any,
     request_idx: int,
     prompt: str,
     sampling_params: Any,
-    arrival_offset_s: float,
+    injection_ts: float,
+    first_completion_event: asyncio.Event,
 ) -> dict[str, Any]:
-    """Sleep until the prompt's scheduled arrival, then collect."""
-    if arrival_offset_s > 0:
-        await asyncio.sleep(arrival_offset_s)
-    return await collect_request(engine, request_idx, prompt, sampling_params)
-
-
-async def collect_request(
-    engine: Any,
-    request_idx: int,
-    prompt: str,
-    sampling_params: Any,
-) -> dict[str, Any]:
+    """Stream one request; set first_completion_event on first completed response."""
     request_id = str(request_idx)
     last_output = None
 
@@ -237,6 +265,8 @@ async def collect_request(
         return {
             "request_id": request_id,
             "request_idx": request_idx,
+            "injection_ts": injection_ts,
+            "injection_idx": request_idx,
             "ttft": None,
             "tpot": None,
             "queue_stall": None,
@@ -245,6 +275,7 @@ async def collect_request(
             "slo_chunk_records": [],
             "total_pending_time_s": None,
             "num_pending_intervals": 0,
+            "terminal_outcome": "in_progress",
         }
 
     metrics = getattr(last_output, "metrics", None)
@@ -297,6 +328,11 @@ async def collect_request(
     terminal_outcome_val = (
         getattr(sslo_metrics, "terminal_outcome", "in_progress") if sslo_metrics else "in_progress"
     )
+
+    # Signal the first completed response.
+    if terminal_outcome_val == "completed":
+        first_completion_event.set()
+
     queue_stall_s = (
         float(admitted_ts_val) - float(queued)
         if (admitted_ts_val is not None and queued is not None and admitted_ts_val >= queued)
@@ -307,6 +343,8 @@ async def collect_request(
     return {
         "request_id": request_id,
         "request_idx": request_idx,
+        "injection_ts": injection_ts,
+        "injection_idx": request_idx,
         "num_output_tokens": num_gen,
         "num_prompt_tokens": num_prompt_tokens,
         "num_chunks": len(slo_chunk_records),
@@ -376,6 +414,14 @@ def write_run_meta(
     run_started_ts: float,
     run_ended_ts: float,
     requests_rows: list[dict[str, Any]],
+    *,
+    window_start_ts: float | None,
+    window_end_ts: float | None,
+    pool_size: int,
+    sampling_seed: int,
+    pool_pass_count: int,
+    injected_count: int,
+    in_window_count: int,
 ) -> None:
     # Sidecar consumed by analyze.py / _consolidate_mode_outputs.py so the
     # validity gate can see run-level identifiers and F3 counters even if
@@ -388,11 +434,18 @@ def write_run_meta(
         "trace_id": (
             f"poisson_rate{args.request_rate}_seed{args.request_rate_seed}"
         ),
-        "workload_id": args.dataset_name,
+        "workload_id": "wildchat2k_lmsys2k",
         "N": len(requests_rows),
         "M": args.max_num_seqs,
-        "measurement_start_ts": run_started_ts,
-        "measurement_end_ts": run_ended_ts,
+        "measurement_window_start_ts": window_start_ts,
+        "measurement_window_end_ts": window_end_ts,
+        "measurement_window_seconds": args.measurement_window_s,
+        "pool_size": pool_size,
+        "pool_source": "wildchat2k_lmsys2k",
+        "sampling_seed": sampling_seed,
+        "pool_pass_count": pool_pass_count,
+        "injected_count": injected_count,
+        "in_window_count": in_window_count,
         "gpu_memory_peak_bytes": _gpu_peak_bytes(),
         "num_preemptions_total": _sum_preemptions(requests_rows),
         "num_requests_completed": sum(
@@ -412,21 +465,8 @@ async def run_one(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    prompts = load_workload(
-        args.dataset_name, args.num_prompts,
-        exclude_code=args.exclude_code,
-        dataset_seed=args.dataset_seed,
-        conversation_only=args.conversation_only)
-    print(f"{args.run_kind}: loaded {len(prompts)} prompts from {args.dataset_name}"
-          + (" (exclude_code=True)" if args.exclude_code else "")
-          + (f" seed={args.dataset_seed}"
-             if args.dataset_name == "combine" else ""))
-    if args.apply_chat_template:
-        prompts = apply_chat_template_to_prompts(
-            prompts, args.model, enable_thinking=args.enable_thinking)
-        print(f"{args.run_kind}: applied chat template "
-              f"enable_thinking={args.enable_thinking}, "
-              f"mean_prompt_chars={sum(len(p) for p in prompts) // len(prompts)}")
+    pool = _build_pool(args)
+    print(f"{args.run_kind}: built pool of {len(pool)} prompts (wildchat2k+lmsys2k)")
 
     # Build sslo_params. Both baseline and sslo modes run through
     # schedule_sslo() so chunk records / scheduler_stats / tpot EMA are
@@ -510,38 +550,74 @@ async def run_one(args: argparse.Namespace) -> None:
     sampling_params = SamplingParams.from_optional(**sampling_kwargs)
     print(f"{args.run_kind}: sampling_params={sampling_params}")
 
-    # Generate Poisson inter-arrival offsets relative to t0.
-    rate = args.request_rate
-    rng = _random.Random(args.request_rate_seed)
-    arrival_offsets: list[float] = []
-    cur = 0.0
-    for _ in prompts:
-        arrival_offsets.append(cur)
-        if rate > 0:
-            cur += rng.expovariate(rate)
-    if rate > 0:
-        print(
-            f"{args.run_kind}: Poisson arrivals at {rate} req/s, "
-            f"last_offset={arrival_offsets[-1]:.2f}s, seed={args.request_rate_seed}"
-        )
-
     def _per_req_sampling_params(seed: int):
         p = sampling_params.clone()
         p.seed = seed
         return p
 
+    # Set up pool sampling state.
+    seed = args.sampling_seed if args.sampling_seed is not None else args.request_rate_seed
+    rng = _random.Random(seed)
+    order = list(range(len(pool)))
+    rng.shuffle(order)
+    cursor = 0
+    pool_pass_count = 0
+
+    def next_prompt() -> str:
+        nonlocal cursor, pool_pass_count
+        if cursor >= len(order):
+            rng.shuffle(order)
+            cursor = 0
+            pool_pass_count += 1
+        p = pool[order[cursor]]
+        cursor += 1
+        return p
+
+    first_completion_event = asyncio.Event()
+    window_start_ts: float | None = None
+    window_end_ts: float | None = None
+    injected: list[tuple[int, asyncio.Task, float]] = []
+    injection_seq = 0
+
+    async def watcher() -> None:
+        nonlocal window_start_ts, window_end_ts
+        await first_completion_event.wait()
+        window_start_ts = time.time()
+        window_end_ts = window_start_ts + args.measurement_window_s
+
+    async def injector() -> None:
+        nonlocal injection_seq
+        while window_end_ts is None or time.time() < window_end_ts:
+            inj_ts = time.time()
+            idx = injection_seq
+            injection_seq += 1
+            prompt = next_prompt()
+            task = asyncio.create_task(collect_one(
+                engine, idx, prompt,
+                _per_req_sampling_params(idx),
+                inj_ts, first_completion_event))
+            injected.append((idx, task, inj_ts))
+            await asyncio.sleep(rng.expovariate(args.request_rate))
+
     try:
         run_started_ts = time.time()
         t0 = time.monotonic()
-        tasks = [
-            asyncio.create_task(collect_request_with_delay(
-                engine, i, prompt, _per_req_sampling_params(i),
-                arrival_offsets[i]))
-            for i, prompt in enumerate(prompts)
-        ]
-        rows = await asyncio.gather(*tasks)
+        await asyncio.gather(watcher(), injector())
+        rows = list(await asyncio.gather(*[t for _, t, _ in injected]))
         elapsed = time.monotonic() - t0
         run_ended_ts = time.time()
+
+        # Compute in_window for each row now that window bounds are known.
+        for row in rows:
+            inj_ts = row.get("injection_ts")
+            if (inj_ts is not None and window_start_ts is not None
+                    and window_end_ts is not None):
+                row["in_window"] = bool(window_start_ts <= inj_ts < window_end_ts)
+            else:
+                row["in_window"] = False
+
+        in_window_count = sum(1 for r in rows if r.get("in_window"))
+
         request_rows = [
             {"mode": args.run_kind,
              **{k: v for k, v in row.items() if k != "slo_chunk_records"}}
@@ -566,7 +642,15 @@ async def run_one(args: argparse.Namespace) -> None:
         # SSLO Phase 6: run-level sidecar for the validity gate (run_id,
         # GPU peak, preemption totals, completion counts).
         write_run_meta(
-            args, output_dir, run_started_ts, run_ended_ts, request_rows)
+            args, output_dir, run_started_ts, run_ended_ts, request_rows,
+            window_start_ts=window_start_ts,
+            window_end_ts=window_end_ts,
+            pool_size=len(pool),
+            sampling_seed=seed,
+            pool_pass_count=pool_pass_count,
+            injected_count=len(rows),
+            in_window_count=in_window_count,
+        )
         print(
             f"{args.run_kind}: completed {len(rows)} requests in {elapsed:.1f}s; "
             f"wrote {output_dir / 'requests.jsonl'}"
@@ -574,6 +658,10 @@ async def run_one(args: argparse.Namespace) -> None:
         print(
             f"{args.run_kind}: wrote {len(chunk_rows)} chunks to "
             f"{output_dir / 'chunks.jsonl'}"
+        )
+        print(
+            f"{args.run_kind}: window={window_start_ts:.1f}..{window_end_ts:.1f} "
+            f"injected={len(rows)} in_window={in_window_count}"
         )
         prompt_counts = [r["num_prompt_tokens"] for r in rows if r and r.get("num_prompt_tokens") is not None]
         output_counts = [r["num_output_tokens"] for r in rows if r and r.get("num_output_tokens") is not None]

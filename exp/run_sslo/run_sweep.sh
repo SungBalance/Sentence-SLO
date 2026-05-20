@@ -46,7 +46,7 @@ PARALLEL="${PARALLEL:-4}"
 START_RUN_INDEX="${START_RUN_INDEX:-1}"
 
 MODEL="${MODEL:-Qwen/Qwen3.5-35B-A3B}"
-NUM_PROMPTS="${NUM_PROMPTS:-256}"
+NUM_PROMPTS="${NUM_PROMPTS:-4000}"
 GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS:-4096}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-0}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
@@ -56,7 +56,7 @@ MODES="${MODES:-baseline,sslo,sslo_adaptive}"
 
 read -ra CHUNK_UNITS_ARR        <<< "${CHUNK_UNITS:-sentence paragraph}"
 read -ra MAX_NUM_SEQS_VALUES    <<< "${MAX_NUM_SEQS_VALUES:-64}"
-read -ra REQUEST_RATES          <<< "${REQUEST_RATES:-0 4 16 32}"
+read -ra REQUEST_RATES          <<< "${REQUEST_RATES:-4 16 32}"
 
 # Distribute REQUEST_RATES round-robin across NUM_PARALLEL_GPUS for PARALLEL=4
 # so changes to REQUEST_RATES propagate without editing a second list.
@@ -150,6 +150,7 @@ run_cell() {
     TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE}" \
     GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION}" \
     SECONDS_PER_WORD="${SECONDS_PER_WORD}" \
+    MEASUREMENT_WINDOW_S="${MEASUREMENT_WINDOW_S:-180}" \
     bash exp/run_sslo/run_test.sh "${mode}" "${seqs}" "${MODEL}" \
       || last_rc=$?
 

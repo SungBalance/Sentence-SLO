@@ -221,6 +221,22 @@ def print_stats(label: str, metric: str, stats: dict[str, float | int | None]) -
     print(f"{label} {metric}: {rendered}")
 
 
+def _filter_by_window(
+    req_rows: list[dict[str, Any]],
+    chunk_rows: list[dict[str, Any]],
+    mw0: float,
+    mw1: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep only requests injected within [mw0, mw1) and their chunks."""
+    kept_req = [r for r in req_rows
+                if r.get("injection_ts") is not None
+                and mw0 <= float(r["injection_ts"]) < mw1]
+    kept_ids = {str(r["request_id"]) for r in kept_req if r.get("request_id") is not None}
+    kept_chunks = [c for c in chunk_rows
+                   if str(c.get("request_id", "")) in kept_ids]
+    return kept_req, kept_chunks
+
+
 def analyze(
     output_dir: Path,
     max_num_seqs: int,
@@ -242,6 +258,25 @@ def analyze(
             f"output_dir parent must be a mode in {ALL_MODES}; "
             f"got parent={mode!r} for {output_dir}")
 
+    # Load run_meta.json early — it is the authoritative source for the
+    # measurement window.
+    run_meta: dict[str, Any] = {}
+    meta_path = output_dir / "run_meta.json"
+    if meta_path.exists():
+        try:
+            run_meta = json.loads(meta_path.read_text()) or {}
+        except json.JSONDecodeError:
+            run_meta = {}
+
+    mw0 = run_meta.get("measurement_window_start_ts")
+    mw1 = run_meta.get("measurement_window_end_ts")
+    if mw0 is None or mw1 is None:
+        raise RuntimeError(
+            "missing measurement_window_*: re-run with new flow"
+        )
+    mw0 = float(mw0)
+    mw1 = float(mw1)
+
     request_rows_mode = read_jsonl(output_dir / "requests.jsonl")
     chunk_rows_mode = read_jsonl(output_dir / "chunks.jsonl")
     sched_rows_mode = read_jsonl(output_dir / "scheduler_stats.jsonl")
@@ -249,6 +284,12 @@ def analyze(
     # tag rows here for the per-mode split downstream.
     for row in sched_rows_mode:
         row.setdefault("mode", mode)
+
+    # Filter scheduler_stats to measurement window.
+    sched_rows_mode = [
+        r for r in sched_rows_mode
+        if r.get("ts") is not None and mw0 <= float(r["ts"]) < mw1
+    ]
 
     sslo_config_by_mode: dict[str, dict[str, Any]] = {}
     cfg_path = output_dir / "sslo_config.json"
@@ -260,8 +301,12 @@ def analyze(
 
     run_status: dict[str, Any] = {mode: 0}
 
-    request_rows_all = list(request_rows_mode)
-    chunk_rows_all = list(chunk_rows_mode)
+    # Apply window filter to requests and chunks.
+    request_rows_mode_windowed, chunk_rows_mode_windowed = _filter_by_window(
+        request_rows_mode, chunk_rows_mode, mw0, mw1)
+
+    request_rows_all = list(request_rows_mode_windowed)
+    chunk_rows_all = list(chunk_rows_mode_windowed)
     sched_rows_all = list(sched_rows_mode)
 
     modes_run = [mode]
@@ -300,16 +345,6 @@ def analyze(
         # Phase 5: new top-level section for merged-interval CP-SLO metrics.
         "cpslo": {},
     }
-
-    # SSLO Phase 6: load run_meta.json early so throughput_stats can use
-    # the canonical full-run wall-time (measurement_start_ts / _end_ts).
-    run_meta: dict[str, Any] = {}
-    meta_path = output_dir / "run_meta.json"
-    if meta_path.exists():
-        try:
-            run_meta = json.loads(meta_path.read_text()) or {}
-        except json.JSONDecodeError:
-            run_meta = {}
 
     for mode in ALL_MODES:
         req_rows = req_by_mode[mode]
@@ -350,12 +385,13 @@ def analyze(
             "num_handling_users": nhu_dist,
         }
 
-    windows: dict[str, tuple] = {}
+    # Use run_meta window as the single authoritative window for all modes.
+    window = (mw0, mw1)
+
     for mode in ALL_MODES:
         req_rows = req_by_mode[mode]
         ch_rows = chunk_by_mode[mode]
         per_req = pm.per_request_progress(req_rows, ch_rows)
-        window = pm.measurement_window(req_rows, ch_rows, max_num_seqs)
 
         def vals(key):
             return [p[key] for p in per_req if p.get(key) is not None]
@@ -381,7 +417,7 @@ def analyze(
             "num_chunks":        dist_for_key(req_rows, "num_chunks"),
         }
         metrics["throughput"][mode] = pm.throughput_stats(
-            req_rows, per_req, window, run_meta=run_meta)
+            req_rows, per_req, run_meta=run_meta)
         # SSLO Phase 6: scalar run-level workload counts consumed by
         # validate_run (drop/timeout/throughput predicates).
         num_total = len(req_rows)
@@ -405,17 +441,15 @@ def analyze(
         # legacy key.
         metrics["cpslo"][mode]["cp_slo_violation_rates_by_tau"] = (
             metrics["cp_slo_violation"][mode])
-        duration = (window[1] - window[0]) if (window[0] is not None and window[1] is not None) else None
+        duration = mw1 - mw0
         metrics["measurement_window"][mode] = {
-            "start_ts":   window[0],
-            "end_ts":     window[1],
+            "start_ts":   mw0,
+            "end_ts":     mw1,
             "duration_s": duration,
         }
-        windows[mode] = window
 
     for mode in ALL_MODES:
         sched_rows = sched_by_mode[mode]
-        window = windows[mode]
         hu_stats = pm.handling_users_stats(sched_rows, window)
         metrics["handling_users"][mode] = hu_stats
         # Phase 5: dual-write time-weighted mean onto scheduler.num_handling_users
@@ -469,6 +503,10 @@ def analyze(
         metrics["cpslo"][mode]["pending_time_distribution"] = distribution_stats(
             pending_times)
 
+    # Surface window-level counts from run_meta in summary.
+    injected_count = run_meta.get("injected_count", 0)
+    in_window_count = run_meta.get("in_window_count", 0)
+
     summary: dict[str, Any] = {
         "config": {
             "model": model,
@@ -488,6 +526,12 @@ def analyze(
         "scheduler_saturation": scheduler_saturation,
         "passes": passes,
         "run_meta": run_meta,
+        # Window-level counts surfaced at top level.
+        "pool_size": run_meta.get("pool_size"),
+        "injected_count": injected_count,
+        "in_window_count": in_window_count,
+        "out_of_window_count": injected_count - in_window_count,
+        "measurement_window_seconds": run_meta.get("measurement_window_seconds"),
     }
 
     # SSLO Phase 6: validity + no-harm gate. Single-mode runs have no paired

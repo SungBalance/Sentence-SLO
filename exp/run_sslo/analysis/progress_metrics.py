@@ -180,35 +180,6 @@ def per_request_progress(
     return results
 
 
-def measurement_window(
-    req_rows: list[dict[str, Any]],
-    chunk_rows: list[dict[str, Any]],
-    max_num_seqs: int,
-) -> tuple[float | None, float | None]:
-    chunks_by_req: dict[str, list[float]] = {}
-    for row in chunk_rows:
-        rid = row.get("request_id")
-        et = row.get("end_time_ts")
-        if rid is not None and et is not None:
-            chunks_by_req.setdefault(str(rid), []).append(float(et))
-
-    completion_times = []
-    for req in req_rows:
-        rid = str(req.get("request_id", ""))
-        ends = chunks_by_req.get(rid)
-        if ends:
-            completion_times.append(max(ends))
-
-    completion_times.sort()
-    n = len(completion_times)
-    if n <= max_num_seqs:
-        return (None, None)
-
-    window_start = completion_times[0]
-    window_end = completion_times[n - max_num_seqs - 1]
-    return (window_start, window_end)
-
-
 def handling_users_stats(
     sched_rows: list[dict[str, Any]],
     window: tuple[float | None, float | None],
@@ -272,51 +243,26 @@ def throughput_stats(
     window: tuple[float | None, float | None] = (None, None),
     run_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Tokens generated per second over the full run wall-time.
+    """Tokens generated per second over the measurement window.
 
-    Canonical basis (post-Phase 5 follow-up): tokens summed over ALL
-    requests, divided by the wall-time from the first request entering
-    the engine to the last request completing. Earlier versions used a
-    windowed slice `completion_times[0..N-M-1]` which biased against
-    schedulers that wave-pattern admission (the "first M completions"
-    window stretched for SSLO because requests sat in the pending pool
-    before running).
-
-    Window source priority:
-      1. run_meta.measurement_start_ts / measurement_end_ts
-         (stamped by run_test.py around the asyncio.gather loop).
-      2. Derived: min(arrival_ts) → max(completion_ts) across
-         per_req_progress when run_meta is unavailable.
-      3. The `window` arg is accepted only as a final fallback so
-         existing callers that don't yet pass `run_meta` keep working.
+    Uses measurement_window_start_ts / measurement_window_end_ts from
+    run_meta (the first-completion window set by run_test.py). The `window`
+    arg is kept for signature compatibility but is no longer used.
     """
     w0: float | None = None
     w1: float | None = None
     if run_meta:
-        w0 = run_meta.get("measurement_start_ts")
-        w1 = run_meta.get("measurement_end_ts")
-    if w0 is None or w1 is None:
-        arrivals = [
-            float(p["arrival_ts"]) for p in per_req_progress
-            if p.get("arrival_ts") is not None
-        ]
-        completions = [
-            float(p["completion_ts"]) for p in per_req_progress
-            if p.get("completion_ts") is not None
-        ]
-        if arrivals and completions:
-            w0 = min(arrivals)
-            w1 = max(completions)
-    if w0 is None or w1 is None:
-        w0, w1 = window
+        w0 = run_meta.get("measurement_window_start_ts")
+        w1 = run_meta.get("measurement_window_end_ts")
     if w0 is None or w1 is None:
         return {"count": 0, "duration_s": None, "tokens_per_second": None,
-                "completed_req_per_s": None, "basis": "unknown"}
+                "completed_req_per_s": None, "basis": "first_completion_window",
+                "error": "missing measurement_window_*"}
 
     duration = w1 - w0
     if duration <= 0:
         return {"count": 0, "duration_s": duration, "tokens_per_second": None,
-                "completed_req_per_s": None, "basis": "full_run"}
+                "completed_req_per_s": None, "basis": "first_completion_window"}
 
     tokens = sum(
         int(p["num_output_tokens"])
@@ -333,7 +279,7 @@ def throughput_stats(
         "duration_s": duration,
         "tokens_per_second": tokens / duration,
         "completed_req_per_s": count / duration,
-        "basis": "full_run",
+        "basis": "first_completion_window",
     }
 
 
