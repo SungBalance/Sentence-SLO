@@ -1,0 +1,17 @@
+{
+  "model": "Qwen/Qwen3.5-9B",
+  "max_num_seqs": 128,
+  "tensor_parallel_size": 1,
+  "num_prompts": 512,
+  "completed": 512,
+  "run_started_ts": 1779333443.550341,
+  "run_ended_ts": 1779333548.8579638,
+  "run_elapsed_s": 105.30762200895697,
+  "window_start_ts": 1779333467.689353,
+  "window_end_ts": 1779333513.4676926,
+  "window_duration_s": 45.77833962440491,
+  "window_request_count": 256,
+  "window_total_output_tokens": 123191,
+  "throughput_tokens_per_second": 2691.0325060004056,
+  "throughput_req_per_second": 5.592164375125649
+}
