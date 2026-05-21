@@ -301,3 +301,30 @@ def cp_slo_violation_rates(
             "total": total,
         }
     return result
+
+
+def chunk_slo_violation_rates(
+    chunk_rows: list[dict[str, Any]],
+    taus: list[float],
+) -> dict[str, dict[str, Any]]:
+    """Chunk-level SLO violation: stall_duration_s > τ across chunks
+    that have a deadline (chunk_idx >= 1; chunk 0 has no preceding chunk
+    to compute a deadline from).
+    """
+    eligible = [
+        r for r in chunk_rows
+        if r.get("chunk_idx") not in (None, 0)
+        and r.get("stall_duration_s") is not None
+    ]
+    total = len(eligible)
+    result: dict[str, dict[str, Any]] = {}
+    for tau in taus:
+        key = f"tau_{tau:g}"
+        violated = sum(
+            1 for r in eligible if float(r["stall_duration_s"]) > tau)
+        result[key] = {
+            "rate": (violated / total) if total > 0 else None,
+            "violated": violated,
+            "total": total,
+        }
+    return result

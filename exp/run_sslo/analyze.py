@@ -341,7 +341,7 @@ def analyze(
         "slo_compliance": {}, "scheduler": {}, "pending": {}, "inter_chunk_delay": {},
         "prediction_ratio": {}, "stall_time": {},
         "progress_request": {}, "workload": {}, "throughput": {},
-        "cp_slo_violation": {}, "measurement_window": {}, "handling_users": {},
+        "cp_slo_violation": {}, "chunk_slo_violation": {}, "measurement_window": {}, "handling_users": {},
         # Phase 5: new top-level section for merged-interval CP-SLO metrics.
         "cpslo": {},
     }
@@ -436,11 +436,15 @@ def analyze(
                 metrics["throughput"][mode].get("tokens_per_second")),
         })
         metrics["cp_slo_violation"][mode] = pm.cp_slo_violation_rates(per_req, list(pm.DEFAULT_TAUS))
+        metrics["chunk_slo_violation"][mode] = pm.chunk_slo_violation_rates(
+            ch_rows, list(pm.DEFAULT_TAUS))
         # Phase 5: also surface the same violation table under the new
         # cpslo namespace so downstream readers don't have to know the
         # legacy key.
         metrics["cpslo"][mode]["cp_slo_violation_rates_by_tau"] = (
             metrics["cp_slo_violation"][mode])
+        metrics["cpslo"][mode]["chunk_slo_violation_rates_by_tau"] = (
+            metrics["chunk_slo_violation"][mode])
         duration = mw1 - mw0
         metrics["measurement_window"][mode] = {
             "start_ts":   mw0,

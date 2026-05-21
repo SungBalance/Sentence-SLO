@@ -1563,6 +1563,140 @@
         }
       }
     },
+    "chunk_slo_violation": {
+      "baseline": {
+        "tau_0.5": {
+          "rate": 0.10091253163675204,
+          "violated": 4346,
+          "total": 43067
+        },
+        "tau_1": {
+          "rate": 0.06784777207606753,
+          "violated": 2922,
+          "total": 43067
+        },
+        "tau_2": {
+          "rate": 0.020967329974226206,
+          "violated": 903,
+          "total": 43067
+        },
+        "tau_5": {
+          "rate": 0.00011609817261476304,
+          "violated": 5,
+          "total": 43067
+        }
+      },
+      "sslo": {
+        "tau_0.5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_1": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_2": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        }
+      },
+      "sslo_offload": {
+        "tau_0.5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_1": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_2": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        }
+      },
+      "sslo_adaptive": {
+        "tau_0.5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_1": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_2": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        }
+      },
+      "sslo_adaptive_offload": {
+        "tau_0.5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_1": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_2": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        }
+      },
+      "sslo_mlp": {
+        "tau_0.5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_1": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_2": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        }
+      }
+    },
     "measurement_window": {
       "baseline": {
         "start_ts": 1779359983.1485395,
@@ -1687,6 +1821,28 @@
             "total": 2081
           }
         },
+        "chunk_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": 0.10091253163675204,
+            "violated": 4346,
+            "total": 43067
+          },
+          "tau_1": {
+            "rate": 0.06784777207606753,
+            "violated": 2922,
+            "total": 43067
+          },
+          "tau_2": {
+            "rate": 0.020967329974226206,
+            "violated": 903,
+            "total": 43067
+          },
+          "tau_5": {
+            "rate": 0.00011609817261476304,
+            "violated": 5,
+            "total": 43067
+          }
+        },
         "mean_handling_users_time_weighted": null,
         "queue_stall_distribution": {
           "count": 2081,
@@ -1727,6 +1883,28 @@
           "max": null
         },
         "cp_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_1": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_2": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          }
+        },
+        "chunk_slo_violation_rates_by_tau": {
           "tau_0.5": {
             "rate": null,
             "violated": 0,
@@ -1809,6 +1987,28 @@
             "total": 0
           }
         },
+        "chunk_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_1": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_2": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          }
+        },
         "mean_handling_users_time_weighted": null,
         "queue_stall_distribution": {
           "count": 0,
@@ -1849,6 +2049,28 @@
           "max": null
         },
         "cp_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_1": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_2": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          }
+        },
+        "chunk_slo_violation_rates_by_tau": {
           "tau_0.5": {
             "rate": null,
             "violated": 0,
@@ -1931,6 +2153,28 @@
             "total": 0
           }
         },
+        "chunk_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_1": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_2": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          }
+        },
         "mean_handling_users_time_weighted": null,
         "queue_stall_distribution": {
           "count": 0,
@@ -1971,6 +2215,28 @@
           "max": null
         },
         "cp_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_1": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_2": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          }
+        },
+        "chunk_slo_violation_rates_by_tau": {
           "tau_0.5": {
             "rate": null,
             "violated": 0,

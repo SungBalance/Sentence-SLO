@@ -68,6 +68,13 @@ def load_cell(model_dir, cap, rate, mode):
             if str(c.get("request_id")) not in req_ids_in: continue
             nt = c.get("num_token") or c.get("num_tokens") or 0
             chunk_tokens.append(nt)
+    # Chunk-level violation from analyze.py output.
+    ch_viol_by_tau = m.get("chunk_slo_violation", {}).get(mkey, {})
+    def chunk_viol(tau):
+        key = f"tau_{tau:g}"
+        v = ch_viol_by_tau.get(key, {})
+        return (v.get("rate") or 0) * 100
+    n_chunks_with_deadline = ch_viol_by_tau.get("tau_1", {}).get("total", 0)
     def pct(arr, q):
         if not arr: return 0
         s = sorted(arr); return s[min(len(s) - 1, int(q * len(s)))]
@@ -85,6 +92,10 @@ def load_cell(model_dir, cap, rate, mode):
         "out99": pct(out_tokens_in, 0.99),
         "ch_m": statistics.mean(chunk_tokens) if chunk_tokens else 0,
         "ch99": pct(chunk_tokens, 0.99),
+        "ch_viol_0.5": chunk_viol(0.5),
+        "ch_viol_1": chunk_viol(1.0),
+        "ch_viol_2": chunk_viol(2.0),
+        "n_chunks_with_deadline": n_chunks_with_deadline,
     }
 
 
@@ -122,6 +133,10 @@ def print_grid(model_dir, caps, rates):
                     "viol_tau_0.5_pct": round(d["v05"], 4),
                     "viol_tau_1_pct":   round(d["v1"], 4),
                     "viol_tau_2_pct":   round(d["v2"], 4),
+                    "chunk_viol_0.5_pct": round(d["ch_viol_0.5"], 4),
+                    "chunk_viol_1_pct":   round(d["ch_viol_1"], 4),
+                    "chunk_viol_2_pct":   round(d["ch_viol_2"], 4),
+                    "n_chunks_with_deadline": d["n_chunks_with_deadline"],
                     "max_stall_p99": round(d["p99st"], 3),
                     "max_stall_max": round(d["mxst"], 3),
                     "ttfc_mean": round(d["ttfc_m"], 2),
