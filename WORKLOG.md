@@ -1,5 +1,12 @@
 # Work Log
 
+## 2026-05-22
+
+- Modified: `exp/tools/lm_datasets.py` — added `english_only: bool` parameter to `load_prompts`, `_load_wildchat`, `_load_lmsys`, `_load_combine`. Filter compares row-level `language` field strictly to `"English"`; non-English / `"Nolang"` / missing rows dropped. Koala loader treats it as no-op (already English-only).
+- Modified: `exp/run_sslo/run_test.py` — added `--english-only` CLI flag; `_build_pool` wildchat/lmsys calls forward `args.english_only`.
+- Modified: `exp/run_sslo/run_test.sh` — added `ENGLISH_ONLY` env var (default `1`) → `--english-only` flag. Default ON: all new runs are English-only unless explicitly disabled.
+- Verification: `python3 -m compileall` + `bash -n` pass. Smoke test (`combine`, 50 prompts): all English. Comparison (wildchat 200 prompts): heavy non-ASCII 14 (off) → 7 (on); remaining 7 are English with Unicode quotes / em-dashes / TAB, no non-English content. Partial pool scan (250K rows): English ratio 46.4%, conv+nocode pass 17.5%. Extrapolated combine English pool ≈ 1.1 M (well above 4 K sweep budget).
+
 ## 2026-05-02 (session 2)
 
 - Modified: `vllm/vllm/sslo/slo_state.py` — added `SsloRequestStats` dataclass (8 fields), added `_num_pending_intervals`, `_cur_consecutive_pending`, `_max_consecutive_pending` tracking to `RequestSLOState.__init__`, updated `on_pending_enter/exit` to count intervals and track consecutive, added `compute_stats()` method.

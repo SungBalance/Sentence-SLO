@@ -50,6 +50,13 @@ def parse_args() -> argparse.Namespace:
              "regardless.",
     )
     parser.add_argument(
+        "--english-only", action="store_true",
+        help="Strictly keep only rows whose row-level language field "
+             "equals 'English' (WildChat / LMSYS). Removes Chinese, "
+             "Persian, multilingual hashtag spam, and 'Nolang' rows that "
+             "confuse the sentence boundary detector.",
+    )
+    parser.add_argument(
         "--dataset-seed", type=int, default=42,
         help="Seed used by the pool builder shuffle.",
     )
@@ -129,12 +136,13 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 def load_workload(
     dataset_name: str, num_prompts: int, *,
     exclude_code: bool = False, dataset_seed: int = 42,
-    conversation_only: bool = False,
+    conversation_only: bool = False, english_only: bool = False,
 ) -> list[str]:
     prompts = load_prompts(
         dataset_name, num_prompts=num_prompts,
         exclude_code=exclude_code, seed=dataset_seed,
-        conversation_only=conversation_only)
+        conversation_only=conversation_only,
+        english_only=english_only)
     if len(prompts) >= num_prompts:
         return prompts[:num_prompts]
     repeated: list[str] = []
@@ -147,10 +155,12 @@ def _build_pool(args: argparse.Namespace) -> list[str]:
     """Build the 4000-prompt sampling pool: wildchat 2000 + lmsys 2000."""
     wildchat_raw = _load_wildchat(
         split="train", num_prompts=2500,
-        exclude_code=True, conversation_only=True)
+        exclude_code=True, conversation_only=True,
+        english_only=args.english_only)
     lmsys_raw = _load_lmsys(
         split="train", num_prompts=2500,
-        exclude_code=True, conversation_only=True)
+        exclude_code=True, conversation_only=True,
+        english_only=args.english_only)
     wildchat_trimmed = wildchat_raw[:2000]
     lmsys_trimmed = lmsys_raw[:2000]
     combined = wildchat_trimmed + lmsys_trimmed

@@ -83,6 +83,7 @@ def load_prompts(
     exclude_code: bool = False,
     seed: int = 42,
     conversation_only: bool = False,
+    english_only: bool = False,
 ) -> list[str]:
     """Return a list of clean prompt strings from the named dataset.
 
@@ -99,6 +100,10 @@ def load_prompts(
             non-code prompts are collected.
         seed: Random seed used by the `combine` dataset shuffle.
             Ignored for single-source datasets.
+        english_only: If True, keep only rows whose row-level `language`
+            field equals exactly "English". WildChat-4.8M and
+            LMSYS-Chat-1M both expose this string field. Non-English,
+            missing, or "Nolang" rows are dropped.
 
     Returns:
         List of cleaned, non-empty prompt strings.
@@ -112,21 +117,25 @@ def load_prompts(
                 "Koala is a single-turn instruction set — no conversation "
                 "rows. Use wildchat / lmsys / combine with "
                 "conversation_only=True.")
+        # Koala is English-only by construction; english_only is a no-op.
         return _load_koala(
             split=resolved_split, num_prompts=num_prompts,
             exclude_code=exclude_code)
     if dataset_id == WILDCHAT_DATASET_ID:
         return _load_wildchat(
             split=resolved_split, num_prompts=num_prompts,
-            exclude_code=exclude_code, conversation_only=conversation_only)
+            exclude_code=exclude_code, conversation_only=conversation_only,
+            english_only=english_only)
     if dataset_id == LMSYS_DATASET_ID:
         return _load_lmsys(
             split=resolved_split, num_prompts=num_prompts,
-            exclude_code=exclude_code, conversation_only=conversation_only)
+            exclude_code=exclude_code, conversation_only=conversation_only,
+            english_only=english_only)
     if dataset_id == "__combine__":
         return _load_combine(
             num_prompts=num_prompts, exclude_code=exclude_code, seed=seed,
-            conversation_only=conversation_only)
+            conversation_only=conversation_only,
+            english_only=english_only)
     raise ValueError(f"No loader implemented for dataset id: {dataset_id}")
 
 
@@ -209,7 +218,7 @@ def _is_conversation(conversation: list[dict]) -> bool:
 
 def _load_wildchat(
     *, split: str, num_prompts: int | None, exclude_code: bool = False,
-    conversation_only: bool = False,
+    conversation_only: bool = False, english_only: bool = False,
 ) -> list[str]:
     from datasets import load_dataset
 
@@ -219,6 +228,8 @@ def _load_wildchat(
     for row in dataset:
         if num_prompts is not None and len(prompts) >= num_prompts:
             break
+        if english_only and row.get("language") != "English":
+            continue
         conversation = row.get("conversation") or []
         if conversation_only and not _is_conversation(conversation):
             continue
@@ -239,7 +250,7 @@ def _load_wildchat(
 
 def _load_lmsys(
     *, split: str, num_prompts: int | None, exclude_code: bool = False,
-    conversation_only: bool = False,
+    conversation_only: bool = False, english_only: bool = False,
 ) -> list[str]:
     from datasets import load_dataset
 
@@ -249,6 +260,8 @@ def _load_lmsys(
     for row in dataset:
         if num_prompts is not None and len(prompts) >= num_prompts:
             break
+        if english_only and row.get("language") != "English":
+            continue
         conversation = row.get("conversation") or []
         if conversation_only and not _is_conversation(conversation):
             continue
@@ -273,6 +286,7 @@ def _load_combine(
     exclude_code: bool = False,
     seed: int = 42,
     conversation_only: bool = False,
+    english_only: bool = False,
 ) -> list[str]:
     """Mix prompts from wildchat + lmsys, shuffled by `seed`.
 
@@ -304,7 +318,8 @@ def _load_combine(
             pool += loader(
                 split=split, num_prompts=over,
                 exclude_code=exclude_code,
-                conversation_only=conversation_only)
+                conversation_only=conversation_only,
+                english_only=english_only)
         except Exception as e:  # noqa: BLE001 — intentional broad catch
             print(f"[combine] {name} skipped: {type(e).__name__}: {e}",
                   file=sys.stderr)
