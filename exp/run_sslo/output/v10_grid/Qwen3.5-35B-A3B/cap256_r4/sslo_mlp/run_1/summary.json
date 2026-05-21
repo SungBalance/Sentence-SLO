@@ -1,0 +1,2080 @@
+{
+  "config": {
+    "model": "Qwen/Qwen3.5-35B-A3B",
+    "label": null,
+    "max_num_seqs": 256,
+    "chunk_unit": "sentence",
+    "request_rate": 4.0,
+    "generation_max_tokens": 2048,
+    "max_model_len": 0,
+    "is_control": false,
+    "modes_run": [
+      "sslo_mlp"
+    ],
+    "sslo_config": {
+      "sslo_mlp": {
+        "chunk_unit": "sentence",
+        "seconds_per_word": 0.28,
+        "method": "sslo",
+        "policy": "multi_level_pressure",
+        "adaptive_batching": true
+      }
+    },
+    "run_kind": "sslo_mlp"
+  },
+  "metrics": {
+    "ttft": {
+      "baseline": {
+        "all": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "post_cap": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "cohort": "all_requests_control_fallback"
+        }
+      },
+      "sslo": {
+        "all": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "post_cap": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "cohort": "all_requests_control_fallback"
+        }
+      },
+      "sslo_offload": {
+        "all": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "post_cap": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "cohort": "all_requests_control_fallback"
+        }
+      },
+      "sslo_adaptive": {
+        "all": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "post_cap": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "cohort": "all_requests_control_fallback"
+        }
+      },
+      "sslo_adaptive_offload": {
+        "all": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "post_cap": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "cohort": "all_requests_control_fallback"
+        }
+      },
+      "sslo_mlp": {
+        "all": {
+          "count": 721,
+          "mean": 224.7106283494735,
+          "p50": 224.25384426116943,
+          "p90": 293.4360570907593,
+          "p95": 298.9706492424011,
+          "p99": 312.92611060142514,
+          "max": 315.17167925834656
+        },
+        "post_cap": {
+          "count": 721,
+          "mean": 224.7106283494735,
+          "p50": 224.25384426116943,
+          "p90": 293.4360570907593,
+          "p95": 298.9706492424011,
+          "p99": 312.92611060142514,
+          "max": 315.17167925834656,
+          "cohort": "all_requests_control_fallback"
+        }
+      }
+    },
+    "ttfc": {
+      "baseline": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_offload": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive_offload": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_mlp": {
+        "count": 721,
+        "mean": 226.21818627098682,
+        "p50": 226.4643949456513,
+        "p90": 295.08983717672527,
+        "p95": 300.66873318795115,
+        "p99": 314.8444188993424,
+        "max": 317.72704518958926
+      }
+    },
+    "tpot": {
+      "baseline": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_offload": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive_offload": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_mlp": {
+        "count": 721,
+        "mean": 0.04991988291175992,
+        "p50": 0.04925122341417052,
+        "p90": 0.056236625909634415,
+        "p95": 0.06028105390982495,
+        "p99": 0.07045771287547212,
+        "max": 0.09692123252898455
+      }
+    },
+    "queue_stall": {
+      "baseline": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_offload": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive_offload": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_mlp": {
+        "count": 720,
+        "mean": 224.39823733324107,
+        "p50": 223.980141304899,
+        "p90": 293.1376825263724,
+        "p95": 298.5557117434684,
+        "p99": 312.6976772279292,
+        "max": 314.95257114898413
+      }
+    },
+    "slack": {
+      "baseline": {
+        "count": 0,
+        "mean": null,
+        "neg_ratio": null,
+        "p5": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo": {
+        "count": 0,
+        "mean": null,
+        "neg_ratio": null,
+        "p5": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_offload": {
+        "count": 0,
+        "mean": null,
+        "neg_ratio": null,
+        "p5": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive": {
+        "count": 0,
+        "mean": null,
+        "neg_ratio": null,
+        "p5": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive_offload": {
+        "count": 0,
+        "mean": null,
+        "neg_ratio": null,
+        "p5": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_mlp": {
+        "count": 15566,
+        "mean": 57.341331030580605,
+        "neg_ratio": 0.08473596299627394,
+        "p5": -0.5323950247839093,
+        "p50": 42.12258377391845,
+        "p90": 136.2077202014625,
+        "p95": 165.76751807681285,
+        "p99": 228.49231593762534,
+        "max": 364.45802343450487
+      }
+    },
+    "slo_compliance": {
+      "baseline": {
+        "rate": null,
+        "count": 0,
+        "total_requests": 0
+      },
+      "sslo": {
+        "rate": null,
+        "count": 0,
+        "total_requests": 0
+      },
+      "sslo_offload": {
+        "rate": null,
+        "count": 0,
+        "total_requests": 0
+      },
+      "sslo_adaptive": {
+        "rate": null,
+        "count": 0,
+        "total_requests": 0
+      },
+      "sslo_adaptive_offload": {
+        "rate": null,
+        "count": 0,
+        "total_requests": 0
+      },
+      "sslo_mlp": {
+        "rate": 0.8515950069348127,
+        "count": 614,
+        "total_requests": 721
+      }
+    },
+    "scheduler": {
+      "baseline": {
+        "running": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_handling_users": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean_time_weighted": null
+        }
+      },
+      "sslo": {
+        "running": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_handling_users": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean_time_weighted": null
+        }
+      },
+      "sslo_offload": {
+        "running": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_handling_users": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean_time_weighted": null
+        }
+      },
+      "sslo_adaptive": {
+        "running": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_handling_users": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean_time_weighted": null
+        }
+      },
+      "sslo_adaptive_offload": {
+        "running": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_handling_users": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean_time_weighted": null
+        }
+      },
+      "sslo_mlp": {
+        "running": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_handling_users": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null,
+          "mean_time_weighted": null
+        }
+      }
+    },
+    "pending": {
+      "baseline": {
+        "time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "intervals": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo": {
+        "time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "intervals": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_offload": {
+        "time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "intervals": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_adaptive": {
+        "time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "intervals": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_adaptive_offload": {
+        "time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "intervals": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_mlp": {
+        "time": {
+          "count": 721,
+          "mean": 2.0928263615625657,
+          "p50": 0.13329338934272528,
+          "p90": 0.8530812580138445,
+          "p95": 17.799802152439952,
+          "p99": 37.57209642995147,
+          "max": 43.97231773752719
+        },
+        "intervals": {
+          "count": 721,
+          "mean": 1.6504854368932038,
+          "p50": 1.0,
+          "p90": 5.0,
+          "p95": 5.0,
+          "p99": 7.0,
+          "max": 10.0
+        }
+      }
+    },
+    "inter_chunk_delay": {
+      "baseline": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_offload": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive_offload": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_mlp": {
+        "count": 15566,
+        "mean": 1.3270583644399347,
+        "p50": 1.1957173952832818,
+        "p90": 2.0747348801232874,
+        "p95": 2.405506060225889,
+        "p99": 3.1353294741827997,
+        "max": 5.964398178271949
+      }
+    },
+    "prediction_ratio": {
+      "baseline": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_offload": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive_offload": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_mlp": {
+        "count": 15566,
+        "mean": 0.7222175014586143,
+        "p50": 0.6571428571428571,
+        "p90": 1.105263157894737,
+        "p95": 1.2972972972972974,
+        "p99": 1.7636996904024773,
+        "max": 3.5625
+      }
+    },
+    "stall_time": {
+      "baseline": {
+        "count": 0,
+        "violated_count": 0,
+        "mean": null,
+        "mean_with_0": null,
+        "p50": null,
+        "p90": null,
+        "p99": null
+      },
+      "sslo": {
+        "count": 0,
+        "violated_count": 0,
+        "mean": null,
+        "mean_with_0": null,
+        "p50": null,
+        "p90": null,
+        "p99": null
+      },
+      "sslo_offload": {
+        "count": 0,
+        "violated_count": 0,
+        "mean": null,
+        "mean_with_0": null,
+        "p50": null,
+        "p90": null,
+        "p99": null
+      },
+      "sslo_adaptive": {
+        "count": 0,
+        "violated_count": 0,
+        "mean": null,
+        "mean_with_0": null,
+        "p50": null,
+        "p90": null,
+        "p99": null
+      },
+      "sslo_adaptive_offload": {
+        "count": 0,
+        "violated_count": 0,
+        "mean": null,
+        "mean_with_0": null,
+        "p50": null,
+        "p90": null,
+        "p99": null
+      },
+      "sslo_mlp": {
+        "count": 15566,
+        "violated_count": 1319,
+        "mean": 0.7471755933986696,
+        "mean_with_0": 0.06331264343394868,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p99": 1.387858883058654
+      }
+    },
+    "progress_request": {
+      "baseline": {
+        "total_stall_time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "max_stall_time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_stall_intervals": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "stall_fraction": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "completion_latency": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "demand_duration": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo": {
+        "total_stall_time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "max_stall_time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_stall_intervals": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "stall_fraction": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "completion_latency": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "demand_duration": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_offload": {
+        "total_stall_time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "max_stall_time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_stall_intervals": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "stall_fraction": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "completion_latency": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "demand_duration": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_adaptive": {
+        "total_stall_time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "max_stall_time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_stall_intervals": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "stall_fraction": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "completion_latency": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "demand_duration": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_adaptive_offload": {
+        "total_stall_time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "max_stall_time": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_stall_intervals": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "stall_fraction": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "completion_latency": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "demand_duration": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_mlp": {
+        "total_stall_time": {
+          "count": 721,
+          "mean": 1.3668857249554025,
+          "p50": 0.0,
+          "p90": 2.804436396807432,
+          "p95": 12.171179595403373,
+          "p99": 22.792010450176896,
+          "max": 38.393565563485026
+        },
+        "max_stall_time": {
+          "count": 721,
+          "mean": 0.2202042846316562,
+          "p50": 0.0,
+          "p90": 1.1486530136317015,
+          "p95": 1.7878366811200976,
+          "p99": 2.4738726083189246,
+          "max": 4.095410220324993
+        },
+        "num_stall_intervals": {
+          "count": 721,
+          "mean": 1.8294036061026353,
+          "p50": 0.0,
+          "p90": 3.0,
+          "p95": 17.0,
+          "p99": 28.799999999999955,
+          "max": 53
+        },
+        "stall_fraction": {
+          "count": 612,
+          "mean": 0.04980379232236895,
+          "p50": 0.0,
+          "p90": 0.21847452690300734,
+          "p95": 0.4422092943464578,
+          "p99": 0.6162596697185383,
+          "max": 0.9387056901479274
+        },
+        "completion_latency": {
+          "count": 721,
+          "mean": 254.89653776382096,
+          "p50": 265.60426016151905,
+          "p90": 334.8047699853778,
+          "p95": 350.79117193538696,
+          "p99": 368.28925312105565,
+          "max": 379.35366874281317
+        },
+        "demand_duration": {
+          "count": 612,
+          "mean": 105.0223325731878,
+          "p50": 76.85999999986961,
+          "p90": 239.8480000035837,
+          "p95": 274.5679999987593,
+          "p99": 353.1024000019391,
+          "max": 457.2399999992922
+        }
+      }
+    },
+    "workload": {
+      "baseline": {
+        "num_prompt_tokens": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_output_tokens": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_chunks": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_requests_total": 0,
+        "num_requests_completed": 0,
+        "num_requests_timeout": 0,
+        "num_chunks_total": 0,
+        "tokens_per_second": 0.0
+      },
+      "sslo": {
+        "num_prompt_tokens": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_output_tokens": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_chunks": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_requests_total": 0,
+        "num_requests_completed": 0,
+        "num_requests_timeout": 0,
+        "num_chunks_total": 0,
+        "tokens_per_second": 0.0
+      },
+      "sslo_offload": {
+        "num_prompt_tokens": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_output_tokens": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_chunks": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_requests_total": 0,
+        "num_requests_completed": 0,
+        "num_requests_timeout": 0,
+        "num_chunks_total": 0,
+        "tokens_per_second": 0.0
+      },
+      "sslo_adaptive": {
+        "num_prompt_tokens": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_output_tokens": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_chunks": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_requests_total": 0,
+        "num_requests_completed": 0,
+        "num_requests_timeout": 0,
+        "num_chunks_total": 0,
+        "tokens_per_second": 0.0
+      },
+      "sslo_adaptive_offload": {
+        "num_prompt_tokens": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_output_tokens": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_chunks": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_requests_total": 0,
+        "num_requests_completed": 0,
+        "num_requests_timeout": 0,
+        "num_chunks_total": 0,
+        "tokens_per_second": 0.0
+      },
+      "sslo_mlp": {
+        "num_prompt_tokens": {
+          "count": 721,
+          "mean": 130.52704576976421,
+          "p50": 27.0,
+          "p90": 276.0,
+          "p95": 485.0,
+          "p99": 1700.7999999999981,
+          "max": 5455.0
+        },
+        "num_output_tokens": {
+          "count": 721,
+          "mean": 638.2690707350902,
+          "p50": 549.0,
+          "p90": 1519.0,
+          "p95": 1764.0,
+          "p99": 2048.0,
+          "max": 2048.0
+        },
+        "num_chunks": {
+          "count": 721,
+          "mean": 22.589459084604716,
+          "p50": 18.0,
+          "p90": 52.0,
+          "p95": 62.0,
+          "p99": 84.0,
+          "max": 94.0
+        },
+        "num_requests_total": 721,
+        "num_requests_completed": 721,
+        "num_requests_timeout": 0,
+        "num_chunks_total": 16287,
+        "tokens_per_second": 2556.6222222222223
+      }
+    },
+    "throughput": {
+      "baseline": {
+        "count": 0,
+        "duration_s": 180.0,
+        "tokens_per_second": 0.0,
+        "completed_req_per_s": 0.0,
+        "basis": "first_completion_window"
+      },
+      "sslo": {
+        "count": 0,
+        "duration_s": 180.0,
+        "tokens_per_second": 0.0,
+        "completed_req_per_s": 0.0,
+        "basis": "first_completion_window"
+      },
+      "sslo_offload": {
+        "count": 0,
+        "duration_s": 180.0,
+        "tokens_per_second": 0.0,
+        "completed_req_per_s": 0.0,
+        "basis": "first_completion_window"
+      },
+      "sslo_adaptive": {
+        "count": 0,
+        "duration_s": 180.0,
+        "tokens_per_second": 0.0,
+        "completed_req_per_s": 0.0,
+        "basis": "first_completion_window"
+      },
+      "sslo_adaptive_offload": {
+        "count": 0,
+        "duration_s": 180.0,
+        "tokens_per_second": 0.0,
+        "completed_req_per_s": 0.0,
+        "basis": "first_completion_window"
+      },
+      "sslo_mlp": {
+        "count": 721,
+        "duration_s": 180.0,
+        "tokens_per_second": 2556.6222222222223,
+        "completed_req_per_s": 4.0055555555555555,
+        "basis": "first_completion_window"
+      }
+    },
+    "cp_slo_violation": {
+      "baseline": {
+        "tau_0.5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_1": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_2": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        }
+      },
+      "sslo": {
+        "tau_0.5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_1": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_2": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        }
+      },
+      "sslo_offload": {
+        "tau_0.5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_1": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_2": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        }
+      },
+      "sslo_adaptive": {
+        "tau_0.5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_1": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_2": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        }
+      },
+      "sslo_adaptive_offload": {
+        "tau_0.5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_1": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_2": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        },
+        "tau_5": {
+          "rate": null,
+          "violated": 0,
+          "total": 0
+        }
+      },
+      "sslo_mlp": {
+        "tau_0.5": {
+          "rate": 0.13314840499306518,
+          "violated": 96,
+          "total": 721
+        },
+        "tau_1": {
+          "rate": 0.11095700416088766,
+          "violated": 80,
+          "total": 721
+        },
+        "tau_2": {
+          "rate": 0.0319001386962552,
+          "violated": 23,
+          "total": 721
+        },
+        "tau_5": {
+          "rate": 0.0,
+          "violated": 0,
+          "total": 721
+        }
+      }
+    },
+    "measurement_window": {
+      "baseline": {
+        "start_ts": 1779351740.5202503,
+        "end_ts": 1779351920.5202503,
+        "duration_s": 180.0
+      },
+      "sslo": {
+        "start_ts": 1779351740.5202503,
+        "end_ts": 1779351920.5202503,
+        "duration_s": 180.0
+      },
+      "sslo_offload": {
+        "start_ts": 1779351740.5202503,
+        "end_ts": 1779351920.5202503,
+        "duration_s": 180.0
+      },
+      "sslo_adaptive": {
+        "start_ts": 1779351740.5202503,
+        "end_ts": 1779351920.5202503,
+        "duration_s": 180.0
+      },
+      "sslo_adaptive_offload": {
+        "start_ts": 1779351740.5202503,
+        "end_ts": 1779351920.5202503,
+        "duration_s": 180.0
+      },
+      "sslo_mlp": {
+        "start_ts": 1779351740.5202503,
+        "end_ts": 1779351920.5202503,
+        "duration_s": 180.0
+      }
+    },
+    "handling_users": {
+      "baseline": {
+        "count": 0,
+        "time_avg": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo": {
+        "count": 0,
+        "time_avg": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_offload": {
+        "count": 0,
+        "time_avg": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive": {
+        "count": 0,
+        "time_avg": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_adaptive_offload": {
+        "count": 0,
+        "time_avg": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "sslo_mlp": {
+        "count": 0,
+        "time_avg": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      }
+    },
+    "cpslo": {
+      "baseline": {
+        "max_stall_interval_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_stall_intervals_merged_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "cp_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_1": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_2": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          }
+        },
+        "mean_handling_users_time_weighted": null,
+        "queue_stall_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "pending_time_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo": {
+        "max_stall_interval_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_stall_intervals_merged_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "cp_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_1": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_2": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          }
+        },
+        "mean_handling_users_time_weighted": null,
+        "queue_stall_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "pending_time_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_offload": {
+        "max_stall_interval_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_stall_intervals_merged_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "cp_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_1": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_2": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          }
+        },
+        "mean_handling_users_time_weighted": null,
+        "queue_stall_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "pending_time_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_adaptive": {
+        "max_stall_interval_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_stall_intervals_merged_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "cp_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_1": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_2": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          }
+        },
+        "mean_handling_users_time_weighted": null,
+        "queue_stall_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "pending_time_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_adaptive_offload": {
+        "max_stall_interval_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "num_stall_intervals_merged_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "cp_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_1": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_2": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          },
+          "tau_5": {
+            "rate": null,
+            "violated": 0,
+            "total": 0
+          }
+        },
+        "mean_handling_users_time_weighted": null,
+        "queue_stall_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "pending_time_distribution": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p90": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "sslo_mlp": {
+        "max_stall_interval_distribution": {
+          "count": 721,
+          "mean": 0.2202042846316562,
+          "p50": 0.0,
+          "p90": 1.1486530136317015,
+          "p95": 1.7878366811200976,
+          "p99": 2.4738726083189246,
+          "max": 4.095410220324993
+        },
+        "num_stall_intervals_merged_distribution": {
+          "count": 721,
+          "mean": 1.8294036061026353,
+          "p50": 0.0,
+          "p90": 3.0,
+          "p95": 17.0,
+          "p99": 28.799999999999955,
+          "max": 53
+        },
+        "cp_slo_violation_rates_by_tau": {
+          "tau_0.5": {
+            "rate": 0.13314840499306518,
+            "violated": 96,
+            "total": 721
+          },
+          "tau_1": {
+            "rate": 0.11095700416088766,
+            "violated": 80,
+            "total": 721
+          },
+          "tau_2": {
+            "rate": 0.0319001386962552,
+            "violated": 23,
+            "total": 721
+          },
+          "tau_5": {
+            "rate": 0.0,
+            "violated": 0,
+            "total": 721
+          }
+        },
+        "mean_handling_users_time_weighted": null,
+        "queue_stall_distribution": {
+          "count": 721,
+          "mean": 224.5132257663419,
+          "p50": 224.0250726956874,
+          "p90": 293.2046427009627,
+          "p95": 298.780096065253,
+          "p99": 312.6956904394552,
+          "max": 314.95257114898413
+        },
+        "pending_time_distribution": {
+          "count": 721,
+          "mean": 2.0928263615625657,
+          "p50": 0.13329338934272528,
+          "p90": 0.8530812580138445,
+          "p95": 17.799802152439952,
+          "p99": 37.57209642995147,
+          "max": 43.97231773752719
+        }
+      }
+    }
+  },
+  "queue_stall_available": true,
+  "scheduler_saturation": {},
+  "passes": {
+    "pending_used": {
+      "sslo": false,
+      "sslo_offload": false,
+      "sslo_adaptive": false,
+      "sslo_adaptive_offload": false,
+      "sslo_mlp": true
+    },
+    "ttft_not_worse": {
+      "sslo": false,
+      "sslo_offload": false,
+      "sslo_adaptive": false,
+      "sslo_adaptive_offload": false,
+      "sslo_mlp": false
+    },
+    "neg_slack_not_worse": {
+      "sslo": false,
+      "sslo_offload": false,
+      "sslo_adaptive": false,
+      "sslo_adaptive_offload": false,
+      "sslo_mlp": false
+    }
+  },
+  "run_meta": {
+    "run_id": "sslo_mlp_256_4.0_43_1779351595",
+    "policy": "sslo_mlp",
+    "variant": "sslo_mlp/abatch=off",
+    "seed": 43,
+    "trace_id": "poisson_rate4.0_seed43",
+    "workload_id": "wildchat2k_lmsys2k",
+    "N": 1324,
+    "M": 256,
+    "measurement_window_start_ts": 1779351740.5202503,
+    "measurement_window_end_ts": 1779351920.5202503,
+    "measurement_window_seconds": 180.0,
+    "pool_size": 4000,
+    "pool_source": "wildchat2k_lmsys2k",
+    "sampling_seed": 43,
+    "pool_pass_count": 0,
+    "injected_count": 1324,
+    "in_window_count": 721,
+    "gpu_memory_peak_bytes": 0,
+    "num_preemptions_total": 0,
+    "num_requests_completed": 1324,
+    "num_requests_total": 1324
+  },
+  "pool_size": 4000,
+  "injected_count": 1324,
+  "in_window_count": 721,
+  "out_of_window_count": 603,
+  "measurement_window_seconds": 180.0,
+  "validity": {
+    "validity_pass": false,
+    "no_harm_pass": true,
+    "invalid_reason": [
+      "queue_stall_p99_too_high:sslo_mlp=312.70s",
+      "pending_time_p99_too_high:sslo_mlp=37.57s"
+    ]
+  }
+}
