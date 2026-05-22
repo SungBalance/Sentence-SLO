@@ -723,7 +723,12 @@ _SUMMARY_CSV_HEADER = [
     # window / counts
     "num_requests_in_measurement_window", "num_arrivals_total",
     # throughput / urgent-mode share
-    "tokens_per_second", "urgent_mode_fraction_pct",
+    # `tokens_per_second` is output-only (legacy alias for
+    # output_tokens_per_second). total_tokens_per_second includes
+    # prompt tokens.
+    "tokens_per_second", "output_tokens_per_second",
+    "input_tokens_per_second", "total_tokens_per_second",
+    "urgent_mode_fraction_pct",
     # queue occupancy (time-weighted means from scheduler_stats)
     "mean_running", "mean_pending", "mean_waiting", "mean_handling_users",
     # per-request latencies — q stall / pending / completion
@@ -839,6 +844,9 @@ def _summary_row(
         str(summary.get("in_window_count") or 0),
         str(summary.get("injected_count") or 0),
         _fmt(tp.get("tokens_per_second"), 2),
+        _fmt(tp.get("output_tokens_per_second"), 2),
+        _fmt(tp.get("input_tokens_per_second"), 2),
+        _fmt(tp.get("total_tokens_per_second"), 2),
         _fmt((sched.get("urgent_mode_fraction") or 0) * 100, 4),
         _fmt(sched.get("mean_running_time_weighted"), 4),
         _fmt(sched.get("mean_pending_time_weighted"), 4),

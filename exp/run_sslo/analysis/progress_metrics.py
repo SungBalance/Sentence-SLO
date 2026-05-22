@@ -264,10 +264,15 @@ def throughput_stats(
         return {"count": 0, "duration_s": duration, "tokens_per_second": None,
                 "completed_req_per_s": None, "basis": "first_completion_window"}
 
-    tokens = sum(
+    tokens_out = sum(
         int(p["num_output_tokens"])
         for p in per_req_progress
         if p.get("num_output_tokens") is not None
+    )
+    tokens_in = sum(
+        int(p["num_prompt_tokens"])
+        for p in per_req_progress
+        if p.get("num_prompt_tokens") is not None
     )
     count = sum(
         1 for p in per_req_progress
@@ -277,7 +282,11 @@ def throughput_stats(
     return {
         "count": count,
         "duration_s": duration,
-        "tokens_per_second": tokens / duration,
+        # `tokens_per_second` (output-only) kept for backward compat.
+        "tokens_per_second": tokens_out / duration,
+        "output_tokens_per_second": tokens_out / duration,
+        "input_tokens_per_second": tokens_in / duration,
+        "total_tokens_per_second": (tokens_in + tokens_out) / duration,
         "completed_req_per_s": count / duration,
         "basis": "first_completion_window",
     }
