@@ -1,5 +1,21 @@
 # Work Log
 
+## 2026-05-22 (session 3)
+
+- Modified: `exp/run_sslo/run_test.py` — switched measurement window from time-based (`MEASUREMENT_WINDOW_S=180s` fixed) to **completion-gated** workflow per user request:
+  - Pool size 4000 → **4096** (wildchat2048+lmsys2048).
+  - `warmup_target = max_num_seqs * 2`, `measurement_target = max_num_seqs * 4`.
+  - Window timestamps written INLINE by the gate-flipping task (race-free; capturing in watcher after `await event.wait()` would race with other completions in between and produce a near-zero window).
+  - Records both wall (`time.time()`) and monotonic (`time.monotonic()`) bounds. Wall for request `in_window` (vs `completion_wall_ts`), monotonic for scheduler_stats trim (matches vLLM's stat clock).
+  - `in_window = completed in [window_start, window_end]` (per user spec "측정 시작 이후 완료된 request 수집"). New field `completion_wall_ts` on each request row.
+  - No cooldown: on measurement_done_event, `engine.abort(in_flight_ids)` + `task.cancel()` + `asyncio.gather(return_exceptions=True)`.
+  - `chunks.jsonl` filtered to in_window reqs (no warmup/post-window partials).
+  - `scheduler_stats.jsonl` post-trimmed in-place to monotonic-window bounds.
+  - Warmup + measurement safety timeouts (= `MEASUREMENT_WINDOW_S`, now default 900s) prevent hang if throughput too low.
+- Modified: `exp/run_sslo/analyze.py` — request filter prefers per-row `in_window` flag when present (new flow), falls back to `injection_ts ∈ [mw0, mw1)` for legacy runs. Scheduler-stats filter uses `measurement_window_start_mono_ts` when present.
+- Modified: `exp/run_sslo/run_test.sh` — `NUM_PROMPTS` default 4000 → 4096, `MEASUREMENT_WINDOW_S` 180 → 900 (now repurposed as safety timeout).
+- Verification: Smoke 9B cap=128 rate=8 sslo_mlp — `in_window=513` (target 512, +1 boundary task), `measurement_completed=514`, window=86.3s, no `engine.abort` errors. Race-free window timestamp recording confirmed by window matching the gate semantics (vs prior buggy 0).
+
 ## 2026-05-22 (session 2)
 
 - Modified: `exp/tools/lm_datasets.py` — added `_max_response_chunk_chars()` helper that runs SSLO's `ChunkSeparator` (sentence mode, `min_chunk_tokens=0`) on a response and returns the longest chunk length. Added `max_response_chunk_chars: int | None` parameter to `load_prompts`, `_load_wildchat`, `_load_lmsys`, `_load_combine`. Filter drops rows whose first assistant response would produce a chunk longer than the threshold under runtime SSLO boundary rules.

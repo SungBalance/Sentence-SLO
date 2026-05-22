@@ -227,10 +227,18 @@ def _filter_by_window(
     mw0: float,
     mw1: float,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Keep only requests injected within [mw0, mw1) and their chunks."""
-    kept_req = [r for r in req_rows
-                if r.get("injection_ts") is not None
-                and mw0 <= float(r["injection_ts"]) < mw1]
+    """Keep only requests in the measurement window and their chunks.
+
+    Prefers the per-row `in_window` flag (set by run_test.py from the
+    completion timestamp under the new completion-gated workflow). Falls
+    back to injection_ts ∈ [mw0, mw1) for runs that predate the flag."""
+    has_flag = any("in_window" in r for r in req_rows)
+    if has_flag:
+        kept_req = [r for r in req_rows if r.get("in_window")]
+    else:
+        kept_req = [r for r in req_rows
+                    if r.get("injection_ts") is not None
+                    and mw0 <= float(r["injection_ts"]) < mw1]
     kept_ids = {str(r["request_id"]) for r in kept_req if r.get("request_id") is not None}
     kept_chunks = [c for c in chunk_rows
                    if str(c.get("request_id", "")) in kept_ids]
@@ -276,6 +284,16 @@ def analyze(
         )
     mw0 = float(mw0)
     mw1 = float(mw1)
+    # scheduler_stats.jsonl uses time.monotonic(); request fields use
+    # time.time(). Read mono-clock window bounds if the run wrote them
+    # (new flow), else fall back to wall-clock bounds (legacy runs —
+    # filter then drops everything, matching prior behavior).
+    mw0_mono = run_meta.get("measurement_window_start_mono_ts")
+    mw1_mono = run_meta.get("measurement_window_end_mono_ts")
+    if mw0_mono is not None and mw1_mono is not None:
+        sched_mw0, sched_mw1 = float(mw0_mono), float(mw1_mono)
+    else:
+        sched_mw0, sched_mw1 = mw0, mw1
 
     request_rows_mode = read_jsonl(output_dir / "requests.jsonl")
     chunk_rows_mode = read_jsonl(output_dir / "chunks.jsonl")
@@ -285,10 +303,11 @@ def analyze(
     for row in sched_rows_mode:
         row.setdefault("mode", mode)
 
-    # Filter scheduler_stats to measurement window.
+    # Filter scheduler_stats to measurement window (monotonic clock).
     sched_rows_mode = [
         r for r in sched_rows_mode
-        if r.get("ts") is not None and mw0 <= float(r["ts"]) < mw1
+        if r.get("ts") is not None
+        and sched_mw0 <= float(r["ts"]) < sched_mw1
     ]
 
     sslo_config_by_mode: dict[str, dict[str, Any]] = {}

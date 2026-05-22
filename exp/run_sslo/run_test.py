@@ -160,7 +160,7 @@ def load_workload(
 
 
 def _build_pool(args: argparse.Namespace) -> list[str]:
-    """Build the 4000-prompt sampling pool: wildchat 2000 + lmsys 2000."""
+    """Build the 4096-prompt sampling pool: wildchat 2048 + lmsys 2048."""
     max_resp = args.max_response_chunk_chars or None
     wildchat_raw = _load_wildchat(
         split="train", num_prompts=2500,
@@ -172,15 +172,15 @@ def _build_pool(args: argparse.Namespace) -> list[str]:
         exclude_code=True, conversation_only=True,
         english_only=args.english_only,
         max_response_chunk_chars=max_resp)
-    wildchat_trimmed = wildchat_raw[:2000]
-    lmsys_trimmed = lmsys_raw[:2000]
+    wildchat_trimmed = wildchat_raw[:2048]
+    lmsys_trimmed = lmsys_raw[:2048]
     combined = wildchat_trimmed + lmsys_trimmed
     rng = _random.Random(args.dataset_seed)
     rng.shuffle(combined)
     if args.apply_chat_template:
         combined = apply_chat_template_to_prompts(
             combined, args.model, enable_thinking=args.enable_thinking)
-    assert len(combined) == 4000, f"Expected 4000 prompts, got {len(combined)}"
+    assert len(combined) == 4096, f"Expected 4096 prompts, got {len(combined)}"
     return combined
 
 
@@ -276,19 +276,29 @@ async def collect_one(
     warmup_event: asyncio.Event,
     warmup_counter: list[int],
     warmup_target: int,
+    measurement_done_event: asyncio.Event,
+    measurement_counter: list[int],
+    measurement_target: int,
+    window_ts_holder: dict[str, float | None],
 ) -> dict[str, Any]:
-    """Stream one request; set warmup_event once warmup_target completions reached."""
+    """Stream one request. Tracks two completion gates:
+      - warmup_event fires when `warmup_target` completions reached
+        (collection window starts)
+      - measurement_done_event fires when `measurement_target` more
+        completions accrue after warmup (collection window ends)."""
     request_id = str(request_idx)
     last_output = None
 
     async for output in engine.generate(prompt, sampling_params, request_id=request_id):
         last_output = output
+    completion_wall_ts = time.time()
 
     if last_output is None:
         return {
             "request_id": request_id,
             "request_idx": request_idx,
             "injection_ts": injection_ts,
+            "completion_wall_ts": completion_wall_ts,
             "injection_idx": request_idx,
             "ttft": None,
             "tpot": None,
@@ -352,12 +362,30 @@ async def collect_one(
         getattr(sslo_metrics, "terminal_outcome", "in_progress") if sslo_metrics else "in_progress"
     )
 
-    # Tally completions and open the warmup gate at the threshold.
+    # Tally completions: open warmup gate, then close measurement gate.
+    # Critical: window_start_ts / window_end_ts are recorded INLINE here
+    # (same task, same callback) — capturing them in the watcher after
+    # an `await event.wait()` would race with other tasks' completions
+    # firing in between, producing a window that's narrower than the
+    # gate semantics imply (in_window_count → near zero).
+    # The boundary task (one that flips warmup_event) is NOT counted in
+    # measurement — `elif` skips it; its completion_wall_ts equals
+    # window_start_ts so in_window comparison is well-defined.
+    completion_mono_ts = time.monotonic()
     if terminal_outcome_val == "completed":
         warmup_counter[0] += 1
         if (warmup_counter[0] >= warmup_target
                 and not warmup_event.is_set()):
+            window_ts_holder["start_ts"] = completion_wall_ts
+            window_ts_holder["start_mono_ts"] = completion_mono_ts
             warmup_event.set()
+        elif warmup_event.is_set():
+            measurement_counter[0] += 1
+            if (measurement_counter[0] >= measurement_target
+                    and not measurement_done_event.is_set()):
+                window_ts_holder["end_ts"] = completion_wall_ts
+                window_ts_holder["end_mono_ts"] = completion_mono_ts
+                measurement_done_event.set()
 
     queue_stall_s = (
         float(admitted_ts_val) - float(queued)
@@ -370,6 +398,7 @@ async def collect_one(
         "request_id": request_id,
         "request_idx": request_idx,
         "injection_ts": injection_ts,
+        "completion_wall_ts": completion_wall_ts,
         "injection_idx": request_idx,
         "num_output_tokens": num_gen,
         "num_prompt_tokens": num_prompt_tokens,
@@ -443,6 +472,8 @@ def write_run_meta(
     *,
     window_start_ts: float | None,
     window_end_ts: float | None,
+    window_start_mono_ts: float | None,
+    window_end_mono_ts: float | None,
     pool_size: int,
     sampling_seed: int,
     pool_pass_count: int,
@@ -460,14 +491,18 @@ def write_run_meta(
         "trace_id": (
             f"poisson_rate{args.request_rate}_seed{args.request_rate_seed}"
         ),
-        "workload_id": "wildchat2k_lmsys2k",
+        "workload_id": "wildchat2048_lmsys2048",
         "N": len(requests_rows),
         "M": args.max_num_seqs,
         "measurement_window_start_ts": window_start_ts,
         "measurement_window_end_ts": window_end_ts,
+        # Monotonic-clock counterparts so downstream code can match the
+        # clock used by scheduler_stats.jsonl / chunks slo_chunk_records.
+        "measurement_window_start_mono_ts": window_start_mono_ts,
+        "measurement_window_end_mono_ts": window_end_mono_ts,
         "measurement_window_seconds": args.measurement_window_s,
         "pool_size": pool_size,
-        "pool_source": "wildchat2k_lmsys2k",
+        "pool_source": "wildchat2048_lmsys2048",
         "sampling_seed": sampling_seed,
         "pool_pass_count": pool_pass_count,
         "injected_count": injected_count,
@@ -492,7 +527,7 @@ async def run_one(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pool = _build_pool(args)
-    print(f"{args.run_kind}: built pool of {len(pool)} prompts (wildchat2k+lmsys2k)")
+    print(f"{args.run_kind}: built pool of {len(pool)} prompts (wildchat2048+lmsys2048)")
 
     # Build sslo_params. Both baseline and sslo modes run through
     # schedule_sslo() so chunk records / scheduler_stats / tpot EMA are
@@ -603,22 +638,55 @@ async def run_one(args: argparse.Namespace) -> None:
         return p
 
     warmup_event = asyncio.Event()
+    measurement_done_event = asyncio.Event()
     warmup_counter: list[int] = [0]
-    warmup_target = args.max_num_seqs
-    window_start_ts: float | None = None
-    window_end_ts: float | None = None
+    measurement_counter: list[int] = [0]
+    warmup_target = args.max_num_seqs * 2
+    measurement_target = args.max_num_seqs * 4
+    max_total_requests = len(pool)
+    safety_timeout_s = float(args.measurement_window_s)  # kill-switch
+    # Window timestamps are written inline by the gate-flipping task in
+    # collect_one (see comment there) and read here after the watcher
+    # observes the events. Two clocks for downstream consumers:
+    #   *_ts        — time.time()       wall clock (request side)
+    #   *_mono_ts   — time.monotonic()  scheduler_stats / chunk ts side
+    window_ts_holder: dict[str, float | None] = {
+        "start_ts": None, "start_mono_ts": None,
+        "end_ts": None, "end_mono_ts": None,
+    }
     injected: list[tuple[int, asyncio.Task, float]] = []
     injection_seq = 0
 
     async def watcher() -> None:
-        nonlocal window_start_ts, window_end_ts
-        await warmup_event.wait()
-        window_start_ts = time.time()
-        window_end_ts = window_start_ts + args.measurement_window_s
+        try:
+            # Warmup safety: if throughput is too low to reach
+            # warmup_target completions in safety_timeout_s, bail out
+            # rather than hang forever. Setting both events here means
+            # the run still progresses to shutdown with no window
+            # (in_window_count=0) instead of deadlocking.
+            await asyncio.wait_for(
+                warmup_event.wait(), timeout=safety_timeout_s)
+        except asyncio.TimeoutError:
+            warmup_event.set()
+            measurement_done_event.set()
+            return
+        try:
+            await asyncio.wait_for(
+                measurement_done_event.wait(),
+                timeout=safety_timeout_s)
+        except asyncio.TimeoutError:
+            # Force-finalize window even if measurement_target wasn't
+            # reached — collect_one only writes end_ts on the natural
+            # path.
+            if window_ts_holder["end_ts"] is None:
+                window_ts_holder["end_ts"] = time.time()
+                window_ts_holder["end_mono_ts"] = time.monotonic()
+            measurement_done_event.set()
 
     async def injector() -> None:
         nonlocal injection_seq
-        while window_end_ts is None or time.time() < window_end_ts:
+        while (injection_seq < max_total_requests
+               and not measurement_done_event.is_set()):
             inj_ts = time.time()
             idx = injection_seq
             injection_seq += 1
@@ -626,7 +694,9 @@ async def run_one(args: argparse.Namespace) -> None:
             task = asyncio.create_task(collect_one(
                 engine, idx, prompt,
                 _per_req_sampling_params(idx),
-                inj_ts, warmup_event, warmup_counter, warmup_target))
+                inj_ts, warmup_event, warmup_counter, warmup_target,
+                measurement_done_event, measurement_counter,
+                measurement_target, window_ts_holder))
             injected.append((idx, task, inj_ts))
             await asyncio.sleep(rng.expovariate(args.request_rate))
 
@@ -634,16 +704,45 @@ async def run_one(args: argparse.Namespace) -> None:
         run_started_ts = time.time()
         t0 = time.monotonic()
         await asyncio.gather(watcher(), injector())
-        rows = list(await asyncio.gather(*[t for _, t, _ in injected]))
+        # No cooldown — abort all still-in-flight requests at the engine
+        # level (releases engine_core resources and unblocks any waiting
+        # async generators), then cancel local asyncio tasks. Tolerate
+        # API differences across vLLM versions via broad except.
+        in_flight_ids = [
+            str(idx) for idx, task, _ in injected if not task.done()
+        ]
+        if in_flight_ids:
+            try:
+                await engine.abort(in_flight_ids)
+            except Exception as e:  # noqa: BLE001
+                print(f"{args.run_kind}: engine.abort failed: "
+                      f"{type(e).__name__}: {e}")
+        for _, task, _ in injected:
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(
+            *[t for _, t, _ in injected], return_exceptions=True)
+        rows = [r for r in results if isinstance(r, dict)]
         elapsed = time.monotonic() - t0
         run_ended_ts = time.time()
 
-        # Compute in_window for each row now that window bounds are known.
+        window_start_ts = window_ts_holder["start_ts"]
+        window_end_ts = window_ts_holder["end_ts"]
+        window_start_mono_ts = window_ts_holder["start_mono_ts"]
+        window_end_mono_ts = window_ts_holder["end_mono_ts"]
+
+        # in_window = request COMPLETED inside [window_start, window_end].
+        # Uses completion_wall_ts (time.time() at the moment the async
+        # generator finished) so it shares the clock with window bounds.
+        # Chunk record timestamps use time.monotonic() — DON'T compare
+        # them to window bounds directly.
         for row in rows:
-            inj_ts = row.get("injection_ts")
-            if (inj_ts is not None and window_start_ts is not None
-                    and window_end_ts is not None):
-                row["in_window"] = bool(window_start_ts <= inj_ts < window_end_ts)
+            comp_ts = row.get("completion_wall_ts")
+            if (comp_ts is not None and window_start_ts is not None
+                    and window_end_ts is not None
+                    and row.get("terminal_outcome") == "completed"):
+                row["in_window"] = bool(
+                    window_start_ts <= comp_ts <= window_end_ts)
             else:
                 row["in_window"] = False
 
@@ -655,6 +754,12 @@ async def run_one(args: argparse.Namespace) -> None:
             for row in rows
         ]
         write_jsonl(output_dir / "requests.jsonl", request_rows)
+        # chunks.jsonl carries only chunks from in-window (completed in
+        # window) requests so downstream analysis doesn't see warmup or
+        # post-window-end partial chunks.
+        in_window_rids = {
+            str(row["request_id"]) for row in rows if row.get("in_window")
+        }
         chunk_rows = [
             {
                 "mode": args.run_kind,
@@ -663,9 +768,31 @@ async def run_one(args: argparse.Namespace) -> None:
                 **chunk,
             }
             for row in rows
+            if str(row["request_id"]) in in_window_rids
             for chunk in (row.get("slo_chunk_records") or [])
         ]
         write_jsonl(output_dir / "chunks.jsonl", chunk_rows)
+        # Trim scheduler_stats.jsonl to the measurement window.
+        # vLLM stamps each step with time.monotonic() so we must use
+        # the monotonic-clock window bounds, NOT the wall-clock ones.
+        stats_path = output_dir / "scheduler_stats.jsonl"
+        if (stats_path.exists() and window_start_mono_ts is not None
+                and window_end_mono_ts is not None):
+            kept = []
+            with stats_path.open() as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts = r.get("ts")
+                    if ts is None:
+                        continue
+                    if window_start_mono_ts <= ts <= window_end_mono_ts:
+                        kept.append(line)
+            with stats_path.open("w") as f:
+                for line in kept:
+                    f.write(line)
         # Sidecar for analyze.py: SSLO config options (per-mode) to embed in
         # summary.config. Only emitted for sslo* modes; baseline gets {}.
         sslo_config_path = output_dir / "sslo_config.json"
@@ -676,6 +803,8 @@ async def run_one(args: argparse.Namespace) -> None:
             args, output_dir, run_started_ts, run_ended_ts, request_rows,
             window_start_ts=window_start_ts,
             window_end_ts=window_end_ts,
+            window_start_mono_ts=window_start_mono_ts,
+            window_end_mono_ts=window_end_mono_ts,
             pool_size=len(pool),
             sampling_seed=seed,
             pool_pass_count=pool_pass_count,
@@ -691,8 +820,12 @@ async def run_one(args: argparse.Namespace) -> None:
             f"{output_dir / 'chunks.jsonl'}"
         )
         print(
-            f"{args.run_kind}: window={window_start_ts:.1f}..{window_end_ts:.1f} "
-            f"injected={len(rows)} in_window={in_window_count}"
+            f"{args.run_kind}: window="
+            f"{window_start_ts if window_start_ts is None else f'{window_start_ts:.1f}'}.."
+            f"{window_end_ts if window_end_ts is None else f'{window_end_ts:.1f}'} "
+            f"injected={len(rows)} in_window={in_window_count} "
+            f"warmup_completed={warmup_counter[0]} "
+            f"measurement_completed={measurement_counter[0]}"
         )
         prompt_counts = [r["num_prompt_tokens"] for r in rows if r and r.get("num_prompt_tokens") is not None]
         output_counts = [r["num_output_tokens"] for r in rows if r and r.get("num_output_tokens") is not None]
