@@ -57,6 +57,14 @@ def parse_args() -> argparse.Namespace:
              "confuse the sentence boundary detector.",
     )
     parser.add_argument(
+        "--max-response-chunk-chars", type=int, default=0,
+        help="Drop rows whose first assistant response produces a chunk "
+             "longer than this many chars under SSLO's ChunkSeparator "
+             "(sentence mode). Filters out dump-style responses (long "
+             "comma lists, ASCII output, repeated tokens) that lack "
+             "sentence-end punctuation. 0 = disabled.",
+    )
+    parser.add_argument(
         "--dataset-seed", type=int, default=42,
         help="Seed used by the pool builder shuffle.",
     )
@@ -153,14 +161,17 @@ def load_workload(
 
 def _build_pool(args: argparse.Namespace) -> list[str]:
     """Build the 4000-prompt sampling pool: wildchat 2000 + lmsys 2000."""
+    max_resp = args.max_response_chunk_chars or None
     wildchat_raw = _load_wildchat(
         split="train", num_prompts=2500,
         exclude_code=True, conversation_only=True,
-        english_only=args.english_only)
+        english_only=args.english_only,
+        max_response_chunk_chars=max_resp)
     lmsys_raw = _load_lmsys(
         split="train", num_prompts=2500,
         exclude_code=True, conversation_only=True,
-        english_only=args.english_only)
+        english_only=args.english_only,
+        max_response_chunk_chars=max_resp)
     wildchat_trimmed = wildchat_raw[:2000]
     lmsys_trimmed = lmsys_raw[:2000]
     combined = wildchat_trimmed + lmsys_trimmed

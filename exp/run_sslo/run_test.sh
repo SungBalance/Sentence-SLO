@@ -84,6 +84,7 @@ if [[ "${ENGLISH_ONLY:-1}" == "1" ]]; then
 else
   ENGLISH_ONLY_FLAG=""
 fi
+MAX_RESPONSE_CHUNK_CHARS="${MAX_RESPONSE_CHUNK_CHARS:-1000}"
 
 export HF_HOME=/cache
 export HF_HUB_CACHE=/cache/hub
@@ -116,5 +117,6 @@ python3 exp/run_sslo/run_test.py \
   ${EXCLUDE_CODE_FLAG} \
   ${CONVERSATION_ONLY_FLAG} \
   ${ENGLISH_ONLY_FLAG} \
+  --max-response-chunk-chars "${MAX_RESPONSE_CHUNK_CHARS}" \
   ${THINKING_FLAG} \
   ${SAMPLING_ARGS}

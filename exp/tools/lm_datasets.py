@@ -75,6 +75,27 @@ def _is_code_request(prompt: str, response: str | None = None) -> bool:
     return False
 
 
+def _max_response_chunk_chars(response: str) -> int:
+    """Run SSLO's ChunkSeparator on the response and return the longest
+    chunk length (chars). Used to identify dump-style responses (long
+    comma lists, ASCII outputs, repeated tokens) that lack sentence-end
+    punctuation and would produce mega-chunks at SSLO runtime."""
+    # Local import: vllm package is only available inside the SSLO
+    # container. Keeping the import lazy lets non-SSLO callers use the
+    # rest of this module without pulling vllm in.
+    from vllm.sslo.slo_state import ChunkSeparator
+
+    sep = ChunkSeparator(chunk_unit="sentence", min_chunk_tokens=0)
+    mx = 0
+    for chunk in sep.feed(response, num_tokens=max(1, len(response))):
+        if len(chunk) > mx:
+            mx = len(chunk)
+    tail = sep.flush()
+    if tail is not None and len(tail) > mx:
+        mx = len(tail)
+    return mx
+
+
 def load_prompts(
     dataset_name: str,
     *,
@@ -84,6 +105,7 @@ def load_prompts(
     seed: int = 42,
     conversation_only: bool = False,
     english_only: bool = False,
+    max_response_chunk_chars: int | None = None,
 ) -> list[str]:
     """Return a list of clean prompt strings from the named dataset.
 
@@ -104,6 +126,12 @@ def load_prompts(
             field equals exactly "English". WildChat-4.8M and
             LMSYS-Chat-1M both expose this string field. Non-English,
             missing, or "Nolang" rows are dropped.
+        max_response_chunk_chars: If set, drop rows whose first assistant
+            response produces a chunk longer than this many chars under
+            SSLO's ChunkSeparator (sentence mode). Filters out
+            dump-style responses (long comma lists, ASCII output,
+            repeated tokens) that lack sentence-end punctuation and
+            would yield mega-chunks at runtime.
 
     Returns:
         List of cleaned, non-empty prompt strings.
@@ -125,17 +153,20 @@ def load_prompts(
         return _load_wildchat(
             split=resolved_split, num_prompts=num_prompts,
             exclude_code=exclude_code, conversation_only=conversation_only,
-            english_only=english_only)
+            english_only=english_only,
+            max_response_chunk_chars=max_response_chunk_chars)
     if dataset_id == LMSYS_DATASET_ID:
         return _load_lmsys(
             split=resolved_split, num_prompts=num_prompts,
             exclude_code=exclude_code, conversation_only=conversation_only,
-            english_only=english_only)
+            english_only=english_only,
+            max_response_chunk_chars=max_response_chunk_chars)
     if dataset_id == "__combine__":
         return _load_combine(
             num_prompts=num_prompts, exclude_code=exclude_code, seed=seed,
             conversation_only=conversation_only,
-            english_only=english_only)
+            english_only=english_only,
+            max_response_chunk_chars=max_response_chunk_chars)
     raise ValueError(f"No loader implemented for dataset id: {dataset_id}")
 
 
@@ -219,6 +250,7 @@ def _is_conversation(conversation: list[dict]) -> bool:
 def _load_wildchat(
     *, split: str, num_prompts: int | None, exclude_code: bool = False,
     conversation_only: bool = False, english_only: bool = False,
+    max_response_chunk_chars: int | None = None,
 ) -> list[str]:
     from datasets import load_dataset
 
@@ -242,6 +274,10 @@ def _load_wildchat(
             continue
         if exclude_code and _is_code_request(text, first_asst):
             continue
+        if (max_response_chunk_chars is not None and first_asst
+                and _max_response_chunk_chars(first_asst)
+                > max_response_chunk_chars):
+            continue
         prompts.append(text)
     if not prompts:
         raise ValueError(f"{WILDCHAT_DATASET_ID} split={split!r} returned no prompts.")
@@ -251,6 +287,7 @@ def _load_wildchat(
 def _load_lmsys(
     *, split: str, num_prompts: int | None, exclude_code: bool = False,
     conversation_only: bool = False, english_only: bool = False,
+    max_response_chunk_chars: int | None = None,
 ) -> list[str]:
     from datasets import load_dataset
 
@@ -274,6 +311,10 @@ def _load_lmsys(
             continue
         if exclude_code and _is_code_request(text, first_asst):
             continue
+        if (max_response_chunk_chars is not None and first_asst
+                and _max_response_chunk_chars(first_asst)
+                > max_response_chunk_chars):
+            continue
         prompts.append(text)
     if not prompts:
         raise ValueError(f"{LMSYS_DATASET_ID} split={split!r} returned no prompts.")
@@ -287,6 +328,7 @@ def _load_combine(
     seed: int = 42,
     conversation_only: bool = False,
     english_only: bool = False,
+    max_response_chunk_chars: int | None = None,
 ) -> list[str]:
     """Mix prompts from wildchat + lmsys, shuffled by `seed`.
 
@@ -319,7 +361,8 @@ def _load_combine(
                 split=split, num_prompts=over,
                 exclude_code=exclude_code,
                 conversation_only=conversation_only,
-                english_only=english_only)
+                english_only=english_only,
+                max_response_chunk_chars=max_response_chunk_chars)
         except Exception as e:  # noqa: BLE001 — intentional broad catch
             print(f"[combine] {name} skipped: {type(e).__name__}: {e}",
                   file=sys.stderr)
