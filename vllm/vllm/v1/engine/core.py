@@ -624,6 +624,15 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    # SSLO
+    def reset_sslo_state(self) -> dict[str, int]:
+        """Reset SSLO accumulator state on the scheduler. Invoked
+        between request-rate sweeps so each rate starts from a cold
+        predictor."""
+        if not hasattr(self.scheduler, "reset_sslo_state"):
+            return {}
+        return self.scheduler.reset_sslo_state()
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

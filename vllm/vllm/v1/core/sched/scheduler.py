@@ -1139,6 +1139,22 @@ class Scheduler(SchedulerInterface):
         return None
 
     # SSLO
+    def _wall_ema_for_batch(self, n: int) -> float | None:
+        """Wall-step EMA for batch size n (any prefill composition).
+
+        Used by the MLP picker to score sub-base candidates with a
+        latency estimate that includes prefill cost (not the
+        decoding-only tpot_ema). Prefers prefill=0 cell when populated,
+        otherwise averages over all observed (n, prefills) cells.
+        """
+        bucket = self._sslo_step_wall_ema.get(n)
+        if not bucket:
+            return None
+        if 0 in bucket:
+            return bucket[0]
+        return sum(bucket.values()) / len(bucket)
+
+    # SSLO
     def _record_step_for_next_ema(
         self,
         scheduler_output: SchedulerOutput,
@@ -2184,12 +2200,14 @@ class Scheduler(SchedulerInterface):
         base_n = self.max_num_running_reqs
         defer_constraint = self.sslo_config.mlp_defer_constraint
         # Candidate list: base_n plus all sub-base captured sizes with a
-        # populated tpot_ema entry.
+        # populated wall_ema entry. (Switched from decoding-only tpot_ema
+        # to wall_ema so candidate latency reflects real step time
+        # including occasional prefill cost.)
         candidates: list[int] = []
         if base_tpot > 0:
             candidates.append(base_n)
         for n in self._sslo_capture_sizes_below_base:
-            tpot = self.tpot_ema.get(n)
+            tpot = self._wall_ema_for_batch(n)
             if tpot is not None and tpot > 0:
                 candidates.append(n)
         if not candidates:
@@ -2207,7 +2225,7 @@ class Scheduler(SchedulerInterface):
             list[Request], list[Request],
             dict[str, float | None], dict[str, float | None]]] = {}
         for n in candidates:
-            tpot_n = self.tpot_ema.get(n, base_tpot)
+            tpot_n = self._wall_ema_for_batch(n) or base_tpot
             # Pass cap_n=n so the system-scale denominator reflects this
             # candidate's actual serving capacity (admitted/n). Without
             # this, every candidate sees scale=admitted/base_n → cap
@@ -2388,8 +2406,9 @@ class Scheduler(SchedulerInterface):
                 s = serve_pick.get(req.request_id)
                 pressures[req.request_id] = 1.0 if s is None else s
             # Re-compute components at the chosen tpot so the decision
-            # log reflects the actual planning batch.
-            tpot_pick = self.tpot_ema.get(picked_n, base_tpot)
+            # log reflects the actual planning batch. wall_ema-based to
+            # match picker's latency model.
+            tpot_pick = self._wall_ema_for_batch(picked_n) or base_tpot
             components_for_log = {}
             if self.sslo_config.decision_log_mode != "off":
                 _, _, components_for_log = self._compute_serve_defer_pair(
@@ -4287,6 +4306,55 @@ class Scheduler(SchedulerInterface):
 
     def has_finished_requests(self) -> bool:
         return len(self.finished_req_ids) > 0
+
+    # SSLO
+    def reset_sslo_state(self) -> dict[str, int]:
+        """Reset SSLO accumulator state between rate sweeps.
+
+        Caller (exp/run_sslo/run_test.py) invokes this between request
+        rate iterations so the next rate starts from a cold predictor
+        and clean per-batch EMAs (matches a fresh-engine baseline).
+
+        Does NOT touch in-flight requests / KV cache — callers are
+        expected to have aborted all requests and let the scheduler
+        drain before calling this. Returns post-reset state sizes for
+        verification.
+        """
+        if hasattr(self._sslo_global_chunk_len_predictor, "reset"):
+            self._sslo_global_chunk_len_predictor.reset()
+        self._sslo_step_wall_ema.clear()
+        # SSLO: per-batch decode-only TPOT also accumulates across rates
+        # and biases the adaptive-cap picker. Clear so rate N+1 starts
+        # cold like a fresh engine would.
+        self.tpot_ema.clear()
+        self._sslo_prev_step_num_prefills = 0
+        self._sslo_prev_step_batch = None
+        self._sslo_prev_step_decoding_only = False
+        self._sslo_prev_step_start_ts = None
+        self._sslo_pre_step_computed.clear()
+        self._sslo_done_logged.clear()
+        self._sslo_prev_tier.clear()
+        self._sslo_prev_selected.clear()
+        self._sslo_step_idx = 0
+        self._sslo_decision_buffer.clear()
+        # SSLO: per-step transient state — recomputed at top of
+        # _apply_sslo_policy each step, but reset here for cleanliness
+        # so any pre-first-step read sees the fresh initial value.
+        self._sslo_step = SsloStepState(
+            cur_max_num_requests=self.max_num_running_reqs)
+        # Cached log path resolutions — clear so next step re-reads
+        # SSLO_STATS_LOG_PATH env (lets callers swap the dest between
+        # rate sweeps by mutating the env var).
+        self._sslo_log_dir_created = False
+        self._sslo_decision_log_path = None
+        self._sslo_decision_log_dir_created = False
+        return {
+            "predictor_sample_count":
+                int(self._sslo_global_chunk_len_predictor.sample_count),
+            "wall_ema_keys": len(self._sslo_step_wall_ema),
+            "waiting": len(self.waiting),
+            "running": len(self.running),
+        }
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

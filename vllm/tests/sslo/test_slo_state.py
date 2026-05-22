@@ -215,9 +215,9 @@ def test_predictor_knob_validation():
 
 
 def test_predictor_uses_global_when_per_req_below_16_samples():
-    # Global predictor warmed up with many samples (p90=50).
+    # Global predictor warmed up beyond cold-start threshold (p90=50).
     glob = ChunkLengthPredictor(strategy="p90")
-    for v in [50] * 32:
+    for v in [50] * 128:
         glob.update(v)
     assert glob.value == 50.0
 
@@ -238,7 +238,7 @@ def test_predictor_uses_global_when_per_req_below_16_samples():
 
 def test_predictor_switches_to_per_req_at_warmup_threshold():
     glob = ChunkLengthPredictor(strategy="p90")
-    for _ in range(32):
+    for _ in range(128):
         glob.update(50)
     state = RequestSLOState(
         num_warmup_chunks=16,
@@ -252,6 +252,23 @@ def test_predictor_switches_to_per_req_at_warmup_threshold():
         state._chunk_len_predictor.update(10)
     # sample_count == num_warmup_chunks → use per-req (p90=10).
     assert state.expected_remaining_len() == pytest.approx(10.0)
+
+
+def test_cold_start_returns_max_remaining_when_global_under_threshold():
+    # Fresh global predictor (sample_count = 0 < default 128) → cold
+    # start fallback returns cold_start_max_remaining_tokens - cur.
+    glob = ChunkLengthPredictor(strategy="p90")
+    state = RequestSLOState(
+        num_warmup_chunks=16,
+        global_chunk_len_predictor=glob,
+        cold_start_max_remaining_tokens=2048,
+        global_warmup_predictor_samples=128,
+    )
+    state.decoding_start_ts = 0.0
+    state.next_deadline_ts = 100.0
+    state.chunks_completed = 1
+    state.current_chunk_generated_len = 32
+    assert state.expected_remaining_len() == pytest.approx(2048 - 32)
 
 
 def test_on_chunk_boundary_updates_global_predictor():

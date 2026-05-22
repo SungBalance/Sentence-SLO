@@ -175,6 +175,17 @@ class ChunkLengthPredictor:
     def update_past_future(self, generated_len: int) -> None:
         pass
 
+    def reset(self) -> None:
+        """Clear all accumulated state. Used between request-rate sweeps
+        within a single engine lifetime so each rate run starts from a
+        cold predictor (matches a fresh-engine baseline)."""
+        self._history.clear()
+        self._ema = None
+        self.value = None
+        self.value_mid = None
+        self.value_high = None
+        self._sample_count = 0
+
 
 class ChunkConsumeEstimator:
     """Estimate the consumption (audio playback) duration of a chunk.
@@ -496,6 +507,9 @@ class RequestSLOState:
     # No longer gates phase transitions — phase=MEASURED triggers as soon
     # as chunks_completed >= 1.
     num_warmup_chunks: int = 16
+    # SSLO: cold-start (global predictor < threshold) fallback knobs.
+    global_warmup_predictor_samples: int = 128
+    cold_start_max_remaining_tokens: int = 2048
     seconds_per_word: InitVar[float] = 0.28
     chunk_unit: InitVar[str] = "sentence"
     chunk_len_strategy: InitVar[str] = _DEFAULT_CHUNK_LEN_STRATEGY
@@ -553,6 +567,10 @@ class RequestSLOState:
         return cls(
             seconds_per_word=config.seconds_per_word,
             num_warmup_chunks=config.num_warmup_chunks,
+            global_warmup_predictor_samples=(
+                config.global_warmup_predictor_samples),
+            cold_start_max_remaining_tokens=(
+                config.cold_start_max_remaining_tokens),
             chunk_unit=config.chunk_unit,
             chunk_len_strategy=config.chunk_len_strategy,
             min_chunk_tokens=config.min_chunk_tokens,
@@ -616,6 +634,17 @@ class RequestSLOState:
         # samples. Hard switch (not blended) per user spec.
         per = self._chunk_len_predictor
         glob = self._global_chunk_len_predictor
+        # SSLO: while the shared global predictor itself is cold
+        # (sample_count < global_warmup_predictor_samples), assume the
+        # worst case for remaining-chunk length (max generation length
+        # minus what's already produced in this chunk). Saturates
+        # pressure high so SSLO admission throttles aggressively on the
+        # first chunks where the global predictor has no signal yet.
+        cur = self.current_chunk_generated_len
+        if (glob is not None and glob.sample_count
+                < self.global_warmup_predictor_samples):
+            return max(
+                1.0, self.cold_start_max_remaining_tokens - cur)
         if (glob is not None and glob.value is not None
                 and per.sample_count < self.num_warmup_chunks):
             pred = glob
@@ -623,7 +652,6 @@ class RequestSLOState:
             pred = per
         if pred.value is None:
             return None
-        cur = self.current_chunk_generated_len
         thr = pred.escalate_threshold
         if cur < pred.value * thr:
             return max(1.0, pred.value - cur)

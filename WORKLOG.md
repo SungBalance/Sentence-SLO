@@ -1,5 +1,20 @@
 # Work Log
 
+## 2026-05-23
+
+- Modified: `vllm/vllm/sslo/slo_state.py` — added `ChunkLengthPredictor.reset()` used between rate sweeps.
+- Modified: `vllm/vllm/v1/core/sched/scheduler.py` — added `Scheduler.reset_sslo_state()` clearing predictor, `_sslo_step_wall_ema`, `tpot_ema`, per-step trackers, decision buffer, log-path caches. Returns post-reset state sizes.
+- Modified: `vllm/vllm/v1/engine/{core,core_client,async_llm}.py` — `reset_sslo_state` RPC plumbing (mirrors `reset_prefix_cache` pattern via `call_utility_async`).
+- Modified: `exp/run_sslo/run_test.py` — major refactor: rate sweep on a single shared engine.
+  - `--request-rates "0.5 1 2 4 8 12 16 20"` and `--repeat` flags.
+  - `run_one()` initialises engine once, then loops `_run_one_rate(...)` per rate. Between rates: `engine.abort(in_flight)` + task cancel + 1 s grace + `engine.reset_sslo_state()` with 5-retry polling.
+  - Output `OUTPUT_DIR/rate_<r>/...` per rate. Engine-wide scheduler stats post-trimmed per rate's monotonic-clock window.
+  - Per-rate `analyze.py` subprocess + fcntl-locked append to per-model `summary.csv` (`--summary-csv`). 56-column schema with clarified violation names.
+- Modified: `exp/run_sslo/run_test.sh` — `REQUEST_RATES`, `REPEAT`, `SUMMARY_CSV` env vars. Removed `MEASUREMENT_WINDOW_S` safety timeout.
+- Modified: `exp/run_sslo/analyze.py` — robust mode detection (walks `output_dir.parents` for any `ALL_MODES` ancestor). Added time-weighted `mean_{running,pending,waiting,handling_users}` + `urgent_mode_fraction` to `metrics.scheduler[mode]`. Added `total_pending_time_s`/`num_pending_intervals`/`chunk_consume_time_s` distributions. Scheduler-stats filter uses `measurement_window_start_mono_ts`.
+- Added: `exp/run_sslo/run_v15_grid.sh` — 9B grid launcher. caps `{16,32,64,128}` × 8 rates × `{baseline,sslo_mlp}` × 3 repeats, outer-most repeat loop, 4 GPUs round-robin.
+- Verification: Full 9B grid completed in ~4-5 h (4 GPUs). `Qwen3.5-9B/summary.csv` = 1 header + 192 rows. Per-rate `reset_sslo_state -> {predictor=0, wall_ema=0, waiting=0, running=0}` confirms clean state cleanup.
+
 ## 2026-05-22 (session 3)
 
 - Modified: `exp/run_sslo/run_test.py` — switched measurement window from time-based (`MEASUREMENT_WINDOW_S=180s` fixed) to **completion-gated** workflow per user request:
@@ -669,3 +684,21 @@ Backfill loop이 86.2% step에서 진입했지만 그 중 **48.2%가 promoted=0*
 DATASET_NAME=combine DATASET_SEED=42 EXCLUDE_CODE=1 \
   bash exp/run_sslo/run_test.sh sslo_mlp 128 Qwen/Qwen3.5-35B-A3B
 ```
+
+## 2026-05-22 (documentation)
+
+- Added: `sslo_multi_level_pressure_algorithm.md` — saved a Korean paper-style Markdown description of the SSLO `multi_level_pressure` scheduling algorithm, including pressure math, critical/non-critical branches, partitioning, adaptive cap selection, and post-policy scheduling.
+- Verification: Documentation-only change; no code or tests run.
+
+## 2026-05-22 (plots_new synthetic figures)
+
+- Added: `plots_new/` Chapter 5 synthetic figure package with `paper_plot_style.py` as the single source of visual style, seven Figure 5.1-5.7 plotting entrypoints, shared `synthetic_figures.py`, `generate_all.py`, and README usage notes.
+- Added: Generated synthetic PNG/PDF outputs under `plots_new/figures/synthetic/` and matching CSV data files under `plots_new/figures/synthetic/data/`.
+- Modified content: Implemented the requested ProgressServe synthetic figure semantics: policy color/line encoding, synthetic caption marker, CU-SLO trace reconstruction, stall-capacity frontier, operating map, refill-risk diagnostic, paired no-harm diagnostic, and sensitivity/scope check.
+- Debugging/verification: Used forked developer/verifier agents for the implementation-verification loop. Ran Docker verification in `sk-sslo-vllm` at `/workspace/mlsys/plots_new`: `python3 -m compileall .` and `python3 generate_all.py`. Verifier final pass reported no remaining issues.
+
+## 2026-05-22 (plots_new PNG-only export)
+
+- Modified: `plots_new/paper_plot_style.py`, `plots_new/synthetic_figures.py`, and `plots_new/README.md` — switched synthetic figure export to PNG-only and updated documentation wording.
+- Removed: Existing `plots_new/figures/synthetic/*.pdf` outputs.
+- Debugging/verification: Used forked developer/verifier agents. Developer ran container compile/generation in `sk-sslo-vllm`; verifier confirmed 7 PNG outputs, 7 CSV files, no PDF outputs, and no remaining PDF-format references.

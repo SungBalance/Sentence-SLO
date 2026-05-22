@@ -108,6 +108,14 @@ class SsloConfig:
     # the shared global predictor (one per Scheduler) can accumulate many
     # — keep enough to stabilise percentile estimates.
     chunk_len_predictor_history_max: int = 4096
+    # Until the shared global chunk-length predictor has accumulated
+    # `global_warmup_predictor_samples` samples, requests whose per-req
+    # predictor is still in warmup (sample_count < num_warmup_chunks)
+    # assume the worst case: `cold_start_max_remaining_tokens` tokens
+    # left in the current chunk. Conservative on first chunks where the
+    # global is still cold and stalls cluster.
+    global_warmup_predictor_samples: int = 128
+    cold_start_max_remaining_tokens: int = 2048
 
 
     def __post_init__(self) -> None:

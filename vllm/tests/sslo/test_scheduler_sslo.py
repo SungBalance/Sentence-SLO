@@ -859,7 +859,9 @@ def test_mlp_pick_n_system_scale_allows_meaningful_shrink():
     ]
     sched = _make_mlp_scheduler(
         running=reqs, max_num_running_reqs=32)
-    sched.tpot_ema = {32: 8.0, 8: 1.0}  # compute-bound (linear scaling)
+    # Picker now reads wall_ema (any prefill composition); populate the
+    # prefill=0 cells so per-batch latencies stay deterministic.
+    sched._sslo_step_wall_ema = {32: {0: 8.0}, 8: {0: 1.0}}
 
     picked_n, _running, _pending, _serve, _defer = sched._mlp_pick_adaptive_n(
         reqs, now=0.0, base_tpot=8.0)

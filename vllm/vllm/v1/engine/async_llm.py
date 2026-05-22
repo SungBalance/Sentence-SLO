@@ -899,6 +899,13 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
+    # SSLO
+    async def reset_sslo_state(self) -> dict:
+        """Reset SSLO accumulator state (chunk-length predictor, EMAs,
+        per-step trackers). Caller should have aborted all requests
+        first so the scheduler queues are empty."""
+        return await self.engine_core.reset_sslo_state_async()
+
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 

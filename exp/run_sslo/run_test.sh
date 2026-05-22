@@ -42,12 +42,20 @@ GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS:-512}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-0}"  # 0 = auto (vLLM uses model config max)
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
-REQUEST_RATE="${REQUEST_RATE:-4}"
 REQUEST_RATE_SEED="${REQUEST_RATE_SEED:-42}"
+# REQUEST_RATES: comma- or space-separated list of Poisson rates. All
+# rates are swept inside a single engine; SSLO state is reset between
+# rates. Defaults to single rate "4" when neither REQUEST_RATES nor
+# REQUEST_RATE is set; REQUEST_RATE (single value, legacy) is honored
+# if REQUEST_RATES is unset.
+if [[ -n "${REQUEST_RATES:-}" ]]; then
+  RATES_ARG="${REQUEST_RATES}"
+else
+  RATES_ARG="${REQUEST_RATE:-4}"
+fi
 # Measurement window is now completion-count gated (warmup=max_num_seqs*2,
-# measurement=max_num_seqs*4). MEASUREMENT_WINDOW_S acts as a safety timeout
-# for the measurement portion only.
-MEASUREMENT_WINDOW_S="${MEASUREMENT_WINDOW_S:-900}"
+# measurement=max_num_seqs*4). No safety timeout — caller picks
+# reachable (cap, rate) combinations.
 CHUNK_UNIT="${CHUNK_UNIT:-sentence}"
 SECONDS_PER_WORD="${SECONDS_PER_WORD:-0.28}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
@@ -111,10 +119,11 @@ python3 exp/run_sslo/run_test.py \
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --output-dir "${OUTPUT_DIR}" \
-  --request-rate "${REQUEST_RATE}" \
+  --request-rates "${RATES_ARG}" \
   --request-rate-seed "${REQUEST_RATE_SEED}" \
+  --summary-csv "${SUMMARY_CSV:-}" \
+  --repeat "${REPEAT:-1}" \
   --seconds-per-word "${SECONDS_PER_WORD}" \
-  --measurement-window-s "${MEASUREMENT_WINDOW_S}" \
   --dataset-name "${DATASET_NAME}" \
   --dataset-seed "${DATASET_SEED}" \
   ${EXCLUDE_CODE_FLAG} \

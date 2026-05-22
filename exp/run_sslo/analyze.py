@@ -255,16 +255,19 @@ def analyze(
     max_model_len: int | None = None,
     label: str | None = None,
 ) -> dict[str, Any]:
-    # New layout: output_dir is a single (mode, run) directory:
-    #   <label>/<chunk>/seqs_<n>/rate_<r>/<mode>/run_<i>/
-    # Each holds requests.jsonl, chunks.jsonl, scheduler_stats.jsonl,
-    # sslo_config.json — all rows already tagged with `mode` by run_test.py.
-    # Mode is detected from the parent directory name.
-    mode = output_dir.parent.name
-    if mode not in ALL_MODES:
+    # Mode is detected by walking up the path looking for a directory
+    # whose name is in ALL_MODES. Supports any layout depth:
+    #   legacy: <label>/.../rate_<r>/<mode>/run_<i>/
+    #   v15:    v15_grid/<model>/cap<C>/<mode>/run_<i>/rate_<r>/
+    mode = None
+    for p in output_dir.parents:
+        if p.name in ALL_MODES:
+            mode = p.name
+            break
+    if mode is None:
         raise ValueError(
-            f"output_dir parent must be a mode in {ALL_MODES}; "
-            f"got parent={mode!r} for {output_dir}")
+            f"could not infer mode from path; expected one of {ALL_MODES} "
+            f"to appear in an ancestor of {output_dir}")
 
     # Load run_meta.json early — it is the authoritative source for the
     # measurement window.
@@ -392,6 +395,30 @@ def analyze(
     # Scheduler stats (running / num_handling_users) emit for ALL modes,
     # including baseline (which now also routes through schedule_sslo via
     # method="baseline" so scheduler_stats.jsonl is populated).
+    def _time_weighted_mean(rows, field, w0, w1):
+        """Time-weighted mean of `field` over [w0, w1]. Each sample's
+        weight = duration until the next sample (or window end)."""
+        if w0 is None or w1 is None:
+            return None
+        rows_w = sorted(
+            (r for r in rows
+             if r.get("ts") is not None and w0 <= float(r["ts"]) <= w1),
+            key=lambda r: float(r["ts"]))
+        if not rows_w:
+            return None
+        wsum = 0.0
+        weight_total = 0.0
+        for i, r in enumerate(rows_w):
+            v = r.get(field)
+            if v is None: continue
+            ts = float(r["ts"])
+            ts_next = float(rows_w[i+1]["ts"]) if i+1 < len(rows_w) else w1
+            w = ts_next - ts
+            if w <= 0: continue
+            wsum += float(v) * w
+            weight_total += w
+        return wsum / weight_total if weight_total > 0 else None
+
     for mode in ALL_MODES:
         sched_rows = sched_by_mode[mode]
         # Include min in `num_handling_users` so summary captures the
@@ -399,9 +426,25 @@ def analyze(
         nhu_dist = distribution_stats(
             numeric_values(sched_rows, "num_handling_users"),
             include_min=True)
+        # SSLO: time-weighted queue means + urgent-mode (critical) fraction.
+        # IMPORTANT: scheduler_stats.jsonl ts uses time.monotonic(); use
+        # the monotonic-clock window bounds, NOT wall-clock mw0/mw1.
+        running_tw = _time_weighted_mean(sched_rows, "running", sched_mw0, sched_mw1)
+        pending_tw = _time_weighted_mean(sched_rows, "pending", sched_mw0, sched_mw1)
+        waiting_tw = _time_weighted_mean(sched_rows, "waiting", sched_mw0, sched_mw1)
+        hu_tw = _time_weighted_mean(sched_rows, "num_handling_users", sched_mw0, sched_mw1)
+        # has_critical is bool; coerce to 0/1 then time-weight.
+        crit_rows = [{**r, "_crit": (1.0 if r.get("has_critical") else 0.0)}
+                     for r in sched_rows]
+        crit_frac = _time_weighted_mean(crit_rows, "_crit", sched_mw0, sched_mw1)
         metrics["scheduler"][mode] = {
             "running": dist_for_key(sched_rows, "running"),
             "num_handling_users": nhu_dist,
+            "mean_running_time_weighted": running_tw,
+            "mean_pending_time_weighted": pending_tw,
+            "mean_waiting_time_weighted": waiting_tw,
+            "mean_handling_users_time_weighted": hu_tw,
+            "urgent_mode_fraction": crit_frac,
         }
 
     # Use run_meta window as the single authoritative window for all modes.
@@ -434,6 +477,10 @@ def analyze(
             "num_prompt_tokens": dist_for_key(req_rows, "num_prompt_tokens"),
             "num_output_tokens": dist_for_key(req_rows, "num_output_tokens"),
             "num_chunks":        dist_for_key(req_rows, "num_chunks"),
+            # SSLO: pending-time + consume-time distributions for summary CSV.
+            "total_pending_time_s": dist_for_key(req_rows, "total_pending_time_s"),
+            "num_pending_intervals": dist_for_key(req_rows, "num_pending_intervals"),
+            "chunk_consume_time_s": dist_for_key(ch_rows, "chunk_consume_time_s"),
         }
         metrics["throughput"][mode] = pm.throughput_stats(
             req_rows, per_req, run_meta=run_meta)

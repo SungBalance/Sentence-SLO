@@ -83,10 +83,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seconds-per-word", type=float, default=0.28)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
-        "--request-rate",
-        type=float,
-        default=4.0,
-        help="Poisson arrival rate in reqs/sec. Must be > 0.",
+        "--request-rates",
+        type=str,
+        default="4",
+        help="Comma- or space-separated list of Poisson arrival rates "
+             "(reqs/sec). All rates are swept under a single engine; "
+             "between rates the SSLO state is reset. Each rate writes "
+             "to OUTPUT_DIR/rate_<r>/.",
     )
     parser.add_argument(
         "--request-rate-seed",
@@ -95,10 +98,18 @@ def parse_args() -> argparse.Namespace:
         help="Seed for the Poisson inter-arrival sampler (reproducibility).",
     )
     parser.add_argument(
-        "--measurement-window-s",
-        type=float,
-        default=180.0,
-        help="Measurement window duration in seconds, starting from the first completed request.",
+        "--summary-csv",
+        type=str,
+        default="",
+        help="If set, after each rate finishes run analyze.py on its "
+             "output dir and append a one-line summary row to this CSV "
+             "(file-locked, safe for parallel jobs).",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Repeat index (1-based) recorded in the summary CSV row.",
     )
     parser.add_argument(
         "--sampling-seed",
@@ -126,11 +137,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--presence-penalty", type=float, default=None)
     parser.add_argument("--repetition-penalty", type=float, default=None)
     args = parser.parse_args()
-    if args.request_rate <= 0:
+    # Parse rates list (accept "0.5,1,2" or "0.5 1 2" or single "4").
+    raw = args.request_rates.replace(",", " ").split()
+    try:
+        rates = [float(x) for x in raw]
+    except ValueError:
         raise ValueError(
-            f"--request-rate must be > 0 (got {args.request_rate}). "
+            f"--request-rates must be numeric (got {args.request_rates!r})")
+    if not rates or any(r <= 0 for r in rates):
+        raise ValueError(
+            f"--request-rates must be positive (got {rates}). "
             "The zero-rate batch mode is no longer supported."
         )
+    args.rates = rates
     return args
 
 
@@ -428,11 +447,16 @@ async def collect_one(
     }
 
 
-def _make_run_id(args: argparse.Namespace, ts: float) -> str:
+def _make_run_id(args: argparse.Namespace, ts: float, rate: float) -> str:
     return (
-        f"{args.run_kind}_{args.max_num_seqs}_{args.request_rate}_"
+        f"{args.run_kind}_{args.max_num_seqs}_{rate}_"
         f"{args.request_rate_seed}_{int(ts)}"
     )
+
+
+def _format_rate(r: float) -> str:
+    """Compact directory-safe rate string. 0.5 -> '0.5', 1.0 -> '1'."""
+    return f"{r:g}"
 
 
 def _policy_label(args: argparse.Namespace) -> str:
@@ -470,6 +494,7 @@ def write_run_meta(
     run_ended_ts: float,
     requests_rows: list[dict[str, Any]],
     *,
+    rate: float,
     window_start_ts: float | None,
     window_end_ts: float | None,
     window_start_mono_ts: float | None,
@@ -479,17 +504,20 @@ def write_run_meta(
     pool_pass_count: int,
     injected_count: int,
     in_window_count: int,
+    warmup_target: int,
+    measurement_target: int,
 ) -> None:
     # Sidecar consumed by analyze.py / _consolidate_mode_outputs.py so the
     # validity gate can see run-level identifiers and F3 counters even if
     # the per-row JSONL doesn't.
     meta = {
-        "run_id": _make_run_id(args, run_started_ts),
+        "run_id": _make_run_id(args, run_started_ts, rate),
         "policy": _policy_label(args),
         "variant": _make_variant_label(args),
         "seed": args.request_rate_seed,
+        "request_rate": rate,
         "trace_id": (
-            f"poisson_rate{args.request_rate}_seed{args.request_rate_seed}"
+            f"poisson_rate{rate}_seed{args.request_rate_seed}"
         ),
         "workload_id": "wildchat2048_lmsys2048",
         "N": len(requests_rows),
@@ -500,7 +528,9 @@ def write_run_meta(
         # clock used by scheduler_stats.jsonl / chunks slo_chunk_records.
         "measurement_window_start_mono_ts": window_start_mono_ts,
         "measurement_window_end_mono_ts": window_end_mono_ts,
-        "measurement_window_seconds": args.measurement_window_s,
+        # Completion-count gates (new workflow). No fixed time window.
+        "warmup_target_completions": warmup_target,
+        "measurement_target_completions": measurement_target,
         "pool_size": pool_size,
         "pool_source": "wildchat2048_lmsys2048",
         "sampling_seed": sampling_seed,
@@ -614,13 +644,320 @@ async def run_one(args: argparse.Namespace) -> None:
     sampling_params = SamplingParams.from_optional(**sampling_kwargs)
     print(f"{args.run_kind}: sampling_params={sampling_params}")
 
-    def _per_req_sampling_params(seed: int):
-        p = sampling_params.clone()
-        p.seed = seed
-        return p
+    base_output_dir = output_dir
+    request_idx_offset = 0
+    # vLLM EngineCore runs in a separate ZMQ subprocess. Its env was
+    # captured at fork/spawn time, so changing os.environ here does
+    # NOT propagate. All rates write to the single SSLO_STATS_LOG_PATH
+    # set by the .sh wrapper; we post-trim each rate's segment using
+    # the monotonic window bounds.
+    shared_stats_path = os.environ.get("SSLO_STATS_LOG_PATH")
+    shared_stats_path = Path(shared_stats_path) if shared_stats_path else None
+    shared_decisions_path = (
+        shared_stats_path.parent / "decisions.jsonl"
+        if shared_stats_path is not None else None)
+    try:
+        for rate_i, rate in enumerate(args.rates):
+            rate_dir = base_output_dir / f"rate_{_format_rate(rate)}"
+            rate_dir.mkdir(parents=True, exist_ok=True)
+            print(f"{args.run_kind}: ===== rate={rate} "
+                  f"({rate_i+1}/{len(args.rates)}) =====")
+            injected_count = await _run_one_rate(
+                engine=engine,
+                pool=pool,
+                sampling_params=sampling_params,
+                rate=rate,
+                output_dir=rate_dir,
+                args=args,
+                sslo_params=sslo_params,
+                request_idx_offset=request_idx_offset,
+                shared_stats_path=shared_stats_path,
+                shared_decisions_path=shared_decisions_path)
+            request_idx_offset += injected_count
+            # Drain + reset SSLO state for next rate (skip after last).
+            if rate_i + 1 < len(args.rates):
+                # abort_requests_async (called above via engine.abort)
+                # is fire-and-forget — the ABORT messages race with the
+                # reset RPC in the EngineCore's ZMQ input queue. Poll
+                # the post-reset state, retry if queues are non-empty
+                # (one EngineCore step is ~few ms; 1s grace is usually
+                # enough but not guaranteed under heavy load).
+                post = None
+                for attempt in range(5):
+                    await asyncio.sleep(1.0)
+                    try:
+                        post = await engine.reset_sslo_state()
+                    except Exception as e:  # noqa: BLE001
+                        print(f"{args.run_kind}: reset_sslo_state failed: "
+                              f"{type(e).__name__}: {e}")
+                        post = None
+                        break
+                    if (post.get("waiting", 0) == 0
+                            and post.get("running", 0) == 0):
+                        break
+                    print(f"{args.run_kind}: reset_sslo_state attempt "
+                          f"{attempt+1}: queues still busy {post}, retrying")
+                if post is not None:
+                    print(f"{args.run_kind}: reset_sslo_state -> {post}")
+                    if (post.get("waiting", 0) != 0
+                            or post.get("running", 0) != 0):
+                        print(f"{args.run_kind}: WARNING — queues not "
+                              f"empty after 5 retries; rate {args.rates[rate_i+1]} "
+                              f"will start with stale state")
+    finally:
+        engine.shutdown()
+        del engine
+        gc.collect()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+        time.sleep(2)
 
-    # Set up pool sampling state.
-    seed = args.sampling_seed if args.sampling_seed is not None else args.request_rate_seed
+
+_SUMMARY_CSV_HEADER = [
+    # identifier
+    "model", "max_num_seqs", "lambda_req_s", "policy", "seed",
+    # window / counts
+    "num_requests_in_measurement_window", "num_arrivals_total",
+    # throughput / urgent-mode share
+    "tokens_per_second", "urgent_mode_fraction_pct",
+    # queue occupancy (time-weighted means from scheduler_stats)
+    "mean_running", "mean_pending", "mean_waiting", "mean_handling_users",
+    # per-request latencies — q stall / pending / completion
+    "queue_stall_p95_s", "queue_stall_p99_s", "queue_stall_max_s",
+    "pending_time_p95_s", "pending_time_p99_s", "pending_time_max_s",
+    "max_continuous_pending_s", "starvation_count",
+    # first-token / first-chunk / per-token / completion
+    "ttft_p95_s", "ttfc_p95_s", "tpot_p95_s",
+    "completion_latency_p95_s", "completion_latency_p99_s",
+    # per-chunk stall summary
+    "max_stall_interval_s_mean", "max_stall_interval_s_p50",
+    "max_stall_interval_s_p90", "max_stall_interval_s_p99",
+    "total_stall_time_s_mean", "total_stall_time_s_p50",
+    "total_stall_time_s_p90", "total_stall_time_s_p99",
+    # violations — explicit naming (chunk = per-chunk, request = per-req)
+    "chunk_slo_violation_rate_tau_0_5s",
+    "chunk_slo_violation_rate_tau_1s",
+    "chunk_slo_violation_rate_tau_2s",
+    "request_slo_violation_rate_tau_0_5s",
+    "request_slo_violation_rate_tau_1s",
+    "request_slo_violation_rate_tau_2s",
+    # other request-level stall
+    "stall_fraction_mean", "stall_event_count_mean",
+    "unit_deadline_miss_rate",
+    # workload — token / unit / consume time distributions
+    "input_tokens_mean", "input_tokens_p50",
+    "input_tokens_p90", "input_tokens_p99",
+    "output_tokens_mean", "output_tokens_p50",
+    "output_tokens_p90", "output_tokens_p99",
+    "units_per_request_mean", "units_per_request_p50",
+    "units_per_request_p90", "units_per_request_p99",
+    "consume_time_per_unit_mean", "consume_time_per_unit_p50",
+    "consume_time_per_unit_p90", "consume_time_per_unit_p99",
+]
+
+
+def _fmt(v: Any, ndigits: int = 4) -> str:
+    """Format a numeric metric for CSV. None/missing -> '' (empty cell)."""
+    if v is None or v == "":
+        return ""
+    try:
+        return f"{float(v):.{ndigits}f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _summary_row(
+    summary: dict[str, Any],
+    *,
+    model: str, cap: int, mode: str, repeat: int, rate: float,
+) -> list[str]:
+    m = summary.get("metrics") or {}
+    sched = (m.get("scheduler") or {}).get(mode) or {}
+    cps = (m.get("cpslo") or {}).get(mode) or {}
+    prog = (m.get("progress_request") or {}).get(mode) or {}
+    wl = (m.get("workload") or {}).get(mode) or {}
+    tp = (m.get("throughput") or {}).get(mode) or {}
+    ttft = (m.get("ttft") or {}).get(mode) or {}
+    ttfc = (m.get("ttfc") or {}).get(mode) or {}
+    tpot = (m.get("tpot") or {}).get(mode) or {}
+    qs = (m.get("queue_stall") or {}).get(mode) or {}
+    stall_t = (m.get("stall_time") or {}).get(mode) or {}
+    req_viol = cps.get("cp_slo_violation_rates_by_tau") or {}
+    chunk_viol = cps.get("chunk_slo_violation_rates_by_tau") or {}
+    max_int_dist = cps.get("max_stall_interval_distribution") or {}
+    total_stall_dist = prog.get("total_stall_time") or {}
+    stall_frac_dist = prog.get("stall_fraction") or {}
+    num_stall_dist = prog.get("num_stall_intervals") or {}
+    completion_dist = prog.get("completion_latency") or {}
+    input_dist = wl.get("num_prompt_tokens") or {}
+    output_dist = wl.get("num_output_tokens") or {}
+    units_dist = wl.get("num_chunks") or {}
+    consume_dist = wl.get("chunk_consume_time_s") or {}
+    pending_dist = wl.get("total_pending_time_s") or {}
+    starv_dist = wl.get("num_pending_intervals") or {}
+
+    # ttft has special shape {"all": {...}, "post_cap": {...}}
+    ttft_all = ttft.get("all") or {} if isinstance(ttft, dict) else {}
+
+    def viol_pct(d, tau):
+        return (d.get(tau, {}).get("rate") or 0) * 100
+
+    def first_present(d, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                return v
+        return None
+
+    # unit_deadline_miss_rate = chunks with stall > 0 / total chunks ≥1
+    # Approximate: same as chunk_slo_violation at tau=0 (instant miss).
+    # If chunks have no field, fall back to ratio of violated/total from
+    # stall_time_stats output (analyze.py line ~85).
+    udmr = None
+    if stall_t and stall_t.get("count"):
+        violated = stall_t.get("violated_count") or 0
+        total = stall_t.get("count") or 1
+        udmr = (violated / total) * 100
+
+    # max_continuous_pending_s = max over reqs of max_stall_interval_s
+    # (i.e. longest stretch any req sat idle). Proxy is the "max" of
+    # max_stall_interval_distribution.
+    max_cont_pending = max_int_dist.get("max")
+
+    # starvation_count = sum of num_pending_intervals across in-window reqs.
+    # Approximate via dist count × mean (count = N reqs, mean = avg events).
+    starv_count = None
+    if starv_dist.get("count") and starv_dist.get("mean") is not None:
+        starv_count = float(starv_dist["count"]) * float(starv_dist["mean"])
+
+    return [
+        model, str(cap), f"{rate:g}", mode, str(repeat),
+        str(summary.get("in_window_count") or 0),
+        str(summary.get("injected_count") or 0),
+        _fmt(tp.get("tokens_per_second"), 2),
+        _fmt((sched.get("urgent_mode_fraction") or 0) * 100, 4),
+        _fmt(sched.get("mean_running_time_weighted"), 4),
+        _fmt(sched.get("mean_pending_time_weighted"), 4),
+        _fmt(sched.get("mean_waiting_time_weighted"), 4),
+        _fmt(sched.get("mean_handling_users_time_weighted"), 4),
+        _fmt(qs.get("p95")), _fmt(qs.get("p99")), _fmt(qs.get("max")),
+        _fmt(pending_dist.get("p95")), _fmt(pending_dist.get("p99")),
+        _fmt(pending_dist.get("max")),
+        _fmt(max_cont_pending),
+        _fmt(starv_count, 0),
+        _fmt(ttft_all.get("p95")), _fmt(ttfc.get("p95")), _fmt(tpot.get("p95")),
+        _fmt(completion_dist.get("p95")), _fmt(completion_dist.get("p99")),
+        _fmt(max_int_dist.get("mean")), _fmt(max_int_dist.get("p50")),
+        _fmt(max_int_dist.get("p90")), _fmt(max_int_dist.get("p99")),
+        _fmt(total_stall_dist.get("mean")), _fmt(total_stall_dist.get("p50")),
+        _fmt(total_stall_dist.get("p90")), _fmt(total_stall_dist.get("p99")),
+        f"{viol_pct(chunk_viol, 'tau_0_5'):.4f}",
+        f"{viol_pct(chunk_viol, 'tau_1'):.4f}",
+        f"{viol_pct(chunk_viol, 'tau_2'):.4f}",
+        f"{viol_pct(req_viol, 'tau_0_5'):.4f}",
+        f"{viol_pct(req_viol, 'tau_1'):.4f}",
+        f"{viol_pct(req_viol, 'tau_2'):.4f}",
+        _fmt(stall_frac_dist.get("mean")), _fmt(num_stall_dist.get("mean")),
+        _fmt(udmr),
+        _fmt(input_dist.get("mean"), 1), _fmt(input_dist.get("p50"), 1),
+        _fmt(input_dist.get("p90"), 1), _fmt(input_dist.get("p99"), 1),
+        _fmt(output_dist.get("mean"), 1), _fmt(output_dist.get("p50"), 1),
+        _fmt(output_dist.get("p90"), 1), _fmt(output_dist.get("p99"), 1),
+        _fmt(units_dist.get("mean"), 1), _fmt(units_dist.get("p50"), 1),
+        _fmt(units_dist.get("p90"), 1), _fmt(units_dist.get("p99"), 1),
+        _fmt(consume_dist.get("mean")), _fmt(consume_dist.get("p50")),
+        _fmt(consume_dist.get("p90")), _fmt(consume_dist.get("p99")),
+    ]
+
+
+async def _analyze_and_append_summary(
+    *,
+    rate_dir: Path,
+    summary_csv: Path,
+    args: argparse.Namespace,
+    rate: float,
+) -> None:
+    """Run analyze.py on `rate_dir`, then append one row to summary_csv
+    under an fcntl lock so parallel jobs don't race on append."""
+    import fcntl
+    cmd = [
+        "python3", "exp/run_sslo/analyze.py",
+        "--output-dir", str(rate_dir),
+        "--max-num-seqs", str(args.max_num_seqs),
+        "--chunk-unit", args.chunk_unit,
+        "--request-rate", f"{rate:g}",
+        "--model", args.model,
+        "--generation-max-tokens", str(args.generation_max_tokens),
+        "--max-model-len", str(args.max_model_len),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    if proc.returncode != 0:
+        print(f"{args.run_kind}: analyze failed for rate={rate}: "
+              f"rc={proc.returncode}; stderr tail: "
+              f"{err.decode(errors='replace')[-400:]}")
+        return
+    sum_json_path = rate_dir / "summary.json"
+    if not sum_json_path.exists():
+        print(f"{args.run_kind}: summary.json missing at {sum_json_path}")
+        return
+    try:
+        summary = json.loads(sum_json_path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"{args.run_kind}: summary.json parse failed: {e}")
+        return
+    row = _summary_row(
+        summary, model=args.model, cap=args.max_num_seqs,
+        mode=args.run_kind, repeat=args.repeat, rate=rate)
+
+    summary_csv.parent.mkdir(parents=True, exist_ok=True)
+    # Append under an exclusive lock. We open the file in 'a+' mode and
+    # lock it, then check size: if empty, write the header first.
+    with summary_csv.open("a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0, 2)  # SEEK_END
+            if f.tell() == 0:
+                f.write(",".join(_SUMMARY_CSV_HEADER) + "\n")
+            f.write(",".join(row) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    print(f"{args.run_kind}: summary row appended to {summary_csv}")
+
+
+async def _run_one_rate(
+    *,
+    engine,
+    pool: list[str],
+    sampling_params,
+    rate: float,
+    output_dir: Path,
+    args: argparse.Namespace,
+    sslo_params: dict,
+    request_idx_offset: int,
+    shared_stats_path: Path | None,
+    shared_decisions_path: Path | None,
+) -> int:
+    """Drive one rate's measurement on an already-loaded engine.
+
+    Caller is responsible for ensuring SSLO state is reset BEFORE this
+    call (so each rate starts cold). Writes per-rate output under
+    `output_dir`. Returns the number of requests injected (for the
+    caller to advance request_idx_offset).
+    """
+    # Per-rate sampling RNG. Different seed per rate so consecutive
+    # rates draw distinct prompt orderings but each is reproducible.
+    base_seed = (
+        args.sampling_seed if args.sampling_seed is not None
+        else args.request_rate_seed)
+    seed = int(base_seed) + int(round(rate * 1000))
     rng = _random.Random(seed)
     order = list(range(len(pool)))
     rng.shuffle(order)
@@ -637,6 +974,11 @@ async def run_one(args: argparse.Namespace) -> None:
         cursor += 1
         return p
 
+    def _per_req_sampling_params(seed_value: int):
+        p = sampling_params.clone()
+        p.seed = seed_value
+        return p
+
     warmup_event = asyncio.Event()
     measurement_done_event = asyncio.Event()
     warmup_counter: list[int] = [0]
@@ -644,7 +986,6 @@ async def run_one(args: argparse.Namespace) -> None:
     warmup_target = args.max_num_seqs * 2
     measurement_target = args.max_num_seqs * 4
     max_total_requests = len(pool)
-    safety_timeout_s = float(args.measurement_window_s)  # kill-switch
     # Window timestamps are written inline by the gate-flipping task in
     # collect_one (see comment there) and read here after the watcher
     # observes the events. Two clocks for downstream consumers:
@@ -658,51 +999,35 @@ async def run_one(args: argparse.Namespace) -> None:
     injection_seq = 0
 
     async def watcher() -> None:
-        try:
-            # Warmup safety: if throughput is too low to reach
-            # warmup_target completions in safety_timeout_s, bail out
-            # rather than hang forever. Setting both events here means
-            # the run still progresses to shutdown with no window
-            # (in_window_count=0) instead of deadlocking.
-            await asyncio.wait_for(
-                warmup_event.wait(), timeout=safety_timeout_s)
-        except asyncio.TimeoutError:
-            warmup_event.set()
-            measurement_done_event.set()
-            return
-        try:
-            await asyncio.wait_for(
-                measurement_done_event.wait(),
-                timeout=safety_timeout_s)
-        except asyncio.TimeoutError:
-            # Force-finalize window even if measurement_target wasn't
-            # reached — collect_one only writes end_ts on the natural
-            # path.
-            if window_ts_holder["end_ts"] is None:
-                window_ts_holder["end_ts"] = time.time()
-                window_ts_holder["end_mono_ts"] = time.monotonic()
-            measurement_done_event.set()
+        # No safety timeout — caller is responsible for picking
+        # (cap, rate) cells whose warmup_target / measurement_target
+        # are reachable.
+        await warmup_event.wait()
+        await measurement_done_event.wait()
 
     async def injector() -> None:
         nonlocal injection_seq
         while (injection_seq < max_total_requests
                and not measurement_done_event.is_set()):
             inj_ts = time.time()
-            idx = injection_seq
+            local_idx = injection_seq
             injection_seq += 1
+            # Globally unique across rates within a single engine — vLLM
+            # rejects duplicate request_ids.
+            global_idx = request_idx_offset + local_idx
             prompt = next_prompt()
             task = asyncio.create_task(collect_one(
-                engine, idx, prompt,
-                _per_req_sampling_params(idx),
+                engine, global_idx, prompt,
+                _per_req_sampling_params(global_idx),
                 inj_ts, warmup_event, warmup_counter, warmup_target,
                 measurement_done_event, measurement_counter,
                 measurement_target, window_ts_holder))
-            injected.append((idx, task, inj_ts))
-            await asyncio.sleep(rng.expovariate(args.request_rate))
+            injected.append((global_idx, task, inj_ts))
+            await asyncio.sleep(rng.expovariate(rate))
 
+    run_started_ts = time.time()
+    t0 = time.monotonic()
     try:
-        run_started_ts = time.time()
-        t0 = time.monotonic()
         await asyncio.gather(watcher(), injector())
         # No cooldown — abort all still-in-flight requests at the engine
         # level (releases engine_core resources and unblocks any waiting
@@ -772,15 +1097,21 @@ async def run_one(args: argparse.Namespace) -> None:
             for chunk in (row.get("slo_chunk_records") or [])
         ]
         write_jsonl(output_dir / "chunks.jsonl", chunk_rows)
-        # Trim scheduler_stats.jsonl to the measurement window.
-        # vLLM stamps each step with time.monotonic() so we must use
-        # the monotonic-clock window bounds, NOT the wall-clock ones.
-        stats_path = output_dir / "scheduler_stats.jsonl"
-        if (stats_path.exists() and window_start_mono_ts is not None
-                and window_end_mono_ts is not None):
-            kept = []
-            with stats_path.open() as f:
-                for line in f:
+        # Trim scheduler_stats / decisions from the shared engine
+        # output to this rate's monotonic window, writing per-rate
+        # copies. vLLM stamps each step with time.monotonic(), so we
+        # must use the monotonic-clock window bounds. The shared file
+        # accumulates across rates (since EngineCore is a fixed-env
+        # subprocess) — we slice it here, but we do NOT truncate it
+        # since later rates still need to append.
+        def _trim_jsonl_to_window(src: Path | None, dst: Path) -> int:
+            if (src is None or not src.exists()
+                    or window_start_mono_ts is None
+                    or window_end_mono_ts is None):
+                return 0
+            n = 0
+            with src.open() as fi, dst.open("w") as fo:
+                for line in fi:
                     try:
                         r = json.loads(line)
                     except json.JSONDecodeError:
@@ -789,10 +1120,15 @@ async def run_one(args: argparse.Namespace) -> None:
                     if ts is None:
                         continue
                     if window_start_mono_ts <= ts <= window_end_mono_ts:
-                        kept.append(line)
-            with stats_path.open("w") as f:
-                for line in kept:
-                    f.write(line)
+                        fo.write(line)
+                        n += 1
+            return n
+        n_stats = _trim_jsonl_to_window(
+            shared_stats_path, output_dir / "scheduler_stats.jsonl")
+        n_dec = _trim_jsonl_to_window(
+            shared_decisions_path, output_dir / "decisions.jsonl")
+        print(f"{args.run_kind}: trimmed shared logs -> "
+              f"scheduler_stats={n_stats}, decisions={n_dec}")
         # Sidecar for analyze.py: SSLO config options (per-mode) to embed in
         # summary.config. Only emitted for sslo* modes; baseline gets {}.
         sslo_config_path = output_dir / "sslo_config.json"
@@ -801,6 +1137,7 @@ async def run_one(args: argparse.Namespace) -> None:
         # GPU peak, preemption totals, completion counts).
         write_run_meta(
             args, output_dir, run_started_ts, run_ended_ts, request_rows,
+            rate=rate,
             window_start_ts=window_start_ts,
             window_end_ts=window_end_ts,
             window_start_mono_ts=window_start_mono_ts,
@@ -810,6 +1147,8 @@ async def run_one(args: argparse.Namespace) -> None:
             pool_pass_count=pool_pass_count,
             injected_count=len(rows),
             in_window_count=in_window_count,
+            warmup_target=warmup_target,
+            measurement_target=measurement_target,
         )
         print(
             f"{args.run_kind}: completed {len(rows)} requests in {elapsed:.1f}s; "
@@ -832,17 +1171,19 @@ async def run_one(args: argparse.Namespace) -> None:
         prompt_mean = f"{sum(prompt_counts)/len(prompt_counts):.1f}" if prompt_counts else "n/a"
         output_mean = f"{sum(output_counts)/len(output_counts):.1f}" if output_counts else "n/a"
         print(f"{args.run_kind}: workload mean num_prompt_tokens={prompt_mean}, num_output_tokens={output_mean}")
+        # Per-rate analyze + append a summary row. Skip if --summary-csv
+        # unset. Run inline (not in background) so the row lands before
+        # the next rate starts and so the caller can observe success.
+        if args.summary_csv:
+            await _analyze_and_append_summary(
+                rate_dir=output_dir,
+                summary_csv=Path(args.summary_csv),
+                args=args, rate=rate)
+        return len(injected)
     finally:
-        engine.shutdown()
-        del engine
-        gc.collect()
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-        except Exception:
-            pass
-        time.sleep(2)
+        # Per-rate task cleanup only — engine lifecycle is managed by the
+        # caller (run_one) so it can be shared across rate iterations.
+        pass
 
 
 def main() -> None:

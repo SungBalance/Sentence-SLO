@@ -229,6 +229,10 @@ class EngineCoreClient(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    # SSLO
+    async def reset_sslo_state_async(self) -> dict:
+        raise NotImplementedError
+
     async def reset_encoder_cache_async(self) -> None:
         raise NotImplementedError
 
@@ -1107,6 +1111,10 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
+
+    # SSLO
+    async def reset_sslo_state_async(self) -> dict:
+        return await self.call_utility_async("reset_sslo_state")
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
