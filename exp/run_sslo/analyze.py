@@ -437,6 +437,24 @@ def analyze(
         crit_rows = [{**r, "_crit": (1.0 if r.get("has_critical") else 0.0)}
                      for r in sched_rows]
         crit_frac = _time_weighted_mean(crit_rows, "_crit", sched_mw0, sched_mw1)
+        # SSLO: unbiased token throughput from scheduler step stats.
+        # Sum num_decode_tokens / num_prefill_tokens within the monotonic
+        # window, divide by duration. Independent of which reqs finished
+        # in the cap*4 measurement cohort (so this avoids the selection
+        # bias the request-level tokens_per_second has).
+        in_win_sched = [
+            r for r in sched_rows
+            if r.get("ts") is not None
+            and sched_mw0 is not None and sched_mw1 is not None
+            and sched_mw0 <= float(r["ts"]) <= sched_mw1
+        ]
+        win_dur = (sched_mw1 - sched_mw0) if (
+            sched_mw0 is not None and sched_mw1 is not None) else None
+        def _sum(key):
+            return sum(int(r.get(key) or 0) for r in in_win_sched)
+        sched_decode_tokens = _sum("num_decode_tokens")
+        sched_prefill_tokens = _sum("num_prefill_tokens")
+        sched_total_tokens = _sum("num_scheduled_tokens_total")
         metrics["scheduler"][mode] = {
             "running": dist_for_key(sched_rows, "running"),
             "num_handling_users": nhu_dist,
@@ -445,6 +463,16 @@ def analyze(
             "mean_waiting_time_weighted": waiting_tw,
             "mean_handling_users_time_weighted": hu_tw,
             "urgent_mode_fraction": crit_frac,
+            # Unbiased token throughputs from scheduler-side counters.
+            "decode_tokens_per_second": (
+                sched_decode_tokens / win_dur
+                if win_dur and win_dur > 0 else None),
+            "prefill_tokens_per_second": (
+                sched_prefill_tokens / win_dur
+                if win_dur and win_dur > 0 else None),
+            "scheduled_tokens_per_second": (
+                sched_total_tokens / win_dur
+                if win_dur and win_dur > 0 else None),
         }
 
     # Use run_meta window as the single authoritative window for all modes.

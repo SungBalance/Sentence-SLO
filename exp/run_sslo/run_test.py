@@ -714,6 +714,26 @@ async def run_one(args: argparse.Namespace) -> None:
                 torch.cuda.synchronize()
         except Exception:
             pass
+        # Force-kill any descendants of this process (vLLM EngineCore
+        # subprocs, multiprocessing.resource_tracker children) that
+        # survived shutdown. Scoped to our own subtree — peer processes
+        # on other GPUs (separate PID trees) are untouched. Prevents
+        # orphan EngineCore from blocking the GPU when a subsequent
+        # job's engine init tries to allocate KV cache.
+        try:
+            import psutil
+            me = psutil.Process(os.getpid())
+            kids = me.children(recursive=True)
+            for p in kids:
+                try:
+                    p.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            if kids:
+                psutil.wait_procs(kids, timeout=5.0)
+        except Exception as e:  # noqa: BLE001
+            print(f"{args.run_kind}: descendant cleanup raised: "
+                  f"{type(e).__name__}: {e}")
         time.sleep(2)
 
 
@@ -723,11 +743,15 @@ _SUMMARY_CSV_HEADER = [
     # window / counts
     "num_requests_in_measurement_window", "num_arrivals_total",
     # throughput / urgent-mode share
-    # `tokens_per_second` is output-only (legacy alias for
-    # output_tokens_per_second). total_tokens_per_second includes
-    # prompt tokens.
+    # Request-side throughput (output_tokens_per_second is legacy alias
+    # for tokens_per_second) — selection-biased by which reqs completed
+    # inside the cap*4 measurement window.
+    # Scheduler-side throughput (decode_tps / prefill_tps) is computed
+    # from per-step num_decode_tokens and is bias-free.
     "tokens_per_second", "output_tokens_per_second",
     "input_tokens_per_second", "total_tokens_per_second",
+    "decode_tokens_per_second", "prefill_tokens_per_second",
+    "scheduled_tokens_per_second",
     "urgent_mode_fraction_pct",
     # queue occupancy (time-weighted means from scheduler_stats)
     "mean_running", "mean_pending", "mean_waiting", "mean_handling_users",
@@ -847,6 +871,9 @@ def _summary_row(
         _fmt(tp.get("output_tokens_per_second"), 2),
         _fmt(tp.get("input_tokens_per_second"), 2),
         _fmt(tp.get("total_tokens_per_second"), 2),
+        _fmt(sched.get("decode_tokens_per_second"), 2),
+        _fmt(sched.get("prefill_tokens_per_second"), 2),
+        _fmt(sched.get("scheduled_tokens_per_second"), 2),
         _fmt((sched.get("urgent_mode_fraction") or 0) * 100, 4),
         _fmt(sched.get("mean_running_time_weighted"), 4),
         _fmt(sched.get("mean_pending_time_weighted"), 4),

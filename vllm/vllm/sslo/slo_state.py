@@ -2,6 +2,7 @@
 """SSLO request lifecycle state for score-based scheduling."""
 from __future__ import annotations
 
+import os
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import InitVar, asdict, dataclass, field
@@ -201,9 +202,31 @@ class ChunkConsumeEstimator:
             raise ValueError("seconds_per_word must be >= 0")
         self.seconds_per_word = seconds_per_word
 
-    def estimate(self, chunk_text: str, word_count: int) -> float:
+    def estimate(
+        self,
+        chunk_text: str,
+        word_count: int,
+    ) -> tuple[float, float | None]:
         del chunk_text  # unused in the default rate-based estimator
-        return word_count * self.seconds_per_word
+        return word_count * self.seconds_per_word, None
+
+
+class TtsProfileConsumeEstimator(ChunkConsumeEstimator):
+    """Placeholder for profile-driven TTS consumption estimates."""
+
+    def __init__(self, profile_path: str) -> None:
+        if not isinstance(profile_path, str) or not profile_path:
+            raise ValueError("profile_path must be a non-empty string")
+        if not os.path.exists(profile_path):
+            raise FileNotFoundError(profile_path)
+        self.profile_path = profile_path
+
+    def estimate(
+        self,
+        chunk_text: str,
+        word_count: int,
+    ) -> tuple[float, float | None]:
+        raise NotImplementedError("TTS profile lookup arrives next round")
 
 
 class ChunkSeparator:
@@ -343,6 +366,7 @@ class ChunkRecord:
     # Consume time persisted here for CP-SLO export; same value used to
     # advance next_deadline_ts in on_chunk_boundary.
     chunk_consume_time_s: float = 0.0
+    conversion_time_s: float = 0.0
     # Demand window: [deadline_ts, deadline_ts + chunk_consume_time_s).
     demand_window_start_ts: float = 0.0
     demand_window_end_ts: float = 0.0
@@ -391,6 +415,7 @@ class ChunkStatCollector:
         token_end_idx: int,
         cumulative_tokens_at_end: int,
         chunk_consume_time_s: float,
+        conversion_time_s: float,
         demand_window_start_ts: float,
         demand_window_end_ts: float,
         expected_chunk_len_high: float | None,
@@ -420,6 +445,7 @@ class ChunkStatCollector:
                 token_end_idx=token_end_idx,
                 cumulative_tokens_at_end=cumulative_tokens_at_end,
                 chunk_consume_time_s=chunk_consume_time_s,
+                conversion_time_s=conversion_time_s,
                 demand_window_start_ts=demand_window_start_ts,
                 demand_window_end_ts=demand_window_end_ts,
                 expected_chunk_len_high=expected_chunk_len_high,
@@ -564,6 +590,11 @@ class RequestSLOState:
         config: "SsloConfig",
         global_chunk_len_predictor: "ChunkLengthPredictor | None" = None,
     ) -> "RequestSLOState":
+        consume_estimator: ChunkConsumeEstimator | None = None
+        if config.consume_mode == "tts":
+            assert config.tts_profile_path is not None
+            consume_estimator = TtsProfileConsumeEstimator(
+                config.tts_profile_path)
         return cls(
             seconds_per_word=config.seconds_per_word,
             num_warmup_chunks=config.num_warmup_chunks,
@@ -582,6 +613,7 @@ class RequestSLOState:
                 config.mlp_predictor_overshoot_safety_factor),
             # SSLO: shared system-wide predictor for warm-up substitute.
             global_chunk_len_predictor=global_chunk_len_predictor,
+            consume_estimator=consume_estimator,
         )
 
     @property

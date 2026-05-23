@@ -1852,13 +1852,35 @@ class Scheduler(SchedulerInterface):
             cands_running.append(pick)
 
     # SSLO
-    def _sslo_dump_step_stats(self, now: float) -> None:
+    def _sslo_dump_step_stats(
+            self,
+            now: float,
+            num_scheduled_tokens: dict[str, int] | None = None,
+    ) -> None:
         log_path = os.environ.get("SSLO_STATS_LOG_PATH")
         if not log_path:
             return
         if not self._sslo_log_dir_created:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             self._sslo_log_dir_created = True
+        # SSLO: derive per-step token throughput from scheduler's own
+        # `num_scheduled_tokens` dict (req_id → tokens scheduled this step).
+        # Decode reqs have value == 1 and emit 1 new generation token.
+        # Prefill (incl. chunked) reqs have value > 1 and process prompt
+        # tokens; they do not emit a new output token in that step.
+        # Summing num_decode_reqs over the measurement window gives the
+        # unbiased generated-token throughput (independent of which reqs
+        # happened to finish inside the window).
+        decode_reqs = prefill_reqs = 0
+        scheduled_tokens_total = scheduled_prefill_tokens = 0
+        if num_scheduled_tokens is not None:
+            for n in num_scheduled_tokens.values():
+                scheduled_tokens_total += n
+                if n == 1:
+                    decode_reqs += 1
+                else:
+                    prefill_reqs += 1
+                    scheduled_prefill_tokens += n
         stats_row = {
             "kind": "step",
             "ts": now,
@@ -1872,6 +1894,12 @@ class Scheduler(SchedulerInterface):
             "max_score": self._sslo_step.max_score,
             "step_wall_ema_cells": sum(
                 len(cells) for cells in self._sslo_step_wall_ema.values()),
+            # SSLO: per-step token throughput (sum/window = true rate).
+            "num_scheduled_tokens_total": scheduled_tokens_total,
+            "num_decode_reqs": decode_reqs,
+            "num_prefill_reqs": prefill_reqs,
+            "num_prefill_tokens": scheduled_prefill_tokens,
+            "num_decode_tokens": decode_reqs,
             # SSLO: post-waiting backfill diagnostics
             "bf_skip_reason": self._sslo_step.bf_skip_reason,
             "bf_slack": self._sslo_step.bf_slack,
@@ -3255,8 +3283,10 @@ class Scheduler(SchedulerInterface):
         # pending reflect what the engine actually executes this step.
         # SsloStepState fields (cur_max_num_requests / has_critical /
         # waiting_admission_budget / defer_base) were set by the policy
-        # during _sslo_commit_step and remain valid here.
-        self._sslo_dump_step_stats(scheduled_timestamp)
+        # during _sslo_commit_step and remain valid here. Pass the live
+        # num_scheduled_tokens dict so the dump can record per-step
+        # decode / prefill token counts.
+        self._sslo_dump_step_stats(scheduled_timestamp, num_scheduled_tokens)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
