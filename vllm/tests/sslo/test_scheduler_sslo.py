@@ -29,7 +29,7 @@ def make_state(
     else:
         state.decoding_start_ts = 0.0
         # next_deadline_ts is absolute; with decoding_start_ts=0.0,
-        # passing `deadline=10` means deadline_ts = 10.
+        # passing `deadline=10` means deadline = 10.
         state.next_deadline_ts = float(deadline)
         if phase == Phase.MEASURED:
             state.chunks_completed = max(state.num_warmup_chunks, 1)
@@ -623,7 +623,7 @@ def test_terminal_outcome_completed_on_finish():
     # and would mark too late.
     state = RequestSLOState(num_warmup_chunks=1)
     state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=10.0)
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=10.0)
     assert state.terminal_outcome == "in_progress"
     state.on_finish(now=1.0)
     assert state.terminal_outcome == "completed"

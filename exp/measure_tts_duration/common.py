@@ -16,43 +16,43 @@ CHUNK_COLUMNS = [
     "chunk_id",
     "dataset_name",
     "dataset_item_id",
+    # SSLO: request_id = dataset_item_id alias for load_sslo_chunks compat.
+    "request_id",
     "turn_idx",
     "role",
     "chunk_unit",
     "chunk_idx",
     "text",
     "word_count",
+    # SSLO: num_words / num_token for load_sslo_chunks compat.
+    "num_words",
+    "num_token",
     "char_count",
 ]
 
 DURATION_COLUMNS = [
-    "chunk_id",
-    "model",
-    "dataset_name",
-    "dataset_item_id",
-    "turn_idx",
-    "role",
-    "chunk_unit",
-    "chunk_idx",
+    # identity
+    "chunk_id", "request_id", "chunk_idx",
+    # text stats
+    "word_count", "num_token",
+    # tts identification
+    "model", "tts_backend",
+    # core measurements (user-facing)
+    "conversion_time_s", "audio_duration_s", "real_time_factor",
+    # supporting
+    "audio_sample_rate", "tts_segment_count",
+    # reference
     "text",
-    "word_count",
-    "char_count",
-    "duration_seconds",
-    "audio_sample_rate",
-    "tts_segment_count",
-    "tts_backend",
 ]
 
 SUMMARY_COLUMNS = [
-    "model",
-    "chunk_unit",
-    "word_count",
-    "row_count",
-    "mean_duration_seconds",
-    "variance_duration_seconds",
-    "std_duration_seconds",
-    "min_duration_seconds",
-    "max_duration_seconds",
+    "model", "tts_backend", "word_count_low", "word_count_high", "row_count",
+    "conversion_time_s_mean", "conversion_time_s_var",
+    "conversion_time_s_std", "conversion_time_s_min", "conversion_time_s_max",
+    "audio_duration_s_mean", "audio_duration_s_var",
+    "audio_duration_s_std", "audio_duration_s_min", "audio_duration_s_max",
+    "real_time_factor_mean", "real_time_factor_var",
+    "real_time_factor_std", "real_time_factor_min", "real_time_factor_max",
 ]
 
 SENTENCE_ENDINGS = frozenset((".", "!", "?", "。", "！", "？", "…"))

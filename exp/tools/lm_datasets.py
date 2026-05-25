@@ -170,6 +170,56 @@ def load_prompts(
     raise ValueError(f"No loader implemented for dataset id: {dataset_id}")
 
 
+# SSLO
+def load_dialogues(
+    dataset_name: str,
+    *,
+    split: str | None = None,
+    max_dialogues: int | None = None,
+    conversation_only: bool = False,
+    english_only: bool = False,
+    exclude_code: bool = False,
+    seed: int = 42,
+) -> list[list[dict[str, Any]]]:
+    """Return filtered dialogues as lists of {role, content} dicts."""
+    if max_dialogues is not None and max_dialogues <= 0:
+        raise ValueError("max_dialogues must be positive when set.")
+
+    dataset_id = _normalize(dataset_name)
+    resolved_split = split if split is not None else _DEFAULT_SPLITS[dataset_id]
+
+    if dataset_id == KOALA_DATASET_ID:
+        raise ValueError(
+            "Koala is a single-turn instruction set; use wildchat, lmsys, "
+            "or combine for dialogue rows."
+        )
+    if dataset_id == WILDCHAT_DATASET_ID:
+        return _load_wildchat_dialogues(
+            split=resolved_split,
+            max_dialogues=max_dialogues,
+            conversation_only=conversation_only,
+            english_only=english_only,
+            exclude_code=exclude_code,
+        )
+    if dataset_id == LMSYS_DATASET_ID:
+        return _load_lmsys_dialogues(
+            split=resolved_split,
+            max_dialogues=max_dialogues,
+            conversation_only=conversation_only,
+            english_only=english_only,
+            exclude_code=exclude_code,
+        )
+    if dataset_id == "__combine__":
+        return _load_combine_dialogues(
+            max_dialogues=max_dialogues,
+            conversation_only=conversation_only,
+            english_only=english_only,
+            exclude_code=exclude_code,
+            seed=seed,
+        )
+    raise ValueError(f"No loader implemented for dataset id: {dataset_id}")
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -237,6 +287,43 @@ def _first_user_and_assistant(conversation: list[dict]) -> tuple[str | None, str
     return first_user, first_asst
 
 
+# SSLO: strict-English text check — rejects any character from the
+# major non-Latin script blocks (CJK, Hangul, Kana, Cyrillic, Arabic,
+# Hebrew, Devanagari, Thai). Greek (U+0370..U+03FF) is intentionally NOT
+# included so math symbols Δ, λ, θ in technical English pass through.
+# Latin Extended (é, ü, ñ, ...) also passes through.
+# Motivation: row-level `language=="English"` lets bilingual / mis-tagged
+# rows leak, and SSLO's tail-outlier behavior is very sensitive to those
+# leaks (Chinese / Korean text inflates audio_duration and skews the
+# tail of the chunk-length distribution).
+_NON_LATIN_RE = re.compile(
+    r"[一-鿿"   # CJK Unified Ideographs
+    r"가-힯"    # Hangul Syllables
+    r"぀-ゟ"    # Hiragana
+    r"゠-ヿ"    # Katakana
+    r"Ѐ-ӿ"    # Cyrillic
+    r"؀-ۿ"    # Arabic
+    r"֐-׿"    # Hebrew
+    r"ऀ-ॿ"    # Devanagari
+    r"฀-๿"    # Thai
+    r"＀-￯"    # Halfwidth / Fullwidth forms (CJK punctuation)
+    r"]"
+)
+
+
+# SSLO
+def _is_strict_english_text(text: str) -> bool:
+    """Return True iff `text` contains zero non-Latin-script characters.
+
+    Strict companion to the row-level `language=="English"` check. Use
+    when downstream consumers (e.g. SSLO TTS profiling) are sensitive to
+    tail outliers from bilingual / mis-tagged rows.
+    """
+    if not text:
+        return True
+    return _NON_LATIN_RE.search(text) is None
+
+
 def _is_conversation(conversation: list[dict]) -> bool:
     """Multi-turn conversation = at least one full
     user-assistant-user-assistant cycle (i.e., the user came back with a
@@ -245,6 +332,151 @@ def _is_conversation(conversation: list[dict]) -> bool:
     n_user = sum(1 for m in conversation if m.get("role") == "user")
     n_asst = sum(1 for m in conversation if m.get("role") == "assistant")
     return n_user >= 2 and n_asst >= 2
+
+
+# SSLO
+def _apply_dialogue_filters(
+    rows_iter: Any,
+    *,
+    content_key: str,
+    max_dialogues: int | None,
+    conversation_only: bool,
+    english_only: bool,
+    exclude_code: bool,
+):
+    yielded = 0
+    for row in rows_iter:
+        if max_dialogues is not None and yielded >= max_dialogues:
+            break
+        if english_only and row.get("language") != "English":
+            continue
+        conversation = row.get(content_key) or []
+        if conversation_only and not _is_conversation(conversation):
+            continue
+
+        dialogue: list[dict[str, Any]] = []
+        has_code_turn = False
+        # SSLO
+        has_non_english_turn = False
+        for message in conversation:
+            try:
+                content = _clean(message.get("content", ""))
+            except (AttributeError, ValueError):
+                continue
+            if exclude_code and _is_code_request(content):
+                has_code_turn = True
+                break
+            # SSLO: strict-English check on every turn — any non-Latin
+            # script content (CJK, Hangul, Cyrillic, Arabic, ...) drops
+            # the whole dialogue. row-level language=='English' alone
+            # leaks bilingual / mistagged rows.
+            if english_only and not _is_strict_english_text(content):
+                has_non_english_turn = True
+                break
+            dialogue.append(
+                {
+                    "role": str(message.get("role", "")).strip().lower(),
+                    "content": content,
+                }
+            )
+        if has_code_turn or has_non_english_turn or not dialogue:
+            continue
+        yielded += 1
+        yield dialogue
+
+
+# SSLO
+def _load_wildchat_dialogues(
+    *,
+    split: str,
+    max_dialogues: int | None,
+    conversation_only: bool = False,
+    english_only: bool = False,
+    exclude_code: bool = False,
+) -> list[list[dict[str, Any]]]:
+    from datasets import load_dataset
+
+    dataset = load_dataset(WILDCHAT_DATASET_ID, split=split, streaming=True)
+    return list(
+        _apply_dialogue_filters(
+            dataset,
+            content_key="conversation",
+            max_dialogues=max_dialogues,
+            conversation_only=conversation_only,
+            english_only=english_only,
+            exclude_code=exclude_code,
+        )
+    )
+
+
+# SSLO
+def _load_lmsys_dialogues(
+    *,
+    split: str,
+    max_dialogues: int | None,
+    conversation_only: bool = False,
+    english_only: bool = False,
+    exclude_code: bool = False,
+) -> list[list[dict[str, Any]]]:
+    from datasets import load_dataset
+
+    dataset = load_dataset(LMSYS_DATASET_ID, split=split, streaming=True)
+    return list(
+        _apply_dialogue_filters(
+            dataset,
+            content_key="conversation",
+            max_dialogues=max_dialogues,
+            conversation_only=conversation_only,
+            english_only=english_only,
+            exclude_code=exclude_code,
+        )
+    )
+
+
+# SSLO
+def _load_combine_dialogues(
+    *,
+    max_dialogues: int | None,
+    conversation_only: bool = False,
+    english_only: bool = False,
+    exclude_code: bool = False,
+    seed: int = 42,
+) -> list[list[dict[str, Any]]]:
+    import random
+    import sys
+
+    if max_dialogues is None:
+        over = 300
+    else:
+        over = max(1, int(max_dialogues * 1.5))
+
+    pool: list[list[dict[str, Any]]] = []
+    for name, loader, split in (
+        ("wildchat", _load_wildchat_dialogues, "train"),
+        ("lmsys", _load_lmsys_dialogues, "train"),
+    ):
+        try:
+            pool += loader(
+                split=split,
+                max_dialogues=over,
+                conversation_only=conversation_only,
+                english_only=english_only,
+                exclude_code=exclude_code,
+            )
+        except Exception as e:  # noqa: BLE001 - intentional broad catch
+            print(
+                f"[combine] {name} skipped: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+
+    if not pool:
+        raise ValueError("combine dataset: both sources returned no dialogues.")
+
+    rng = random.Random(seed)
+    rng.shuffle(pool)
+    if max_dialogues is not None:
+        return pool[:max_dialogues]
+    return pool
 
 
 def _load_wildchat(
@@ -271,6 +503,12 @@ def _load_wildchat(
         try:
             text = _clean(first_user)
         except ValueError:
+            continue
+        # SSLO: strict-English text check (see _is_strict_english_text).
+        if english_only and (
+                not _is_strict_english_text(text)
+                or (first_asst is not None
+                    and not _is_strict_english_text(first_asst))):
             continue
         if exclude_code and _is_code_request(text, first_asst):
             continue
@@ -308,6 +546,12 @@ def _load_lmsys(
         try:
             text = _clean(first_user)
         except ValueError:
+            continue
+        # SSLO: strict-English text check (see _is_strict_english_text).
+        if english_only and (
+                not _is_strict_english_text(text)
+                or (first_asst is not None
+                    and not _is_strict_english_text(first_asst))):
             continue
         if exclude_code and _is_code_request(text, first_asst):
             continue

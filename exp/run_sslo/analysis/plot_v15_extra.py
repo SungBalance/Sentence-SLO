@@ -1,11 +1,6 @@
-"""v15 grid extra plots:
-  1. Ratio heatmap (sslo/baseline) per metric
-  2. Throughput trade-off scatter (admission vs throughput)
-  3. SLO violation tau-curves (rate of violations at different tau)
-  4. Saturation curves (rate vs throughput per cap)
-
-Outputs PNGs into each model's plots/ dir.
-"""
+"""DEPRECATED (2026-05): this script uses v15-era column names that no longer
+exist after the R3 metric refactor. Do not run on current sweep output.
+Kept only as historical reference."""
 import csv
 import math
 import statistics
@@ -271,4 +266,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "plot_v15_extra.py is deprecated; see top-of-file docstring.")

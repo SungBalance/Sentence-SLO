@@ -2,7 +2,9 @@
 """SSLO request lifecycle state for score-based scheduling."""
 from __future__ import annotations
 
+import csv
 import os
+from bisect import bisect_left
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import InitVar, asdict, dataclass, field
@@ -212,21 +214,71 @@ class ChunkConsumeEstimator:
 
 
 class TtsProfileConsumeEstimator(ChunkConsumeEstimator):
-    """Placeholder for profile-driven TTS consumption estimates."""
+    """Profile-driven TTS audio duration and conversion-time estimates."""
 
-    def __init__(self, profile_path: str) -> None:
+    def __init__(self, profile_path: str, model: str) -> None:
         if not isinstance(profile_path, str) or not profile_path:
             raise ValueError("profile_path must be a non-empty string")
+        if not isinstance(model, str) or not model:
+            raise ValueError("model must be a non-empty string")
         if not os.path.exists(profile_path):
             raise FileNotFoundError(profile_path)
         self.profile_path = profile_path
+        self.model = model
+        self._consume_by_wc: dict[int, float] = {}
+        self._conversion_by_wc: dict[int, float] = {}
+        models_present: set[str] = set()
+
+        required_columns = {
+            "model",
+            "word_count_low",
+            "conversion_time_s_mean",
+            "audio_duration_s_mean",
+        }
+        with open(profile_path, newline="") as f:
+            reader = csv.DictReader(f)
+            missing = required_columns.difference(reader.fieldnames or ())
+            if missing:
+                raise ValueError(
+                    f"TTS profile missing required columns: "
+                    f"{sorted(missing)}")
+            for row in reader:
+                row_model = row["model"]
+                models_present.add(row_model)
+                if row_model != model:
+                    continue
+                wc = int(row["word_count_low"])
+                self._consume_by_wc[wc] = float(
+                    row["audio_duration_s_mean"])
+                self._conversion_by_wc[wc] = float(
+                    row["conversion_time_s_mean"])
+
+        if not self._consume_by_wc:
+            raise ValueError(
+                f"TTS profile has no rows for model {model!r}; "
+                f"models present: {sorted(models_present)}")
+        self._wc_sorted = sorted(self._consume_by_wc.keys())
+
+    def _nearest_word_count(self, word_count: int) -> int:
+        idx = bisect_left(self._wc_sorted, word_count)
+        if idx <= 0:
+            return self._wc_sorted[0]
+        if idx >= len(self._wc_sorted):
+            return self._wc_sorted[-1]
+        lower = self._wc_sorted[idx - 1]
+        upper = self._wc_sorted[idx]
+        if word_count - lower <= upper - word_count:
+            return lower
+        return upper
 
     def estimate(
         self,
         chunk_text: str,
         word_count: int,
-    ) -> tuple[float, float | None]:
-        raise NotImplementedError("TTS profile lookup arrives next round")
+    ) -> tuple[float, float]:
+        del chunk_text
+        wc = self._nearest_word_count(word_count)
+        return self._consume_by_wc[wc], self._conversion_by_wc[wc]
 
 
 class ChunkSeparator:
@@ -332,15 +384,14 @@ class ChunkSeparator:
 
 @dataclass
 class ChunkRecord:
-    chunk_idx: int
-    deadline_ts: float
-    gen_finish_ts: float
-    slack_s: float
+    unit_index: int
+    deadline: float
+    text_generation_end_time: float
+    consumer_ready_time: float
+    unit_deadline_miss_s: float
+    unit_deadline_missed: int
     pending_time_s: float
     word_count: int
-    # Chunk start wall-clock — prev chunk's gen_finish_ts, or
-    # decoding_start_ts for chunk 0.
-    start_time_ts: float
     # Tokens generated within this chunk window.
     num_token: int
     # Scheduler-step accounting per chunk window.
@@ -353,23 +404,14 @@ class ChunkRecord:
     # history yet) and any time before the predictor has a value. Compare
     # to num_token to measure prediction accuracy.
     expected_len: float | None
-    # Raw stall interval for this chunk; non-None only when late.
-    # Kept as raw timestamps so post-hoc analysis can merge overlapping
-    # stall windows across requests.
-    stall_start_ts: float | None
-    stall_end_ts: float | None
-    stall_duration_s: float
-    # Cumulative token indices: half-open [token_start_idx, token_end_idx).
-    token_start_idx: int = 0
-    token_end_idx: int = 0
-    cumulative_tokens_at_end: int = 0
+    # Cumulative token indices: half-open [token_start, token_end).
+    token_start: int = 0
+    token_end: int = 0
+    token_boundary: int = 0
     # Consume time persisted here for CP-SLO export; same value used to
     # advance next_deadline_ts in on_chunk_boundary.
-    chunk_consume_time_s: float = 0.0
-    conversion_time_s: float = 0.0
-    # Demand window: [deadline_ts, deadline_ts + chunk_consume_time_s).
-    demand_window_start_ts: float = 0.0
-    demand_window_end_ts: float = 0.0
+    consume_duration: float = 0.0
+    conversion_time: float = 0.0
     # p99 companion from the predictor — only populated under p90 strategy.
     expected_chunk_len_high: float | None = None
     # Which predictor strategy produced expected_len.
@@ -400,24 +442,19 @@ class ChunkStatCollector:
     def record(
         self,
         *,
-        chunk_idx: int,
-        deadline_ts: float,
-        gen_finish_ts: float,
-        slack_s: float,
+        unit_index: int,
+        deadline: float,
+        text_generation_end_time: float,
+        consumer_ready_time: float,
+        unit_deadline_miss_s: float,
         word_count: int,
-        start_time_ts: float,
         num_token: int,
         expected_len: float | None,
-        stall_start_ts: float | None,
-        stall_end_ts: float | None,
-        stall_duration_s: float,
-        token_start_idx: int,
-        token_end_idx: int,
-        cumulative_tokens_at_end: int,
-        chunk_consume_time_s: float,
-        conversion_time_s: float,
-        demand_window_start_ts: float,
-        demand_window_end_ts: float,
+        token_start: int,
+        token_end: int,
+        token_boundary: int,
+        consume_duration: float,
+        conversion_time: float,
         expected_chunk_len_high: float | None,
         predictor_source: str,
         text: str = "",
@@ -426,34 +463,29 @@ class ChunkStatCollector:
         pending_iters = self._current_pending_iters
         self.records.append(
             ChunkRecord(
-                chunk_idx=chunk_idx,
-                deadline_ts=deadline_ts,
-                gen_finish_ts=gen_finish_ts,
-                slack_s=slack_s,
+                unit_index=unit_index,
+                deadline=deadline,
+                text_generation_end_time=text_generation_end_time,
+                consumer_ready_time=consumer_ready_time,
+                unit_deadline_miss_s=unit_deadline_miss_s,
+                unit_deadline_missed=int(unit_deadline_miss_s > 0),
                 pending_time_s=self._current_pending_s,
                 word_count=word_count,
-                start_time_ts=start_time_ts,
                 num_token=num_token,
                 num_iters=running_iters + pending_iters,
                 num_running_iters=running_iters,
                 num_pending_iters=pending_iters,
                 expected_len=expected_len,
-                stall_start_ts=stall_start_ts,
-                stall_end_ts=stall_end_ts,
-                stall_duration_s=stall_duration_s,
-                token_start_idx=token_start_idx,
-                token_end_idx=token_end_idx,
-                cumulative_tokens_at_end=cumulative_tokens_at_end,
-                chunk_consume_time_s=chunk_consume_time_s,
-                conversion_time_s=conversion_time_s,
-                demand_window_start_ts=demand_window_start_ts,
-                demand_window_end_ts=demand_window_end_ts,
+                token_start=token_start,
+                token_end=token_end,
+                token_boundary=token_boundary,
+                consume_duration=consume_duration,
+                conversion_time=conversion_time,
                 expected_chunk_len_high=expected_chunk_len_high,
                 predictor_source=predictor_source,
                 text=text,
             ))
-        # Aggregate stall = max(0, -slack); positive only when late.
-        self.stall_time_total += max(0.0, -slack_s)
+        self.stall_time_total += unit_deadline_miss_s
         self._current_pending_s = 0.0
         self._current_running_iters = 0
         self._current_pending_iters = 0
@@ -487,7 +519,7 @@ class SsloRequestStats:
     prefill_step_count: int = 0
     # Wall-clock when the consumer can start reading: set at chunk 0 finish,
     # equals d(0) under the new contract.
-    consume_start_ts: float | None = None
+    consume_start_time: float | None = None
     # Wall-clock of first waiting→running transition; None if never admitted.
     admitted_ts: float | None = None
     # Final disposition of the request.
@@ -507,9 +539,9 @@ class RequestSLOState:
     current_chunk_generated_len: int = 0
 
     # Wall-clock when consumption can start; set once at chunk 0 finish.
-    # d(0) = chunk_0_gen_finish_ts, not decoding_start_ts, because the
+    # d(0) = chunk 0 text generation end, not decoding_start_ts, because the
     # consumer cannot start until the first chunk is actually available.
-    consume_start_ts: float | None = None
+    consume_start_time: float | None = None
 
     # Wall-clock of first waiting→running transition. Idempotent — only
     # set once; re-entries (running→pending→running) do not update it.
@@ -593,8 +625,9 @@ class RequestSLOState:
         consume_estimator: ChunkConsumeEstimator | None = None
         if config.consume_mode == "tts":
             assert config.tts_profile_path is not None
+            assert config.tts_model is not None
             consume_estimator = TtsProfileConsumeEstimator(
-                config.tts_profile_path)
+                config.tts_profile_path, config.tts_model)
         return cls(
             seconds_per_word=config.seconds_per_word,
             num_warmup_chunks=config.num_warmup_chunks,
@@ -642,8 +675,8 @@ class RequestSLOState:
 
     def chunk_deadline(self) -> float | None:
         # Bootstrapped to decoding_start_ts at first token / chunk event,
-        # overwritten to gen_finish_ts(0) when chunk 0 completes (so
-        # d(0) = consume_start_ts), then advanced by the stall-aware
+        # overwritten to chunk 0 text generation end when chunk 0 completes (so
+        # d(0) = consume_start_time), then advanced by the stall-aware
         # recurrence at each subsequent chunk boundary.
         return self.next_deadline_ts
 
@@ -919,7 +952,8 @@ class RequestSLOState:
         self,
         now: float,
         word_count: int,
-        chunk_consume_time_s: float,
+        consume_duration: float,
+        conversion_time: float | None = None,
         text: str = "",
     ) -> None:
         self._ensure_decoding_started(now)
@@ -928,23 +962,29 @@ class RequestSLOState:
         assert deadline is not None
 
         if self.chunks_completed == 0:
-            # d(0) = chunk 0's own finish time: the consumer can't start
-            # until the first chunk is available, so its deadline IS now.
-            self.consume_start_ts = now
+            # next_deadline_ts is TEXT-side (when text must be generated).
+            # For TTS, text-side deadline = consumer_deadline - conversion.
+            # Bootstrap text_side_deadline[0] = consume_start - conv = now,
+            # regardless of conv. consume_start_time keeps the audio-start
+            # real-world timestamp (= now + conv for TTS, now for read).
+            if conversion_time is None:
+                self.consume_start_time = now
+            else:
+                self.consume_start_time = now + conversion_time
             self.next_deadline_ts = now
             deadline = now
-            start_time_ts = self.decoding_start_ts
-        else:
-            start_time_ts = self.chunk_stats.records[-1].gen_finish_ts
 
-        slack = deadline - now
-        stall_duration_s = max(0.0, -slack)
-        if stall_duration_s > 0:
-            stall_start_ts: float | None = deadline
-            stall_end_ts: float | None = now
+        if conversion_time is None:
+            record_conversion_time = 0.0
+            consumer_ready_time = now
         else:
-            stall_start_ts = None
-            stall_end_ts = None
+            record_conversion_time = conversion_time
+            consumer_ready_time = now + record_conversion_time
+        # Miss is computed in TEXT-side time: was the text late vs its
+        # text-side deadline? consumer_ready_time is recorded for
+        # downstream timeline reconstruction but NOT used in deadline
+        # math (would double-count conv).
+        unit_deadline_miss_s = max(0.0, now - deadline)
 
         # Invariant: tokens are always accumulated (via on_token /
         # on_text_delta) before a chunk boundary is observed. on_finish's
@@ -957,28 +997,24 @@ class RequestSLOState:
         # estimate that pressure() used during this chunk's generation.
         expected_len = self._chunk_len_predictor.value
 
-        token_start_idx = self._cumulative_tokens
-        token_end_idx = self._cumulative_tokens + num_token
-        self._cumulative_tokens = token_end_idx
+        token_start = self._cumulative_tokens
+        token_end = self._cumulative_tokens + num_token
+        self._cumulative_tokens = token_end
 
         self.chunk_stats.record(
-            chunk_idx=self.chunks_completed,
-            deadline_ts=deadline,
-            gen_finish_ts=now,
-            slack_s=slack,
+            unit_index=self.chunks_completed,
+            deadline=deadline,
+            text_generation_end_time=now,
+            consumer_ready_time=consumer_ready_time,
+            unit_deadline_miss_s=unit_deadline_miss_s,
             word_count=word_count,
-            start_time_ts=start_time_ts,
             num_token=num_token,
             expected_len=expected_len,
-            stall_start_ts=stall_start_ts,
-            stall_end_ts=stall_end_ts,
-            stall_duration_s=stall_duration_s,
-            token_start_idx=token_start_idx,
-            token_end_idx=token_end_idx,
-            cumulative_tokens_at_end=token_end_idx,
-            chunk_consume_time_s=chunk_consume_time_s,
-            demand_window_start_ts=deadline,
-            demand_window_end_ts=deadline + chunk_consume_time_s,
+            token_start=token_start,
+            token_end=token_end,
+            token_boundary=token_end,
+            consume_duration=consume_duration,
+            conversion_time=record_conversion_time,
             expected_chunk_len_high=self._chunk_len_predictor.value_high,
             predictor_source=self._chunk_len_predictor.strategy,
             text=text,
@@ -989,14 +1025,13 @@ class RequestSLOState:
         if self._global_chunk_len_predictor is not None:
             self._global_chunk_len_predictor.update(num_token)
 
-        # Stall-aware deadline recurrence (t = chunk index just completed):
-        #   deadline(t+1) = max(deadline(t), finish(t)) + consume(t)
-        # An early arrival (finish < deadline) does not buy buffer time —
-        # consumption starts at deadline. A late arrival (finish > deadline)
-        # pushes the next deadline back by exactly the lateness so a single
-        # stall doesn't propagate as cumulative violation.
-        self.next_deadline_ts = (
-            max(deadline, now) + chunk_consume_time_s)
+        # Text-side stall-aware recurrence (t = chunk just completed):
+        #   text_deadline(t+1) = max(text_deadline(t), text_end(t)) + consume(t)
+        # Derived from consumer-side recurrence by subtracting conv from
+        # both sides — the conv terms cancel exactly. So the scheduler
+        # sees a deadline that's already shifted earlier for TTS without
+        # subtracting conv elsewhere.
+        self.next_deadline_ts = max(deadline, now) + consume_duration
         self.chunks_completed += 1
         self.current_chunk_generated_len = 0
 
@@ -1040,11 +1075,13 @@ class RequestSLOState:
         self.current_chunk_generated_len += delta_tokens
         for chunk_text in self.chunk_separator.feed(text, delta_tokens):
             word_count = len(chunk_text.split())
+            consume_s, conversion_s = self.consume_estimator.estimate(
+                chunk_text, word_count)
             self.on_chunk_boundary(
                 now=now,
                 word_count=word_count,
-                chunk_consume_time_s=self.consume_estimator.estimate(
-                    chunk_text, word_count),
+                consume_duration=consume_s,
+                conversion_time=conversion_s,
                 text=chunk_text,
             )
 
@@ -1059,11 +1096,13 @@ class RequestSLOState:
         remaining = self.chunk_separator.flush()
         if remaining and self.current_chunk_generated_len > 0:
             word_count = len(remaining.split())
+            consume_s, conversion_s = self.consume_estimator.estimate(
+                remaining, word_count)
             self.on_chunk_boundary(
                 now=now,
                 word_count=word_count,
-                chunk_consume_time_s=self.consume_estimator.estimate(
-                    remaining, word_count),
+                consume_duration=consume_s,
+                conversion_time=conversion_s,
                 text=remaining,
             )
         elif self.decoding_start_ts is None:
@@ -1083,7 +1122,7 @@ class RequestSLOState:
             final_chunk_expected_len=self._chunk_len_predictor.value,
             total_step_count=self.total_step_count,
             prefill_step_count=self.prefill_step_count,
-            consume_start_ts=self.consume_start_ts,
+            consume_start_time=self.consume_start_time,
             admitted_ts=self.admitted_ts,
             terminal_outcome=self.terminal_outcome,
         )

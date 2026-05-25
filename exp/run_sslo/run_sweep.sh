@@ -1,254 +1,228 @@
 #!/usr/bin/env bash
-# Unified full sweep: chunk_unit × max_num_seqs × request_rate × N trials × modes.
+# Full sweep launcher.
 #
-# Usage:
-#   run_sweep.sh [num_runs=3] [--label NAME]
+# One Python process per cell = (model, cap, consume_cell, mode, repeat).
+# Each cell iterates ALL rates on a shared engine via REQUEST_RATES, so a
+# given engine is loaded exactly once per cell.
 #
-# Env-var overrides (all optional; bare names — no _OVERRIDE suffix):
-#   MODEL=Qwen/Qwen3.5-35B-A3B
-#   NUM_PROMPTS=256
-#   GENERATION_MAX_TOKENS=4096
-#   MAX_MODEL_LEN=0                 (0 = auto, vLLM uses model HF config max)
-#   TENSOR_PARALLEL_SIZE=1
-#   GPU_MEMORY_UTILIZATION=0.95
-#   SECONDS_PER_WORD=0.28
-#   MODES=baseline,sslo,sslo_adaptive
-#   CHUNK_UNITS="sentence paragraph"  (space-separated)
-#   MAX_NUM_SEQS_VALUES="64"
-#   REQUEST_RATES="0 4 16 32"
-#   LABEL=                           (default-named subdir if empty)
-#   PARALLEL=0                       (0=sequential, 4=split across 4 GPUs)
+# Output layout:
+#   $OUTPUT_ROOT/sentence/<MODEL_SLUG>/<consume_mode>/<tts_slug>/cap<N>/<mode>/run_<i>/rate_<r>/
+# where tts_slug is "none" for consume_mode=read, else the TTS HF id with
+# '/' replaced by '__'. The model identity is recorded in each cell's
+# sslo_config.json and surfaced as a column by sweep_analysis.py csv.
 #
-# --label NAME (or LABEL env) writes outputs to
-#   exp/run_sslo/output_sweep/<NAME>/...
-# so multiple comparison sweeps can sit side by side and feed one
-# summary.csv at exp/run_sslo/output_sweep/summary.csv.
+# Execution plan: 4 sequential phases, LPT-balanced inside each phase.
+#   Phase 1: MODEL_SPECS[0] (default 9B)  run_1
+#   Phase 2: MODEL_SPECS[1] (default 35B) run_1
+#   Phase 3: MODEL_SPECS[0]               run_2..REPEATS
+#   Phase 4: MODEL_SPECS[1]               run_2..REPEATS
 #
-# Run inside the sk-sslo container from /workspace/mlsys.
+# Env overrides:
+#   MODEL_SPECS      space-sep "<slug>:<HF_id>" pairs (default 9B + 35B-A3B; must be 2)
+#   CAPS             max_num_seqs values (space-sep)  (default "32 64 128 256")
+#   MODES            modes (comma-sep)                (default baseline,sslo_mlp)
+#   REPEATS          number of repeats                (default 3)
+#   RATES            rate ladder (space-sep)          (default "1 2 4 8 12 16")
+#   CONSUME_CELLS    entries: "read" or "tts:<HF id>" (default read + 2 TTS models)
+#   TTS_PROFILE_PATH path to profile CSV              (default exp/run_sslo/profiles/word_count_duration_stats.csv)
+#   OUTPUT_ROOT      sweep destination dir            (default exp/run_sslo/output_sweep)
+#   NUM_GPUS         parallel workers                 (default 4)
 set -euo pipefail
+cd /workspace/mlsys
 
-LABEL="${LABEL:-}"
-POSITIONAL=()
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --label)    LABEL="$2"; shift 2 ;;
-    --label=*)  LABEL="${1#--label=}"; shift ;;
-    *)          POSITIONAL+=("$1"); shift ;;
-  esac
-done
-set -- "${POSITIONAL[@]}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-exp/run_sslo/output_sweep}"
+ROOT="${OUTPUT_ROOT}/sentence"
+mkdir -p "$ROOT"
 
-NUM_RUNS="${1:-3}"
-PARALLEL="${PARALLEL:-4}"
-# Start index for the inner run loop. Default 1 (fresh sweep). Set to
-# >1 to extend an existing sweep without re-running earlier indices —
-# e.g. START_RUN_INDEX=2 with NUM_RUNS=3 only writes run_2 and run_3.
-START_RUN_INDEX="${START_RUN_INDEX:-1}"
+MODEL_SPECS=(${MODEL_SPECS:-Qwen3.5-9B:Qwen/Qwen3.5-9B Qwen3.5-35B-A3B:Qwen/Qwen3.5-35B-A3B})
+CAPS=(${CAPS:-32 64 128 256})
+MODES_CSV="${MODES:-baseline,sslo_mlp}"
+IFS=',' read -ra MODE_ARR <<< "${MODES_CSV}"
+REPEATS="${REPEATS:-1}"
+RATES="${RATES:-4 8 12 16 20 24}"
+CONSUME_CELLS=(${CONSUME_CELLS:-read tts:hexgrad/Kokoro-82M tts:Supertone/supertonic-3})
 
-MODEL="${MODEL:-Qwen/Qwen3.5-35B-A3B}"
+NUM_GPUS="${NUM_GPUS:-4}"
+TTS_PROFILE_PATH="${TTS_PROFILE_PATH:-exp/run_sslo/profiles/word_count_duration_stats.csv}"
+
 NUM_PROMPTS="${NUM_PROMPTS:-4000}"
-GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS:-4096}"
+GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS:-2048}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-0}"
-TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
+DATASET_NAME="${DATASET_NAME:-koala}"
+DATASET_SEED="${DATASET_SEED:-42}"
+EXCLUDE_CODE="${EXCLUDE_CODE:-1}"
+CONVERSATION_ONLY="${CONVERSATION_ONLY:-1}"
+ENGLISH_ONLY="${ENGLISH_ONLY:-1}"
+MAX_RESPONSE_CHUNK_CHARS="${MAX_RESPONSE_CHUNK_CHARS:-1000}"
 SECONDS_PER_WORD="${SECONDS_PER_WORD:-0.28}"
-MODES="${MODES:-baseline,sslo,sslo_adaptive}"
 
-read -ra CHUNK_UNITS_ARR        <<< "${CHUNK_UNITS:-sentence paragraph}"
-read -ra MAX_NUM_SEQS_VALUES    <<< "${MAX_NUM_SEQS_VALUES:-64}"
-read -ra REQUEST_RATES          <<< "${REQUEST_RATES:-4 16 32}"
-
-# Distribute REQUEST_RATES round-robin across NUM_PARALLEL_GPUS for PARALLEL=4
-# so changes to REQUEST_RATES propagate without editing a second list.
-NUM_PARALLEL_GPUS=4
-GPU_RATE_ASSIGNMENTS=()
-for (( g=0; g<NUM_PARALLEL_GPUS; g++ )); do GPU_RATE_ASSIGNMENTS+=(""); done
-for (( i=0; i<${#REQUEST_RATES[@]}; i++ )); do
-  g=$(( i % NUM_PARALLEL_GPUS ))
-  if [[ -z "${GPU_RATE_ASSIGNMENTS[g]}" ]]; then
-    GPU_RATE_ASSIGNMENTS[g]="${REQUEST_RATES[i]}"
+# Parse "read" or "tts:<HF_id>" → echoes "<consume_mode> <tts_slug> <tts_model>"
+# Uses "-" placeholder for empty tts_model (read mode) to keep token count fixed.
+parse_cell() {
+  local cell="$1"
+  if [[ "$cell" == "read" ]]; then
+    echo "read none -"
+  elif [[ "$cell" == tts:* ]]; then
+    local tts_model="${cell#tts:}"
+    echo "tts ${tts_model//\//__} ${tts_model}"
   else
-    GPU_RATE_ASSIGNMENTS[g]+=" ${REQUEST_RATES[i]}"
+    echo "ERROR: CONSUME_CELLS entry must be 'read' or 'tts:<HF id>'; got '$cell'" >&2
+    return 1
   fi
-done
-
-SWEEP_ROOT="exp/run_sslo/output_sweep"
-BASE_OUTPUT="${SWEEP_ROOT}/${LABEL:-default}"
-BASE_SEED=42
-GPU_READY_FREE_FRAC=0.95
-GPU_READY_TIMEOUT_S=60
-GPU_READY_SLEEP_S=5
-
-# ---------------------------------------------------------------------------
-# gpu_wait_ready <gpu_index> — poll nvidia-smi until free memory exceeds
-# GPU_READY_FREE_FRAC * total or GPU_READY_TIMEOUT_S elapses.
-# ---------------------------------------------------------------------------
-gpu_wait_ready() {
-  local gpu_index="${1:-1}"
-  local deadline=$(( $(date +%s) + GPU_READY_TIMEOUT_S ))
-  while true; do
-    local line free total
-    line=$(nvidia-smi --query-gpu=memory.free,memory.total \
-      --format=csv,noheader,nounits -i "${gpu_index}" 2>/dev/null | head -1) || true
-    free=$(echo "${line}" | awk -F',' '{print $1+0}')
-    total=$(echo "${line}" | awk -F',' '{print $2+0}')
-    if [[ "${total}" -gt 0 ]]; then
-      local ready
-      ready=$(awk -v f="${free}" -v t="${total}" -v frac="${GPU_READY_FREE_FRAC}" \
-        'BEGIN { print (f > t * frac) ? "1" : "0" }')
-      if [[ "${ready}" == "1" ]]; then
-        echo "[gpu_wait] GPU${gpu_index}: ${free}/${total} MiB free — ready"
-        return 0
-      fi
-      echo "[gpu_wait] GPU${gpu_index}: ${free}/${total} MiB free — waiting..."
-    fi
-    if [[ $(date +%s) -ge ${deadline} ]]; then
-      echo "WARNING: GPU${gpu_index} memory wait timed out; proceeding anyway"
-      return 0
-    fi
-    sleep "${GPU_READY_SLEEP_S}"
-  done
 }
 
-# ---------------------------------------------------------------------------
-# write_run_status <out_dir> <mode:rc> [<mode:rc> ...]  →  out_dir/run_status.json
-# ---------------------------------------------------------------------------
-write_run_status() {
-  local out_dir="$1"; shift
-  local body="" sep=""
-  for pair in "$@"; do
-    body+="${sep}\"${pair%%:*}\": ${pair##*:}"
-    sep=", "
-  done
-  printf '{%s}\n' "${body}" > "${out_dir}/run_status.json"
+# Relative LPT cost. Only ordering matters; pick something that ranks
+# 35B > 9B and scales with cap.
+cell_cost() {
+  local model_slug="$1" cap="$2"
+  local base
+  case "$model_slug" in
+    *9B*)   base=9 ;;
+    *35B*)  base=22 ;;
+    *)      base=12 ;;
+  esac
+  # base minutes × 100 + cap so equal-base cells sort cap-desc.
+  echo $((base * 100 + cap))
 }
 
-# ---------------------------------------------------------------------------
-# run_cell <unit> <gpu> <rate> <seqs> <run_index>
-# ---------------------------------------------------------------------------
-run_cell() {
-  local unit="$1" gpu="$2" rate="$3" seqs="$4" run_index="$5"
-  local cell_root="${BASE_OUTPUT}/${unit}/seqs_${seqs}/rate_${rate}"
-
-  IFS=',' read -ra modes_arr <<< "${MODES}"
-
-  for mode in "${modes_arr[@]}"; do
-    [[ "${mode}" != "baseline" ]] && gpu_wait_ready "${gpu:-1}"
-    local mode_run_dir="${cell_root}/${mode}/run_${run_index}"
-    rm -rf "${mode_run_dir}"
-    mkdir -p "${mode_run_dir}"
-
-    local last_rc=0
-    OUTPUT_DIR="${mode_run_dir}" \
-    CUDA_VISIBLE_DEVICES="${gpu:-1}" \
-    CHUNK_UNIT="${unit}" \
-    REQUEST_RATE="${rate}" \
-    REQUEST_RATE_SEED=$(( BASE_SEED + run_index )) \
-    NUM_PROMPTS="${NUM_PROMPTS}" \
-    GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS}" \
-    MAX_MODEL_LEN="${MAX_MODEL_LEN}" \
-    TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE}" \
-    GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION}" \
-    SECONDS_PER_WORD="${SECONDS_PER_WORD}" \
-    MEASUREMENT_WINDOW_S="${MEASUREMENT_WINDOW_S:-180}" \
-    bash exp/run_sslo/run_test.sh "${mode}" "${seqs}" "${MODEL}" \
-      || last_rc=$?
-
-    if [[ "${last_rc}" -ne 0 ]]; then
-      echo "WARNING: ${mode} run_${run_index} exited ${last_rc}; skipping analyze"
-      continue
-    fi
-
-    python3 exp/run_sslo/analyze.py \
-      --output-dir "${mode_run_dir}" \
-      --max-num-seqs "${seqs}" \
-      --chunk-unit "${unit}" \
-      --request-rate "${rate}" \
-      --model "${MODEL}" \
-      --generation-max-tokens "${GENERATION_MAX_TOKENS}" \
-      --max-model-len "${MAX_MODEL_LEN}" \
-      ${LABEL:+--label "${LABEL}"}
-  done
-
-  # Refresh the sweep-wide summary.csv after each cell so partial sweeps
-  # are inspectable.
-  python3 exp/run_sslo/analysis/sweep_analysis.py csv \
-    --sweep-root "${SWEEP_ROOT}" \
-    --output "${SWEEP_ROOT}/summary.csv"
+launch_job() {
+  local model_slug="$1" model="$2" cap="$3" cell="$4" mode="$5" repeat="$6" gpu="$7"
+  local consume_mode tts_slug tts_model_raw
+  read -r consume_mode tts_slug tts_model_raw < <(parse_cell "$cell") || return 1
+  local tts_model=""
+  [[ "$tts_model_raw" != "-" ]] && tts_model="$tts_model_raw"
+  local outdir="${ROOT}/${model_slug}/${consume_mode}/${tts_slug}/cap${cap}/${mode}/run_${repeat}"
+  mkdir -p "$outdir"
+  echo "[gpu=$gpu] ${model_slug}/${consume_mode}/${tts_slug} cap=${cap} mode=${mode} repeat=${repeat}"
+  env CONSUME_MODE="$consume_mode" \
+    TTS_MODEL="$tts_model" \
+    TTS_PROFILE_PATH="${TTS_PROFILE_PATH}" \
+    OUTPUT_DIR="$outdir" \
+    REQUEST_RATES="$RATES" \
+    REQUEST_RATE_SEED="$((43 + repeat))" \
+    REPEAT="$repeat" \
+    SUMMARY_CSV="${OUTPUT_ROOT}/summary.csv" \
+    NUM_PROMPTS="$NUM_PROMPTS" \
+    GENERATION_MAX_TOKENS="$GENERATION_MAX_TOKENS" \
+    MAX_MODEL_LEN="$MAX_MODEL_LEN" \
+    CHUNK_UNIT=sentence \
+    CUDA_VISIBLE_DEVICES="$gpu" \
+    DATASET_NAME="$DATASET_NAME" \
+    DATASET_SEED="$DATASET_SEED" \
+    EXCLUDE_CODE="$EXCLUDE_CODE" \
+    CONVERSATION_ONLY="$CONVERSATION_ONLY" \
+    ENGLISH_ONLY="$ENGLISH_ONLY" \
+    MAX_RESPONSE_CHUNK_CHARS="$MAX_RESPONSE_CHUNK_CHARS" \
+    SECONDS_PER_WORD="$SECONDS_PER_WORD" \
+    bash exp/run_sslo/run_test.sh "$mode" "$cap" "$model" \
+    > "$outdir/run.log" 2>&1
 }
 
-# ---------------------------------------------------------------------------
-# run_subset <unit> <gpu> <rates...>
-# ---------------------------------------------------------------------------
-run_subset() {
-  local unit="$1" gpu="$2"
-  shift 2
-  for rate in "$@"; do
-    for seqs in "${MAX_NUM_SEQS_VALUES[@]}"; do
-      for (( i=START_RUN_INDEX; i<=NUM_RUNS; i++ )); do
-        echo
-        echo "[${unit}${gpu:+ GPU${gpu}}] rate=${rate} seqs=${seqs} run=${i}/${NUM_RUNS}"
-        run_cell "${unit}" "${gpu}" "${rate}" "${seqs}" "${i}"
+# Build cells for (model_slug, model_hf, repeats…) — one line per cell:
+#   "cost|model_slug|model|cap|cell|mode|repeat"
+build_phase_jobs() {
+  local model_slug="$1" model_hf="$2"; shift 2
+  local rs=("$@")
+  for cap in "${CAPS[@]}"; do
+    for cell in "${CONSUME_CELLS[@]}"; do
+      for mode in "${MODE_ARR[@]}"; do
+        for repeat in "${rs[@]}"; do
+          printf '%d|%s|%s|%d|%s|%s|%d\n' \
+            "$(cell_cost "$model_slug" "$cap")" \
+            "$model_slug" "$model_hf" "$cap" "$cell" "$mode" "$repeat"
+        done
       done
     done
   done
 }
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-if [[ "${PARALLEL}" != "0" && "${PARALLEL}" != "4" ]]; then
-  echo "ERROR: PARALLEL=${PARALLEL} is not supported (use 0 or 4)." >&2
+# LPT: sort jobs cost-desc, greedy assign to currently lightest GPU.
+run_phase() {
+  local phase_name="$1"; shift
+  local jobs=("$@")
+  if (( ${#jobs[@]} == 0 )); then
+    echo "[phase ${phase_name}] (no jobs)"
+    return 0
+  fi
+  echo
+  echo "===== phase ${phase_name}: ${#jobs[@]} cells across ${NUM_GPUS} GPUs (LPT) ====="
+  local sorted
+  sorted=$(printf '%s\n' "${jobs[@]}" | sort -t'|' -k1,1nr)
+  declare -a gpu_cost gpu_queue
+  for ((g=0; g<NUM_GPUS; g++)); do gpu_cost[g]=0; gpu_queue[g]=""; done
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    local cost="${entry%%|*}" job="${entry#*|}"
+    local min_g=0
+    for ((g=1; g<NUM_GPUS; g++)); do
+      (( ${gpu_cost[g]} < ${gpu_cost[min_g]} )) && min_g=$g
+    done
+    gpu_cost[min_g]=$((${gpu_cost[min_g]} + cost))
+    if [[ -z "${gpu_queue[min_g]}" ]]; then
+      gpu_queue[min_g]="$job"
+    else
+      gpu_queue[min_g]+=$'\n'"$job"
+    fi
+  done <<< "$sorted"
+  for ((g=0; g<NUM_GPUS; g++)); do
+    local n_cells=0
+    [[ -n "${gpu_queue[g]}" ]] && n_cells=$(printf '%s\n' "${gpu_queue[g]}" | grep -c .)
+    echo "  GPU${g}: cost=${gpu_cost[g]} cells=${n_cells}"
+  done
+  worker() {
+    local gpu=$1
+    while IFS= read -r job; do
+      [[ -z "$job" ]] && continue
+      IFS='|' read -r ms mh c cell m rp <<<"$job"
+      launch_job "$ms" "$mh" "$c" "$cell" "$m" "$rp" "$gpu"
+    done
+  }
+  local pids=()
+  for ((g=0; g<NUM_GPUS; g++)); do
+    printf '%s\n' "${gpu_queue[g]}" | worker "$g" &
+    pids+=($!)
+  done
+  local any_failed=0
+  for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+      echo "WARNING: worker pid=$pid exited non-zero" >&2
+      any_failed=1
+    fi
+  done
+  [[ "$any_failed" -ne 0 ]] && echo "phase ${phase_name} finished with worker failures"
+  echo "===== phase ${phase_name} complete ====="
+}
+
+# ----- 4-phase plan ----------------------------------------------------
+if (( ${#MODEL_SPECS[@]} != 2 )); then
+  echo "ERROR: Phase plan requires exactly 2 entries in MODEL_SPECS; got ${#MODEL_SPECS[@]}." >&2
   exit 1
 fi
+m0_slug="${MODEL_SPECS[0]%%:*}"; m0_hf="${MODEL_SPECS[0]#*:}"
+m1_slug="${MODEL_SPECS[1]%%:*}"; m1_hf="${MODEL_SPECS[1]#*:}"
 
-for unit in "${CHUNK_UNITS_ARR[@]}"; do
-  echo
-  echo "=========================================="
-  echo "  chunk_unit=${unit}"
-  echo "=========================================="
+later_repeats=()
+for r in $(seq 2 "$REPEATS"); do later_repeats+=("$r"); done
 
-  if [[ "${PARALLEL}" == "0" ]]; then
-    run_subset "${unit}" "" "${REQUEST_RATES[@]}"
-  else
-    pids=()
-    for (( gpu_id=0; gpu_id<${#GPU_RATE_ASSIGNMENTS[@]}; gpu_id++ )); do
-      read -ra gpu_rates <<< "${GPU_RATE_ASSIGNMENTS[gpu_id]}"
-      echo "  GPU${gpu_id} rates=${gpu_rates[*]:-<none>}"
-      if [[ ${#gpu_rates[@]} -gt 0 ]]; then
-        run_subset "${unit}" "${gpu_id}" "${gpu_rates[@]}" \
-          > "/tmp/sweep_${unit}_gpu${gpu_id}.log" 2>&1 &
-        pids+=($!)
-      fi
-    done
-    echo "  pids: ${pids[*]:-<none>}"
-    any_failed=0
-    for pid in "${pids[@]}"; do
-      wait "${pid}" || { echo "  WARNING: pid=${pid} exit=$?"; any_failed=1; }
-    done
-    [[ "${any_failed}" -ne 0 ]] && echo "  WARNING: aggregator will use whatever cells are present."
-  fi
-done
+mapfile -t p1 < <(build_phase_jobs "$m0_slug" "$m0_hf" 1)
+mapfile -t p2 < <(build_phase_jobs "$m1_slug" "$m1_hf" 1)
+p3=()
+p4=()
+if (( ${#later_repeats[@]} > 0 )); then
+  mapfile -t p3 < <(build_phase_jobs "$m0_slug" "$m0_hf" "${later_repeats[@]}")
+  mapfile -t p4 < <(build_phase_jobs "$m1_slug" "$m1_hf" "${later_repeats[@]}")
+fi
+
+phase3_label="2..${REPEATS}"
+[[ "$REPEATS" -le 1 ]] && phase3_label="(skipped)"
+
+run_phase "1 (${m0_slug} run_1)" "${p1[@]}"
+run_phase "2 (${m1_slug} run_1)" "${p2[@]}"
+run_phase "3 (${m0_slug} run_${phase3_label})" "${p3[@]}"
+run_phase "4 (${m1_slug} run_${phase3_label})" "${p4[@]}"
 
 echo
-echo "=========================================="
-echo "  Sweep complete. Aggregating..."
-echo "=========================================="
-for unit in "${CHUNK_UNITS_ARR[@]}"; do
-  echo
-  echo "--- chunk_unit=${unit} ---"
-  python3 exp/run_sslo/analysis/sweep_analysis.py agg-sweep \
-    --base-output "${BASE_OUTPUT}/${unit}" \
-    --num-runs "${NUM_RUNS}" \
-    --modes "${MODES}"
-done
-
-echo
-echo "--- writing summary.csv across all labels under ${SWEEP_ROOT}/ ---"
+echo "===== sweep complete ====="
 python3 exp/run_sslo/analysis/sweep_analysis.py csv \
-  --sweep-root "${SWEEP_ROOT}" \
-  --output "${SWEEP_ROOT}/summary.csv"
-
-echo
-echo "--- writing validity_checks.csv across all summaries under ${SWEEP_ROOT}/ ---"
-python3 exp/run_sslo/_consolidate_mode_outputs.py --validity-csv "${SWEEP_ROOT}"
+  --sweep-root "${OUTPUT_ROOT}" \
+  --output "${OUTPUT_ROOT}/summary.csv"

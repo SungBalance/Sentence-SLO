@@ -15,7 +15,7 @@ from vllm.sslo.slo_state import (
 def measured_state() -> RequestSLOState:
     state = RequestSLOState(num_warmup_chunks=1)
     state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=10.0)
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=10.0)
     return state
 
 
@@ -29,12 +29,12 @@ def test_phase_transitions_on_token_and_chunk_boundary():
     assert state.phase == Phase.WARMUP  # decode started, first chunk not done
     assert state.decoding_start_ts == pytest.approx(1.0)
 
-    state.on_chunk_boundary(1.2, word_count=1, chunk_consume_time_s=0.5)
+    state.on_chunk_boundary(1.2, word_count=1, consume_duration=0.5)
     # First chunk completed → MEASURED immediately (regardless of num_warmup_chunks).
     assert state.phase == Phase.MEASURED
     assert state.chunks_completed == 1
     state.on_token(1.3)
-    state.on_chunk_boundary(1.4, word_count=2, chunk_consume_time_s=0.7)
+    state.on_chunk_boundary(1.4, word_count=2, consume_duration=0.7)
     assert state.phase == Phase.MEASURED
     assert state.chunks_completed == 2
 
@@ -44,26 +44,25 @@ def test_chunk_record_and_diagnostics_append():
     state.on_token(5.0)
     state.on_pending_enter(5.1)
     state.on_pending_exit(5.4)
-    state.on_chunk_boundary(5.5, word_count=3, chunk_consume_time_s=0.84)
+    state.on_chunk_boundary(5.5, word_count=3, consume_duration=0.84)
 
     assert len(state.chunk_records) == 1
     record = state.chunk_records[0]
     assert isinstance(record, ChunkRecord)
-    assert record.chunk_idx == 0
+    assert record.unit_index == 0
     # Under the new contract d(0) = chunk 0's own finish time, not decoding_start_ts.
-    assert record.deadline_ts == pytest.approx(5.5)
-    assert record.gen_finish_ts == pytest.approx(5.5)
-    assert record.slack_s == 0.0
+    assert record.deadline == pytest.approx(5.5)
+    assert record.text_generation_end_time == pytest.approx(5.5)
+    assert record.consumer_ready_time == pytest.approx(5.5)
     assert record.pending_time_s == pytest.approx(0.3)
     assert state.chunk_stall_time_total == 0.0
     assert state.total_pending_time_s == pytest.approx(0.3)
     assert state.num_pending_intervals == 1
-    # Chunk 0 is on-time by definition — stall fields must be empty.
-    assert record.stall_duration_s == 0.0
-    assert record.stall_start_ts is None
-    assert record.stall_end_ts is None
-    # consume_start_ts is stamped at chunk 0 finish.
-    assert state.consume_start_ts == pytest.approx(5.5)
+    # Chunk 0 is on-time by definition.
+    assert record.unit_deadline_miss_s == 0.0
+    assert record.unit_deadline_missed == 0
+    # consume_start_time is stamped at chunk 0 finish.
+    assert state.consume_start_time == pytest.approx(5.5)
 
 
 def test_on_step_tracks_total_and_prefill_counts():
@@ -79,37 +78,35 @@ def test_on_step_tracks_total_and_prefill_counts():
     assert stats.prefill_step_count == 2
 
 
-def test_chunk1_records_real_slack():
-    # Chunk 1+ uses the real slack/stall computation. Stall-aware deadline
+def test_chunk1_records_real_deadline_miss():
+    # Chunk 1+ uses the real deadline miss computation. Stall-aware deadline
     # propagation: after chunk 0 finishes at t=0.5 with consume_time=1.0,
     # the next deadline = max(0.5, 0.5) + 1.0 = 1.5.
     state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
     state.on_token(0.0)
-    state.on_chunk_boundary(0.5, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.5, word_count=2, consume_duration=1.0)
     state.on_token(0.5)
-    state.on_chunk_boundary(2.0, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(2.0, word_count=2, consume_duration=1.0)
     rec = state.chunk_records[1]
-    assert rec.chunk_idx == 1
-    assert rec.deadline_ts == pytest.approx(1.5)
-    assert rec.gen_finish_ts == pytest.approx(2.0)
-    assert rec.slack_s == pytest.approx(-0.5)  # missed deadline by 0.5s
-    # stall = max(0, -slack); aggregated into chunk_stall_time_total.
+    assert rec.unit_index == 1
+    assert rec.deadline == pytest.approx(1.5)
+    assert rec.text_generation_end_time == pytest.approx(2.0)
+    assert rec.consumer_ready_time - rec.deadline == pytest.approx(0.5)
     assert state.chunk_stall_time_total == pytest.approx(0.5)
-    # Chunk 1 arrived late — stall fields must reflect the overrun.
-    assert rec.stall_duration_s == pytest.approx(0.5)
-    assert rec.stall_start_ts == pytest.approx(1.5)
-    assert rec.stall_end_ts == pytest.approx(2.0)
+    # Chunk 1 arrived late.
+    assert rec.unit_deadline_miss_s == pytest.approx(0.5)
+    assert rec.unit_deadline_missed == 1
 
 
 def test_chunk_expected_len_p90_tracks_history():
     state = RequestSLOState(num_warmup_chunks=1, chunk_len_strategy="p90")
     for _ in range(10):
         state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
     assert state.chunk_expected_len == pytest.approx(10.0)
     for _ in range(20):
         state.on_token(0.2)
-    state.on_chunk_boundary(0.3, word_count=4, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.3, word_count=4, consume_duration=1.0)
     # p90 over [10, 20] picks the larger one.
     assert state.chunk_expected_len == pytest.approx(20.0)
 
@@ -118,11 +115,11 @@ def test_chunk_expected_len_ema_strategy_smooths():
     state = RequestSLOState(num_warmup_chunks=1, chunk_len_strategy="ema")
     for _ in range(10):
         state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
     assert state.chunk_expected_len == pytest.approx(10.0)
     for _ in range(20):
         state.on_token(0.2)
-    state.on_chunk_boundary(0.3, word_count=4, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.3, word_count=4, consume_duration=1.0)
     # EMA(alpha=0.2): 0.2*20 + 0.8*10 = 12.0
     assert state.chunk_expected_len == pytest.approx(12.0)
 
@@ -278,7 +275,7 @@ def test_on_chunk_boundary_updates_global_predictor():
         global_chunk_len_predictor=glob,
     )
     state.on_token(0.0)
-    state.on_chunk_boundary(1.0, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(1.0, word_count=2, consume_duration=1.0)
     # Both per-req and global should have one sample now.
     assert state._chunk_len_predictor.sample_count == 1
     assert glob.sample_count == 1
@@ -428,52 +425,53 @@ def test_chunk_separator_breaks_thai_bullet_list():
     assert all(c.endswith("\n") for c in chunks)
 
 
-def test_chunk0_slack_zero_by_structure():
-    # Chunk 0's deadline = its own finish time, so slack = deadline - now = 0
-    # without any special-case branch.
+def test_chunk0_deadline_miss_zero_by_structure():
+    # Chunk 0's deadline = its own finish time, so it is on-time without any
+    # special-case branch.
     state = RequestSLOState(num_warmup_chunks=1)
     state.on_token(3.0)
-    state.on_chunk_boundary(4.0, word_count=1, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(4.0, word_count=1, consume_duration=1.0)
     rec = state.chunk_records[0]
-    assert rec.slack_s == pytest.approx(0.0)
-    assert rec.deadline_ts == pytest.approx(rec.gen_finish_ts)
+    assert rec.unit_deadline_miss_s == pytest.approx(0.0)
+    assert rec.consumer_ready_time == pytest.approx(4.0)
+    assert rec.deadline == pytest.approx(rec.text_generation_end_time)
 
 
-def test_consume_start_ts_set_at_chunk0_end():
+def test_consume_start_time_set_at_chunk0_end():
     state = RequestSLOState(num_warmup_chunks=1)
     state.on_token(1.0)
-    state.on_chunk_boundary(2.5, word_count=2, chunk_consume_time_s=1.0)
-    assert state.consume_start_ts == pytest.approx(2.5)
-    assert state.consume_start_ts == pytest.approx(
-        state.chunk_records[0].gen_finish_ts)
+    state.on_chunk_boundary(2.5, word_count=2, consume_duration=1.0)
+    assert state.consume_start_time == pytest.approx(2.5)
+    assert state.consume_start_time == pytest.approx(
+        state.chunk_records[0].text_generation_end_time)
 
 
-def test_stall_fields_populated_when_late():
-    # Chunk 1 arrives after its deadline — stall fields must be set.
+def test_unit_deadline_miss_populated_when_late():
+    # Chunk 1 arrives after its deadline.
     state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
     state.on_token(0.0)
-    state.on_chunk_boundary(1.0, word_count=1, chunk_consume_time_s=2.0)
+    state.on_chunk_boundary(1.0, word_count=1, consume_duration=2.0)
     # deadline(1) = max(1.0, 1.0) + 2.0 = 3.0; chunk arrives at 4.0.
     state.on_token(1.0)
-    state.on_chunk_boundary(4.0, word_count=1, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(4.0, word_count=1, consume_duration=1.0)
     rec = state.chunk_records[1]
-    assert rec.stall_duration_s == pytest.approx(1.0)
-    assert rec.stall_start_ts == pytest.approx(3.0)
-    assert rec.stall_end_ts == pytest.approx(4.0)
+    assert rec.unit_deadline_miss_s == pytest.approx(1.0)
+    assert rec.unit_deadline_missed == 1
+    assert rec.deadline == pytest.approx(3.0)
+    assert rec.consumer_ready_time == pytest.approx(4.0)
 
 
-def test_stall_fields_none_when_ontime():
-    # Chunk 1 arrives before its deadline — stall fields must be empty.
+def test_unit_deadline_miss_zero_when_ontime():
+    # Chunk 1 arrives before its deadline.
     state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
     state.on_token(0.0)
-    state.on_chunk_boundary(1.0, word_count=1, chunk_consume_time_s=5.0)
+    state.on_chunk_boundary(1.0, word_count=1, consume_duration=5.0)
     # deadline(1) = max(1.0, 1.0) + 5.0 = 6.0; chunk arrives at 3.0.
     state.on_token(1.0)
-    state.on_chunk_boundary(3.0, word_count=1, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(3.0, word_count=1, consume_duration=1.0)
     rec = state.chunk_records[1]
-    assert rec.stall_duration_s == 0.0
-    assert rec.stall_start_ts is None
-    assert rec.stall_end_ts is None
+    assert rec.unit_deadline_miss_s == 0.0
+    assert rec.unit_deadline_missed == 0
 
 
 # ---------------------------------------------------------------------------
@@ -486,38 +484,38 @@ def test_chunk_token_indices_monotone():
     # Chunk 0: 5 tokens
     for _ in range(5):
         state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
     # Chunk 1: 3 tokens
     for _ in range(3):
         state.on_token(0.2)
-    state.on_chunk_boundary(0.3, word_count=1, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.3, word_count=1, consume_duration=1.0)
     # Chunk 2: 7 tokens
     for _ in range(7):
         state.on_token(0.4)
-    state.on_chunk_boundary(0.5, word_count=3, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.5, word_count=3, consume_duration=1.0)
 
     recs = state.chunk_records
     assert len(recs) == 3
-    assert recs[0].token_start_idx == 0
-    assert recs[0].token_end_idx == 5
-    assert recs[1].token_start_idx == 5
-    assert recs[1].token_end_idx == 8
-    assert recs[2].token_start_idx == 8
-    assert recs[2].token_end_idx == 15
-    # cumulative_tokens_at_end matches token_end_idx
+    assert recs[0].token_start == 0
+    assert recs[0].token_end == 5
+    assert recs[1].token_start == 5
+    assert recs[1].token_end == 8
+    assert recs[2].token_start == 8
+    assert recs[2].token_end == 15
+    # token_boundary matches token_end.
     for rec in recs:
-        assert rec.cumulative_tokens_at_end == rec.token_end_idx
+        assert rec.token_boundary == rec.token_end
 
 
-def test_chunk_demand_window():
+def test_chunk_demand_window_derives_from_deadline_and_consume_duration():
     state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
     state.on_token(0.0)
     # chunk 0: deadline = now = 1.0, consume = 2.0
-    state.on_chunk_boundary(1.0, word_count=1, chunk_consume_time_s=2.0)
+    state.on_chunk_boundary(1.0, word_count=1, consume_duration=2.0)
     rec = state.chunk_records[0]
-    assert rec.demand_window_start_ts == pytest.approx(rec.deadline_ts)
-    assert rec.demand_window_end_ts == pytest.approx(rec.deadline_ts + rec.chunk_consume_time_s)
-    assert rec.chunk_consume_time_s == pytest.approx(2.0)
+    assert rec.deadline == pytest.approx(1.0)
+    assert rec.deadline + rec.consume_duration == pytest.approx(3.0)
+    assert rec.consume_duration == pytest.approx(2.0)
 
 
 def test_predictor_source_p90_emits_value_high():
@@ -526,10 +524,10 @@ def test_predictor_source_p90_emits_value_high():
     # Need at least 2 chunks to have a value_high (p99 over history).
     for _ in range(10):
         state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
     for _ in range(20):
         state.on_token(0.2)
-    state.on_chunk_boundary(0.3, word_count=3, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.3, word_count=3, consume_duration=1.0)
     # chunk 1 is the first to have a non-None expected_chunk_len_high
     rec = state.chunk_records[1]
     assert rec.predictor_source == "p90"
@@ -541,10 +539,10 @@ def test_predictor_source_ema_no_value_high():
         num_warmup_chunks=1, chunk_len_strategy="ema", min_chunk_tokens=0)
     for _ in range(10):
         state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
     for _ in range(5):
         state.on_token(0.2)
-    state.on_chunk_boundary(0.3, word_count=1, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.3, word_count=1, consume_duration=1.0)
     rec = state.chunk_records[1]
     assert rec.predictor_source == "ema"
     assert rec.expected_chunk_len_high is None
@@ -614,7 +612,7 @@ def test_pressure_components_no_tpot():
     # Advance to MEASURED phase: complete warmup chunk
     for _ in range(10):
         state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
     assert state.phase.name == "MEASURED"
     pc = state.pressure_components(0.2, tpot_s=None)
     assert not pc.pressure_available
@@ -628,7 +626,7 @@ def test_pressure_components_no_predictor():
     # "past-future" strategy never sets predictor.value
     for _ in range(10):
         state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
     assert state.phase.name == "MEASURED"
     assert state._chunk_len_predictor.value is None
     pc = state.pressure_components(0.2, tpot_s=0.05)
@@ -641,7 +639,7 @@ def test_pressure_components_available_finite():
     state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
     for _ in range(10):
         state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
     assert state.phase.name == "MEASURED"
     now = 0.5
     tpot = 0.04
@@ -665,7 +663,7 @@ def test_pressure_components_deadline_passed():
     for _ in range(10):
         state.on_token(0.0)
     # chunk 0 completes very late (now=100.0), consume=1.0 → next deadline ≈ 101.0
-    state.on_chunk_boundary(100.0, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(100.0, word_count=2, consume_duration=1.0)
     assert state.phase.name == "MEASURED"
     # Query well after the deadline (now=200.0)
     pc = state.pressure_components(200.0, tpot_s=0.05)
@@ -678,7 +676,7 @@ def test_pressure_equals_depletion_pressure():
     state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
     for _ in range(10):
         state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, chunk_consume_time_s=1.0)
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
     now = 0.5
     tpot = 0.04
     p = state.pressure(now, tpot)
@@ -701,7 +699,7 @@ def _measured_state_with_history(now_chunk_finish: float = 0.1):
     for _ in range(10):
         state.on_token(0.0)
     state.on_chunk_boundary(
-        now_chunk_finish, word_count=2, chunk_consume_time_s=1.0)
+        now_chunk_finish, word_count=2, consume_duration=1.0)
     assert state.phase.name == "MEASURED"
     return state
 

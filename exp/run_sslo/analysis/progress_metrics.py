@@ -9,45 +9,50 @@ DEFAULT_TAUS = (0.5, 1.0, 2.0, 5.0)
 
 
 def compute_stall_intervals(
-    chunks: list[dict[str, Any]],
+    units: list[dict[str, Any]],
 ) -> list[tuple[float, float, float]]:
-    """Walk per-request chunks in order; merge contiguous stalls.
+    """Return exact stall intervals under linear-between-deadlines consume.
 
-    Returns list of (start_ts, end_ts, duration_s). Two consecutive
-    stalled chunks form one merged interval iff chunk N's stall_end_ts
-    equals chunk N+1's stall_start_ts (no consume break in between).
-    In practice with positive chunk_consume_time_s, stalls are
-    non-contiguous, but the merge correctly handles consume_time = 0
-    workloads and any other zero-gap edge case.
+    With the linear-between-deadlines consume model, the stall region reduces
+    exactly to per-unit intervals [deadline[i], consumer_ready_time[i]) for
+    units where unit_deadline_miss_s > 0; no interval merging is needed.
     """
+    return [
+        (u["deadline"], u["consumer_ready_time"], u["unit_deadline_miss_s"])
+        for u in units
+        if u.get("unit_deadline_miss_s", 0) > 0
+    ]
+
+
+def compute_token_trace(
+    units: list[dict[str, Any]],
+) -> dict[str, list[tuple[float, float]]]:
+    """Build diagnostic available/consumed token traces."""
     ordered = sorted(
-        (c for c in chunks if c.get("chunk_idx") is not None),
-        key=lambda c: c["chunk_idx"],
+        units,
+        key=lambda u: (
+            u.get("unit_index") is None,
+            u.get("unit_index", 0),
+            u.get("deadline", 0),
+        ),
     )
-    intervals: list[list[float]] = []
-    current: list[float] | None = None
-    for c in ordered:
-        dur = c.get("stall_duration_s")
-        if dur is None or dur <= 0:
-            if current is not None:
-                intervals.append(current)
-                current = None
+    available: list[tuple[float, float]] = []
+    consumed: list[tuple[float, float]] = []
+    for unit in ordered:
+        ready = unit.get("consumer_ready_time")
+        boundary = unit.get("token_boundary")
+        if ready is not None and boundary is not None:
+            available.append((float(ready), float(boundary)))
+
+        start = unit.get("deadline")
+        if start is None or boundary is None:
             continue
-        start = c.get("stall_start_ts")
-        end = c.get("stall_end_ts")
-        if start is None or end is None:
-            continue
-        start = float(start)
-        end = float(end)
-        if current is not None and current[1] == start:
-            current[1] = end
-        else:
-            if current is not None:
-                intervals.append(current)
-            current = [start, end]
-    if current is not None:
-        intervals.append(current)
-    return [(s, e, e - s) for s, e in intervals]
+        consumed.append((float(start), float(boundary)))
+
+    return {
+        "available": sorted(available, key=lambda p: p[0]),
+        "consumed": sorted(consumed, key=lambda p: p[0]),
+    }
 
 
 def available_tokens_curve(
@@ -90,26 +95,41 @@ def per_request_progress(
     req_rows: list[dict[str, Any]],
     chunk_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    # Index chunks by request_id
-    chunks_by_req: dict[str, list[dict[str, Any]]] = {}
+    # Index consumable units by request_id.
+    units_by_req: dict[str, list[dict[str, Any]]] = {}
     for row in chunk_rows:
         rid = row.get("request_id")
         if rid is not None:
-            chunks_by_req.setdefault(str(rid), []).append(row)
+            units_by_req.setdefault(str(rid), []).append(row)
 
     results = []
     for req in req_rows:
         rid = str(req.get("request_id", ""))
-        ch = chunks_by_req.get(rid, [])
+        units = sorted(
+            units_by_req.get(rid, []),
+            key=lambda u: (
+                u.get("unit_index") is None,
+                u.get("unit_index", 0),
+                u.get("deadline", 0),
+            ),
+        )
 
         # arrival_ts
-        dts = req.get("decoding_start_ts")
-        ttft = req.get("ttft")
-        arrival_ts = (float(dts) - float(ttft)) if (dts is not None and ttft is not None) else None
+        arrival_ts = req.get("arrival_ts")
+        if arrival_ts is not None:
+            arrival_ts = float(arrival_ts)
+        else:
+            dts = req.get("decoding_start_ts")
+            ttft = req.get("ttft")
+            arrival_ts = (
+                (float(dts) - float(ttft))
+                if (dts is not None and ttft is not None)
+                else None
+            )
 
         # completion_ts
-        end_times = [float(c["end_time_ts"]) for c in ch if c.get("end_time_ts") is not None]
-        completion_ts = max(end_times) if end_times else None
+        completion_ts = req.get("completion_wall_ts")
+        completion_ts = float(completion_ts) if completion_ts is not None else None
 
         # completion_latency
         completion_latency = (
@@ -118,45 +138,38 @@ def per_request_progress(
             else None
         )
 
-        # consume_origin_ts: end_time_ts of chunk_idx == 0
-        consume_origin_ts = None
-        for c in ch:
-            if c.get("chunk_idx") == 0 and c.get("end_time_ts") is not None:
-                consume_origin_ts = float(c["end_time_ts"])
-                break
-
-        # final_deadline_ts
-        deadlines = [float(c["deadline_ts"]) for c in ch if c.get("deadline_ts") is not None]
+        deadlines = [
+            float(u["deadline"]) for u in units
+            if u.get("deadline") is not None
+        ]
+        consume_origin_ts = min(deadlines) if deadlines else None
         final_deadline_ts = max(deadlines) if deadlines else None
 
-        # demand_duration
-        demand_duration = None
+        # request_demand_duration_s
+        request_demand_duration_s = None
         if consume_origin_ts is not None and final_deadline_ts is not None:
             d = final_deadline_ts - consume_origin_ts
-            demand_duration = d if d > 0 else None
+            request_demand_duration_s = d if d > 0 else None
 
-        # stall per chunk (chunk_idx >= 1)
-        stalls = []
-        for c in ch:
-            if c.get("chunk_idx") is None or c["chunk_idx"] == 0:
-                continue
-            slack = c.get("chunk_slack")
-            if slack is not None:
-                stalls.append(max(0.0, -float(slack)))
-
-        total_stall_time = sum(stalls)
-        max_stall_time = max(stalls, default=0.0)
-        num_stall_intervals = sum(1 for s in stalls if s > 0)
-        stall_fraction = (
-            (total_stall_time / demand_duration)
-            if demand_duration is not None and demand_duration > 0
+        intervals = compute_stall_intervals(units)
+        unit_misses = [
+            float(u.get("unit_deadline_miss_s") or 0.0)
+            for u in units
+        ]
+        request_total_stall_s = sum(m for m in unit_misses if m > 0)
+        request_max_stall_s = max(
+            (float(d) for _, _, d in intervals),
+            default=0.0,
+        )
+        num_stall_intervals = len(intervals)
+        request_stall_fraction = (
+            (request_total_stall_s / request_demand_duration_s)
+            if (
+                request_demand_duration_s is not None
+                and request_demand_duration_s > 0
+            )
             else None
         )
-
-        # Phase 5: merged contiguous stall intervals from
-        # stall_start_ts / stall_end_ts (chunk-record fields).
-        intervals = compute_stall_intervals(ch)
-        max_stall_interval_s = max((d for _, _, d in intervals), default=0.0)
 
         results.append({
             "request_id": rid,
@@ -165,14 +178,12 @@ def per_request_progress(
             "completion_latency": completion_latency,
             "consume_origin_ts": consume_origin_ts,
             "final_deadline_ts": final_deadline_ts,
-            "demand_duration": demand_duration,
-            "total_stall_time": total_stall_time,
-            "max_stall_time": max_stall_time,
+            "request_demand_duration_s": request_demand_duration_s,
+            "request_total_stall_s": request_total_stall_s,
+            "request_max_stall_s": request_max_stall_s,
             "num_stall_intervals": num_stall_intervals,
-            "stall_fraction": stall_fraction,
+            "request_stall_fraction": request_stall_fraction,
             "stall_intervals": intervals,
-            "max_stall_interval_s": max_stall_interval_s,
-            "num_stall_intervals_merged": len(intervals),
             "num_output_tokens": req.get("num_output_tokens"),
             "num_prompt_tokens": req.get("num_prompt_tokens"),
         })
@@ -292,18 +303,19 @@ def throughput_stats(
     }
 
 
-def cp_slo_violation_rates(
+def request_cu_slo_violation_rates(
     per_req_progress: list[dict[str, Any]],
     taus: list[float],
 ) -> dict[str, dict[str, Any]]:
-    # Phase 5: switched basis from per-chunk `max_stall_time` to merged
-    # `max_stall_interval_s`. Contiguous stalls now count as one event.
     result: dict[str, dict[str, Any]] = {}
-    valid = [p for p in per_req_progress if p.get("max_stall_interval_s") is not None]
+    valid = [
+        p for p in per_req_progress
+        if p.get("request_max_stall_s") is not None
+    ]
     total = len(valid)
     for tau in taus:
         key = f"tau_{tau:g}"
-        violated = sum(1 for p in valid if p["max_stall_interval_s"] > tau)
+        violated = sum(1 for p in valid if p["request_max_stall_s"] > tau)
         result[key] = {
             "rate": (violated / total) if total > 0 else None,
             "violated": violated,
@@ -337,3 +349,37 @@ def chunk_slo_violation_rates(
             "total": total,
         }
     return result
+
+
+if __name__ == "__main__":
+    synthetic_units = [
+        {
+            "unit_index": 0,
+            "deadline": 10,
+            "consumer_ready_time": 9.5,
+            "consume_duration": 2,
+            "token_boundary": 10,
+            "unit_deadline_miss_s": 0,
+        },
+        {
+            "unit_index": 1,
+            "deadline": 12,
+            "consumer_ready_time": 13.0,
+            "consume_duration": 2,
+            "token_boundary": 20,
+            "unit_deadline_miss_s": 1.0,
+        },
+        {
+            "unit_index": 2,
+            "deadline": 15,
+            "consumer_ready_time": 14.5,
+            "consume_duration": 2,
+            "token_boundary": 30,
+            "unit_deadline_miss_s": 0,
+        },
+    ]
+    intervals = compute_stall_intervals(synthetic_units)
+    max_miss = max((d for _, _, d in intervals), default=0.0)
+    assert intervals == [(12, 13.0, 1.0)], f"unexpected intervals: {intervals}"
+    assert max_miss == 1.0, f"unexpected max_miss: {max_miss}"
+    print("OK")

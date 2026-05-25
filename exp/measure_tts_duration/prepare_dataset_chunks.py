@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import random as _random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,13 +25,6 @@ from common import (
 )
 
 
-ULTRACHAT_DATASET_ID = "HuggingFaceH4/ultrachat_200k"
-SUPPORTED_DATASETS = {
-    "ultrachat": ULTRACHAT_DATASET_ID,
-    ULTRACHAT_DATASET_ID: ULTRACHAT_DATASET_ID,
-}
-
-
 @dataclass(frozen=True)
 class DialogueTurn:
     dataset_item_id: str
@@ -43,59 +37,88 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Load a dialogue dataset and write sentence/paragraph text chunks."
     )
-    parser.add_argument("--dataset-name", default=ULTRACHAT_DATASET_ID)
-    parser.add_argument("--dataset-split", default="train_sft")
-    parser.add_argument("--max-dialogues", type=int, default=256)
+    parser.add_argument("--dataset-name", default="combine",
+                        choices=["combine", "wildchat", "lmsys"])
+    parser.add_argument(
+        "--dataset-split",
+        default=None,
+        help="Override default split; None = dataset default.",
+    )
+    parser.add_argument("--max-dialogues", type=int, default=2048)
+    # SSLO
+    parser.add_argument("--conversation-only", action="store_true", default=True)
+    # SSLO
+    parser.add_argument(
+        "--no-conversation-only",
+        dest="conversation_only",
+        action="store_false",
+    )
+    # SSLO
+    parser.add_argument("--english-only", action="store_true", default=True)
+    # SSLO
+    parser.add_argument("--no-english-only", dest="english_only", action="store_false")
+    # SSLO
+    parser.add_argument("--exclude-code", action="store_true", default=True)
+    # SSLO
+    parser.add_argument("--no-exclude-code", dest="exclude_code", action="store_false")
+    # SSLO
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="combine shuffle seed (matches run_sslo).",
+    )
+    # SSLO: chunk-level random subsample fraction. Applied AFTER chunk
+    # construction so TTS profile sample count = round(total_chunks * frac).
+    parser.add_argument(
+        "--sample-frac",
+        type=float,
+        default=0.5,
+        help="Random fraction of chunks to keep per chunk_unit (default 0.5).",
+    )
     parser.add_argument("--output-root", required=True)
     return parser.parse_args()
-
-
-def normalize_dataset_name(dataset_name: str) -> str:
-    try:
-        return SUPPORTED_DATASETS[dataset_name]
-    except KeyError as exc:
-        supported = ", ".join(sorted(SUPPORTED_DATASETS))
-        raise ValueError(
-            f"Unsupported dialogue dataset {dataset_name!r}. Supported: {supported}."
-        ) from exc
 
 
 def load_dialogue_turns(
     *,
     dataset_name: str,
-    split: str,
+    split: str | None,
     max_dialogues: int,
+    conversation_only: bool,
+    english_only: bool,
+    exclude_code: bool,
+    seed: int,
 ) -> list[DialogueTurn]:
-    dataset_id = normalize_dataset_name(dataset_name)
     if max_dialogues <= 0:
         raise ValueError("--max-dialogues must be positive.")
 
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:
-        raise RuntimeError(
-            "datasets is required in the execution container. "
-            "Install it before running this experiment."
-        ) from exc
+    # SSLO
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    # SSLO
+    from lm_datasets import load_dialogues
 
-    dataset = load_dataset(dataset_id, split=split)
+    # SSLO
+    dialogues = load_dialogues(
+        dataset_name,
+        split=split,
+        max_dialogues=max_dialogues,
+        conversation_only=conversation_only,
+        english_only=english_only,
+        exclude_code=exclude_code,
+        seed=seed,
+    )
     turns: list[DialogueTurn] = []
-    kept_dialogues = 0
-    for row_idx, row in enumerate(dataset):
-        messages = row.get("messages") or []
-        dialogue_turns = extract_turns(
-            dataset_item_id=str(row.get("prompt_id") or row.get("id") or f"row_{row_idx}"),
-            messages=messages,
+    for idx, dialogue in enumerate(dialogues):
+        turns.extend(
+            extract_turns(
+                dataset_item_id=f"{dataset_name}_{idx}",
+                messages=dialogue,
+            )
         )
-        if not dialogue_turns:
-            continue
-        turns.extend(dialogue_turns)
-        kept_dialogues += 1
-        if kept_dialogues >= min(max_dialogues, len(dataset)):
-            break
 
     if not turns:
-        raise RuntimeError("No usable dialogue turns remained after filtering.")
+        raise RuntimeError("No usable dialogue turns after filtering.")
     return turns
 
 
@@ -139,6 +162,7 @@ def build_chunk_rows(
     for turn in turns:
         pieces = [piece for piece in chunk_text(turn.text, chunk_unit) if piece.strip()]
         for chunk_idx, piece in enumerate(pieces):
+            wc = word_count(piece)
             rows.append(
                 {
                     "chunk_id": (
@@ -146,12 +170,19 @@ def build_chunk_rows(
                     ),
                     "dataset_name": dataset_name,
                     "dataset_item_id": turn.dataset_item_id,
+                    # SSLO: load_sslo_chunks.transform_row 가 request_id /
+                    # num_words / num_token 키를 요구. dataset_item_id 를
+                    # request_id 로 alias 하고, num_words 는 word_count 와
+                    # 같은 값, num_token 은 알 수 없으므로 0.
+                    "request_id": str(turn.dataset_item_id),
                     "turn_idx": turn.turn_idx,
                     "role": turn.role,
                     "chunk_unit": chunk_unit,
                     "chunk_idx": chunk_idx,
                     "text": piece,
-                    "word_count": word_count(piece),
+                    "word_count": wc,
+                    "num_words": wc,
+                    "num_token": 0,
                     "char_count": len(piece),
                 }
             )
@@ -191,6 +222,10 @@ def main() -> None:
         dataset_name=args.dataset_name,
         split=args.dataset_split,
         max_dialogues=args.max_dialogues,
+        conversation_only=args.conversation_only,
+        english_only=args.english_only,
+        exclude_code=args.exclude_code,
+        seed=args.seed,
     )
 
     for chunk_unit in ("sentence", "paragraph"):
@@ -199,6 +234,14 @@ def main() -> None:
             dataset_name=args.dataset_name,
             chunk_unit=chunk_unit,
         )
+        # SSLO: chunk-level random subsample. Reduces TTS profile sample
+        # count without changing the source distribution (dialogues are
+        # shuffled upstream; rows here are in turn order, so sample()
+        # gives uniform coverage across dialogues).
+        if 0 < args.sample_frac < 1.0 and rows:
+            rng = _random.Random(args.seed)
+            n_keep = max(1, int(round(len(rows) * args.sample_frac)))
+            rows = rng.sample(rows, n_keep)
         write_chunk_unit_output(
             output_root=output_root,
             chunk_unit=chunk_unit,

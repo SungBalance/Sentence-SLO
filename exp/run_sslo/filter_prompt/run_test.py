@@ -15,10 +15,10 @@ from typing import Any
 import random as _random
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "tools"))
 from lm_datasets import load_prompts, _load_wildchat, _load_lmsys
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from metrics_utils import MODES_DEFAULT
 from analysis.cpslo_names import classify_request
 
@@ -187,10 +187,9 @@ def load_workload(
 def _build_pool(args: argparse.Namespace) -> list[str]:
     """Build the sampling pool from the seed-agnostic combined cache.
 
-    The shared curated pool lives at
-    exp/tools/dataset_cache/processed_dataset.jsonl and is reused across
-    seeds. Seed only controls the load-time shuffle in
-    `load_or_build_combine_pool`. Chat template is then applied
+    The shared curated pool lives at exp/tools/dataset_cache/processed_dataset.jsonl
+    and is reused across seeds. Seed only controls the load-time shuffle
+    in `load_or_build_combine_pool`. Chat template is then applied
     per-model.
     """
     from dataset_cache import load_or_build_combine_pool
@@ -442,6 +441,8 @@ async def collect_one(
         "num_output_tokens": num_gen,
         "num_prompt_tokens": num_prompt_tokens,
         "num_consumable_units": len(slo_chunk_records),
+        # filter_prompt: preserve input prompt for cache filtering.
+        "prompt": prompt,
         "ttft": ttft,
         "ttfc": ttfc,
         "tpot": tpot,
@@ -1086,8 +1087,9 @@ async def _run_one_rate(
 
     async def injector() -> None:
         nonlocal injection_seq
-        while (injection_seq < max_total_requests
-               and not measurement_done_event.is_set()):
+        # filter_prompt fork: drop the measurement_done early-stop so
+        # every prompt in the pool is processed and classified.
+        while injection_seq < max_total_requests:
             inj_ts = time.time()
             local_idx = injection_seq
             injection_seq += 1
@@ -1108,22 +1110,10 @@ async def _run_one_rate(
     t0 = time.monotonic()
     try:
         await asyncio.gather(watcher(), injector())
-        # No cooldown — abort all still-in-flight requests at the engine
-        # level (releases engine_core resources and unblocks any waiting
-        # async generators), then cancel local asyncio tasks. Tolerate
-        # API differences across vLLM versions via broad except.
-        in_flight_ids = [
-            str(idx) for idx, task, _ in injected if not task.done()
-        ]
-        if in_flight_ids:
-            try:
-                await engine.abort(in_flight_ids)
-            except Exception as e:  # noqa: BLE001
-                print(f"{args.run_kind}: engine.abort failed: "
-                      f"{type(e).__name__}: {e}")
-        for _, task, _ in injected:
-            if not task.done():
-                task.cancel()
+        # filter_prompt fork: do NOT abort in-flight requests after
+        # measurement_done. We need every injected prompt to complete
+        # so that classification covers the entire pool. Just wait for
+        # all tasks to finish naturally.
         results = await asyncio.gather(
             *[t for _, t, _ in injected], return_exceptions=True)
         rows = [r for r in results if isinstance(r, dict)]
@@ -1164,6 +1154,8 @@ async def _run_one_rate(
             "completion_wall_ts",
             "num_output_tokens",
             "num_prompt_tokens",
+            # filter_prompt only: prompt text for cache filtering.
+            "prompt",
             # Spec section 6 + 12 per-request CU-SLO aggregates.
             "request_max_stall_s",
             "request_total_stall_s",
@@ -1179,19 +1171,14 @@ async def _run_one_rate(
             for row in rows
         ]
         write_jsonl(output_dir / "requests.jsonl", request_rows)
-        # chunks.jsonl carries only chunks from in-window (completed in
-        # window) requests so downstream analysis doesn't see warmup or
-        # post-window-end partial chunks.
-        in_window_rids = {
-            str(row["request_id"]) for row in rows if row.get("in_window")
-        }
+        # filter_prompt fork: emit chunks for ALL requests (no in-window
+        # filter) so every prompt gets classified.
         chunk_rows = [
             {
                 "request_id": str(row["request_id"]),
                 **chunk,
             }
             for row in rows
-            if str(row["request_id"]) in in_window_rids
             for chunk in (row.get("slo_chunk_records") or [])
         ]
         write_jsonl(output_dir / "chunks.jsonl", chunk_rows)

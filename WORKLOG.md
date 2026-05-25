@@ -1,5 +1,29 @@
 # Work Log
 
+## 2026-05-25 (Figure 5.1 request metrics)
+
+- Modified: `exp/plots/figures/scripts/figs/fig5_1_token_metric_mismatch.py` — added two-line `Request N` / TPOT labels inside the upper-left corner of each existing trace panel, shifted the labels slightly right, removed the temporary bottom metric tables, and changed the consumed-token trace to a solid line.
+- Modified: `exp/plots/figures/scripts/figs/fig5_1_token_metric_mismatch.py` — replaced the in-panel TPOT labels with three-line per-request panel titles using actual request IDs, tokens, TPOT, words, consume time, and consume-token rate.
+- Modified: `exp/plots/figures/scripts/figs/fig5_1_token_metric_mismatch.py` — tightened the legend-to-panel-title spacing, added a small gap below each request title, and reduced the metric title font size.
+- Modified: `exp/plots/figures/scripts/figs/fig5_1_token_metric_mismatch.py` — tuned legend-title and title-plot spacing to a compact, matching gap of roughly 16 px in the rendered PNG.
+- Modified: `exp/plots/figures/scripts/figs/fig5_1_token_metric_mismatch.py` — renamed the token-count y-axis to `# of Tokens` and moved the legend up to increase the legend-title gap.
+- Modified: `exp/plots/figures/scripts/figs/fig5_2_cu_slo_reconstruction.py` — added the request ID title only, removed max-stall/tau annotations, renamed token axes, removed Slack from the legend, and reused the consumable-token blue for the lower panel data.
+- Modified: `exp/plots/figures/scripts/figs/fig5_2_cu_slo_reconstruction.py` — added the generated-token trace and changed the available-consumable-unit trace to match Figure 5.1's blue dotted style and legend wording.
+- Modified: `exp/plots/figures/scripts/figs/fig5_2_cu_slo_reconstruction.py` — renamed the lower-panel y-axis to `Remained Consumable Tokens`.
+- Added: Regenerated `exp/plots/figures/fig5_1_token_metric_mismatch.png` and `exp/plots/figures/fig5_2_cu_slo_reconstruction.png`.
+- Debugging/verification: Ran container compileall for Figure 5.1/5.2 scripts, regenerated Figure 5.2 preprocessing output, regenerated both PNGs inside `sk-sslo-vllm`, and visually checked both figures.
+- Modified: `exp/plots/figures/scripts/figs/paper_plot_style.py` — fixed the Pretendard font lookup after the figures folder restructure so the common style resolves `exp/plots/fonts/Pretendard-Regular.ttf`.
+- Added: Regenerated `exp/plots/figures/processed/fig5_1_token_metric_mismatch_request_metrics.csv` with TPOT-only values and refreshed `exp/plots/figures/fig5_1_token_metric_mismatch.png`.
+- Debugging/verification: Ran container compileall, regenerated Figure 5.1 preprocessing output, regenerated the PNG inside `sk-sslo-vllm`, and visually checked the resulting image.
+
+## 2026-05-25
+
+- Modified: `exp/run_sslo/analysis/sweep_analysis.py` — R3 summary CSV schema now emits the requested context columns, flat R2 distribution/scalar metrics, validity columns for capacity filtering, and per-tau `request_cu_slo_violation_rate_tau_*` columns while dropping old cpslo/progress/chunk-slack columns.
+- Modified: `exp/run_sslo/analysis/validity.py` and `exp/run_sslo/analyze.py` — validity reports now include placeholder runtime counters, request preemption totals, starvation count from flat per-mode metrics, and `included_in_main_result`.
+- Modified: `exp/run_sslo/run_smoke.sh` — smoke launcher now iterates `MODES x CONSUME_CELLS` with the R3 default mode/rate ladder.
+- Added: `exp/run_sslo/analysis/capacity.py` — computes supported handling-user capacity and policy ratios against baseline from `summary.csv`.
+- Debugging/verification: Separate read-only verifier found no R3 issues. Host `bash -n exp/run_sslo/run_smoke.sh` passed. Required Docker verification commands could not run from this session because the Docker API socket returned permission denied.
+
 ## 2026-05-23
 
 - Modified: `vllm/vllm/sslo/slo_state.py` — added `ChunkLengthPredictor.reset()` used between rate sweeps.
@@ -702,3 +726,390 @@ DATASET_NAME=combine DATASET_SEED=42 EXCLUDE_CODE=1 \
 - Modified: `plots_new/paper_plot_style.py`, `plots_new/synthetic_figures.py`, and `plots_new/README.md` — switched synthetic figure export to PNG-only and updated documentation wording.
 - Removed: Existing `plots_new/figures/synthetic/*.pdf` outputs.
 - Debugging/verification: Used forked developer/verifier agents. Developer ran container compile/generation in `sk-sslo-vllm`; verifier confirmed 7 PNG outputs, 7 CSV files, no PDF outputs, and no remaining PDF-format references.
+
+## 2026-05-24 (TTS profile plots)
+
+- Added content: `exp/measure_tts_duration/plot_word_count_profiles.py` to plot
+  TTS profile mean/variance by word count from `word_count_duration_stats.csv`.
+- Added content: Generated four PNGs under
+  `exp/measure_tts_duration/output/profile_per_wc/plots/`:
+  smoothing-regression and bar+variance views for conversion time and audio
+  duration.
+- Modified content: Updated TTS profile plots to cap chunk length at 80,
+  remove regression datapoints, share barplot y-axes, and use the shared
+  `exp/plots_new/paper_plot_style.py` color palette.
+- Modified content: Lowered the TTS profile plot chunk-length cap to 60 and
+  set both `exp/plots_new/paper_plot_style.py` and `exp/plots/paper_plot_style.py`
+  to use the same common palette by default.
+- Modified content: Promoted the TTS profile plot to Figure 5.0, fixed it to
+  bar-only output, and reserved the common palette's first/second colors for
+  baseline/SSLO while using third/fourth colors for non-policy series.
+- Debugging/verification: Ran the plotting script inside `sk-sslo-vllm` with
+  container workdir `/workspace/mlsys`; verified PNG dimensions and file sizes.
+  Ran `python3 -m compileall` for the plotting script and paper plot style.
+
+## 2026-05-24 (TTS profile plots, Figure 5.0 relocation)
+
+- Added content: Moved the Figure 5.0 entrypoint to
+  `exp/plots_new/fig5_0_tts_word_count_profiles.py` so it follows the same
+  `fig5_0_{...}.py` management pattern as the other plot scripts.
+- Added content: Synced the updated profile CSV into
+  `exp/plots_new/word_count_duration_stats.csv`.
+- Modified content: Regenerated `exp/plots_new/figures/fig5_0_conversion_time.png`,
+  `exp/plots_new/figures/fig5_0_audio_duration.png`, and
+  `exp/plots_new/figures/data/fig5_0_tts_word_count_profiles.csv`.
+- Removed content: Dropped the old
+  `exp/measure_tts_duration/plot_word_count_profiles.py` entrypoint.
+- Debugging/verification: Ran Docker compileall for the Figure 5.0 script and
+  shared plot styles, regenerated the figures inside `sk-sslo-vllm`, confirmed
+  the profile CSV copy matches the source CSV, and verified both PNG outputs.
+
+## 2026-05-24 (TTS profile plots, plots folder)
+
+- Modified content: Updated `exp/plots/fig5_0_tts_word_count_profiles.py` to
+  use `exp/plots/word_count_duration_stats.csv` and `exp/plots/figures/` by
+  default, regardless of the caller's working directory.
+- Modified content: Matched Figure 5.0 typography and sizing to the other
+  `exp/plots/fig5_*` figures by using the default paper theme and double-column
+  figure sizing.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_0_conversion_time.png`,
+  `exp/plots/figures/fig5_0_audio_duration.png`, and
+  `exp/plots/figures/data/fig5_0_tts_word_count_profiles.csv`.
+- Debugging/verification: Ran Docker compileall and regenerated Figure 5.0 in
+  `sk-sslo-vllm` from `/workspace/mlsys/exp/plots`; confirmed both PNG outputs
+  are 4113 x 4113.
+
+## 2026-05-24 (plots title removal and Figure 5.0 regression)
+
+- Modified content: Removed Matplotlib title calls from all
+  `exp/plots/fig5_*` scripts.
+- Modified content: Changed all Figure 5 scripts to default to data and output
+  paths under `exp/plots/` using each script's own directory.
+- Modified content: Updated Figure 5.0 so conversion time is rendered as a
+  smooth regression line with a variance band, while audio duration remains a
+  bar plot with variance bars; removed the bar/error explanatory annotation.
+- Added content: Regenerated all `exp/plots/figures/fig5_*.png` files and
+  matching `exp/plots/figures/data/fig5_*.csv` files.
+- Debugging/verification: Ran Docker compileall for all Figure 5 scripts and
+  regenerated all figures inside `sk-sslo-vllm`; verified no `set_title` or
+  `suptitle` calls remain in the Figure 5 scripts.
+
+## 2026-05-24 (Figure 5.0 model labels)
+
+- Modified content: Updated `exp/plots/fig5_0_tts_word_count_profiles.py` so
+  TTS model names are shown above each panel instead of inside the left y-axis
+  label.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_0_conversion_time.png` and
+  `exp/plots/figures/fig5_0_audio_duration.png`.
+- Debugging/verification: Ran Docker compileall and regenerated Figure 5.0 in
+  `sk-sslo-vllm`; confirmed no `set_title` or `suptitle` calls were added.
+
+## 2026-05-24 (Figure 5.0 combined panel)
+
+- Modified content: Updated `exp/plots/fig5_0_tts_word_count_profiles.py` to
+  render conversion time and audio duration side by side in one combined
+  Figure 5.0 output.
+- Added content: Regenerated the combined
+  `exp/plots/figures/fig5_0_tts_word_count_profiles.png` and matching data CSV.
+- Removed content: Removed the old separate Figure 5.0 PNG outputs for
+  conversion time and audio duration.
+- Debugging/verification: Ran Docker compileall and regenerated Figure 5.0 in
+  `sk-sslo-vllm`; confirmed only the combined Figure 5.0 PNG remains and no
+  `set_title` or `suptitle` calls were added.
+
+## 2026-05-24 (Figure 5.0 wide axis labels)
+
+- Modified content: Adjusted `exp/plots/fig5_0_tts_word_count_profiles.py` to
+  use a wider double-column aspect ratio.
+- Modified content: Enabled x-axis tick labels and x-axis labels on the upper
+  Figure 5.0 panels as well as the lower panels.
+- Modified content: Added right-side x-axis padding so data up to word count
+  60 is shown without clipping the `60` tick label or final bar.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_0_tts_word_count_profiles.png`.
+- Debugging/verification: Ran Docker compileall and regenerated Figure 5.0 in
+  `sk-sslo-vllm`; verified the updated PNG is 4074 x 3221.
+
+## 2026-05-24 (plots color-profile regeneration)
+
+- Added content: Regenerated all `exp/plots/figures/fig5_*.png` files and
+  matching `exp/plots/figures/data/fig5_*.csv` files using the current
+  `exp/plots/paper_plot_style.py` color profile.
+- Debugging/verification: Ran Docker compileall for `paper_plot_style.py`,
+  `_policy_style.py`, and all `exp/plots/fig5_*.py` scripts, then executed
+  Figure 5.0 through Figure 5.7 inside `sk-sslo-vllm`.
+
+## 2026-05-24 (policy color centralization)
+
+- Modified content: Added `POLICY_COLORS` to `exp/plots/paper_plot_style.py`
+  so baseline and SSLO colors are centralized alongside `TTS_MODEL_COLORS`.
+- Modified content: Updated `exp/plots/_policy_style.py` to import and re-use
+  `paper_plot_style.POLICY_COLORS` instead of deriving policy colors locally
+  from `COMMON_PALETTE`.
+- Added content: Regenerated policy-color figures
+  `exp/plots/figures/fig5_3_stall_capacity_frontier.png`,
+  `exp/plots/figures/fig5_5_refill_risk_diagnostic.png`, and
+  `exp/plots/figures/fig5_6_policy_behavior_no_harm.png` with matching data
+  CSVs.
+- Debugging/verification: Ran Docker compileall for `paper_plot_style.py`,
+  `_policy_style.py`, and the affected policy-color figure scripts; verified
+  `_policy_style.POLICY_COLORS` points to the shared
+  `paper_plot_style.POLICY_COLORS` object.
+
+## 2026-05-24 (Figure 5.3 highlight removal and Figure 5.8)
+
+- Modified content: Removed the supported-point highlight overlay from
+  `exp/plots/fig5_3_stall_capacity_frontier.py` so Figure 5.3 no longer has
+  oversized bold points.
+- Added content: Added `exp/plots/fig5_8_handling_tradeoffs.py` to show
+  violation-vs-handling-users and violation-vs-TTFC tradeoff panels using the
+  shared policy colors and batch markers.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_3_stall_capacity_frontier.png`,
+  `exp/plots/figures/fig5_8_handling_tradeoffs.png`, and matching data CSVs.
+- Debugging/verification: Ran Docker compileall and generation for Figure 5.3
+  and Figure 5.8 inside `sk-sslo-vllm`; verified no title calls or oversized
+  highlight markers remain in the touched scripts.
+
+## 2026-05-24 (arrival-rate axis ticks)
+
+- Modified content: Updated `exp/plots/fig5_3_stall_capacity_frontier.py` so
+  arrival-rate x-axis ticks are placed exactly at measured `lambda_req_s`
+  datapoints instead of Matplotlib's automatic tick positions.
+- Modified content: Updated `exp/plots/fig5_4_operating_map.py` so every
+  heatmap panel shows the exact measured arrival-rate tick labels.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_3_stall_capacity_frontier.png`,
+  `exp/plots/figures/fig5_4_operating_map.png`, and matching data CSVs.
+- Debugging/verification: Ran Docker compileall and generation for Figure 5.3
+  and Figure 5.4 inside `sk-sslo-vllm`; visually checked the regenerated PNGs
+  for exact arrival-rate tick placement and label readability.
+
+## 2026-05-24 (Figure 5.0 reading consume profile)
+
+- Modified content: Updated `exp/plots/fig5_0_tts_word_count_profiles.py` so
+  Figure 5.0 uses regression plots for both conversion time and consume time,
+  including the reading consume-time profile.
+- Modified content: Extended `exp/plots/paper_plot_style.py` with additional
+  shared palette colors and assigned the reading profile its own palette color.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_0_tts_word_count_profiles.png` and matching data
+  CSVs under `exp/plots/figures/data/`.
+- Debugging/verification: Ran Docker compileall for `paper_plot_style.py` and
+  `fig5_0_tts_word_count_profiles.py`, then regenerated Figure 5.0 inside
+  `sk-sslo-vllm` and visually checked the updated PNG.
+
+## 2026-05-24 (Figure 5.0 merged model panels)
+
+- Modified content: Updated `exp/plots/fig5_0_tts_word_count_profiles.py` so
+  Figure 5.0 has one row with two side-by-side panels, overlaying both TTS
+  models in each panel and Human Reading in the consume-time panel.
+- Modified content: Updated `exp/plots/paper_plot_style.py` TTS labels for the
+  Figure 5.0 legend text.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_0_tts_word_count_profiles.png` and matching data
+  CSVs under `exp/plots/figures/data/`.
+- Debugging/verification: Ran Docker compileall for `paper_plot_style.py` and
+  `fig5_0_tts_word_count_profiles.py`, regenerated Figure 5.0 inside
+  `sk-sslo-vllm`, and visually checked the two-panel PNG.
+
+## 2026-05-24 (Figure 5.0 outlier-cleaned refresh)
+
+- Added content: Regenerated
+  `exp/plots/figures/fig5_0_tts_word_count_profiles.png` and matching Figure
+  5.0 data CSVs after the TTS profile CSV outliers were removed.
+- Debugging/verification: Ran Docker compileall for
+  `fig5_0_tts_word_count_profiles.py` and `paper_plot_style.py`, regenerated
+  Figure 5.0 inside `sk-sslo-vllm`, and visually checked that the variance
+  spikes were removed from the refreshed PNG.
+
+## 2026-05-24 (Figure 5.0 Human Reading solid line)
+
+- Modified content: Updated `exp/plots/fig5_0_tts_word_count_profiles.py` so
+  the Human Reading curve and legend handle use a solid line and the x-axis
+  label reads `Sentence Length (# of Words)`.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_0_tts_word_count_profiles.png` and matching Figure
+  5.0 data CSVs.
+- Debugging/verification: Ran Docker compileall for
+  `fig5_0_tts_word_count_profiles.py`, regenerated Figure 5.0 inside
+  `sk-sslo-vllm`, and visually checked the refreshed PNG.
+
+## 2026-05-24 (plot axis and legend weight)
+
+- Modified content: Updated `exp/plots/paper_plot_style.py` to use thicker
+  axis spines, thicker major ticks, and a thicker default legend frame.
+- Modified content: Updated Figure 5.0 to use the common legend frame weight
+  and renamed the Kokoro legend entry to `TTS: Kokoro-82M (GPU)`.
+- Added content: Regenerated all `exp/plots/figures/fig5_*.png` outputs for
+  the common design change, then regenerated Figure 5.0 after the label change.
+- Debugging/verification: Ran Docker compileall for the plot scripts,
+  regenerated the figures inside `sk-sslo-vllm`, and visually checked the
+  refreshed Figure 5.0 legend and axes.
+
+## 2026-05-24 (Figure folder restructure)
+
+- Modified content: Reorganized the Figure 5 plotting tree under
+  `exp/plots/figures/`: raw inputs live under `data/`, processed CSVs under
+  `processed/`, preprocessing scripts under `scripts/preprocess/`, and plotting
+  scripts plus shared helpers under `scripts/figs/`.
+- Modified content: Updated all Figure 5 scripts so plotting entry points read
+  `figures/processed/` CSVs by default and preprocessing entry points read
+  `figures/data/` inputs.
+- Added content: Added `exp/plots/README.md`, `scripts/figs/figure_paths.py`,
+  and per-figure `scripts/preprocess/process_fig_5_*.py` entry points.
+- Added content: Regenerated all `exp/plots/figures/fig5_*.png` images and
+  refreshed all `exp/plots/figures/processed/*.csv` outputs.
+- Debugging/verification: Ran Docker compileall for `scripts/figs` and
+  `scripts/preprocess`, then ran the full preprocess loop followed by the full
+  figure generation loop inside `sk-sslo-vllm`.
+
+## 2026-05-24 (SSLO metric refactor Round 1)
+
+- Modified content: Renamed SSLO chunk/request timing fields in
+  `vllm/vllm/sslo/slo_state.py` to the Round 1 metric schema, including
+  `consumer_ready_time`, `consume_duration`, `unit_deadline_miss_s`, and
+  `unit_deadline_missed`.
+- Modified content: Updated SSLO tests under `vllm/tests/sslo/` and the
+  `exp/run_sslo/run_test.py` request/chunk JSONL writers for the new field
+  names.
+- Debugging/verification: Ran static grep checks for removed field aliases,
+  `git diff --check`, and a separate verifier review with no remaining issues.
+  The required docker pytest command was attempted but blocked by Docker socket
+  permission denial in this session.
+
+## 2026-05-24 (SSLO metric refactor Round 2)
+
+- Modified content: Updated `exp/run_sslo/analysis/progress_metrics.py` to
+  derive request stall intervals directly from R1 per-unit token trace fields,
+  emit `request_*` progress keys, and expose
+  `request_cu_slo_violation_rates`.
+- Modified content: Updated `exp/run_sslo/analyze.py` to write the Round 2
+  flattened summary metric shape, including per-mode request stall
+  distributions, flattened latency/queue/scheduler/throughput fields,
+  request-CU SLO violation rates, `drop_timeout_rate`, and
+  `starvation_count`.
+- Modified content: Updated only `_summary_row` in `exp/run_sslo/run_test.py`
+  for the flattened summary shape and R1 workload names
+  `num_consumable_units` / `consume_duration`.
+- Debugging/verification: Ran `git diff --check` and three verifier-agent
+  review passes. The required Docker verification command was attempted twice
+  but blocked by Docker socket permission denial in this session.
+
+## 2026-05-25 (Figure 5.1 candidate filtering)
+
+- Modified content: Updated `exp/plots/figures/scripts/figs/fig5_1_token_metric_mismatch.py`
+  to filter non-English, CJK, list-like, structured, numeric-dump, reference,
+  product-key, JSON, and code/path-like candidates while using a 500-700 output
+  token range for Figure 5.1 preprocessing.
+- Modified content: Regenerated Figure 5.1 processed CSVs and PNG under
+  `exp/plots/figures/processed/` and `exp/plots/figures/`.
+- Debugging/verification: Ran Docker compileall, Figure 5.1 preprocess, and
+  Figure 5.1 rendering inside `sk-sslo-vllm`; previewed the regenerated PNG.
+
+## 2026-05-25 (Figure 5.2 max-batch stall request)
+
+- Modified content: Updated `exp/plots/figures/scripts/figs/fig5_2_cu_slo_reconstruction.py`
+  to select the max-batch filtered request with the most measured stall and to
+  display model, max batch size, and request rate under the request title.
+- Modified content: Clipped the Figure 5.2 x-axis to the selected request's
+  generation completion time.
+- Modified content: Extended Figure 5.2 selection to all baseline max-batch
+  model outputs, selected the highest stall-count request from the larger
+  `Qwen3.5-35B-A3B` cap512 run, and fixed both token y-axes to 0-700.
+- Modified content: Limited the Figure 5.2 x-axis to 0-30 seconds and adjusted
+  edge tick labels to avoid clipping.
+- Modified content: Recomputed the Figure 5.2 shared token y-axis from the
+  visible 0-30 second window, giving the current plot a 0-300 token scale.
+
+## 2026-05-25 (Figure 5.1 line simplification)
+
+- Modified content: Removed the Available Consumable Unit line and legend entry
+  from `exp/plots/figures/scripts/figs/fig5_1_token_metric_mismatch.py`.
+- Modified content: Regenerated `exp/plots/figures/fig5_1_token_metric_mismatch.png`.
+- Debugging/verification: Ran Docker compileall for the Figure 5.1 script,
+  rendered the figure inside `sk-sslo-vllm`, and previewed the PNG.
+- Modified content: Regenerated Figure 5.2 processed CSVs and PNG under
+  `exp/plots/figures/processed/` and `exp/plots/figures/`.
+- Debugging/verification: Checked max-batch filtered stall candidates inside
+  `sk-sslo-vllm`, then ran Docker compileall, Figure 5.2 preprocess, and
+  Figure 5.2 rendering; previewed the regenerated PNG.
+
+## 2026-05-25 (Figure 5 plotting readiness)
+
+- Modified content: Appended this worklog entry only; no plot scripts, data
+  CSVs, or PNG outputs were changed.
+- Debugging/verification: Inspected the `exp/plots/figures` layout, shared
+  plotting helpers, per-figure preprocess/render entry points, processed CSV
+  schemas, generated PNG dimensions, file ownership, and container mount state.
+  Docker execution is currently blocked because `sk-sslo` has a stale empty
+  `/workspace/mlsys` mount, and host-side PNG overwrite is blocked by
+  `nobody:nogroup` ownership on `exp/plots/figures`.
+
+## 2026-05-25 (Figure 5 sk-sslo-vllm readiness)
+
+- Modified content: Appended this worklog entry only; no plot scripts, data
+  CSVs, or PNG outputs were changed.
+- Debugging/verification: Switched plot verification to `sk-sslo-vllm`, whose
+  `/workspace/mlsys` mount points at this workspace. Verified matplotlib,
+  pandas, and numpy imports, compiled all 22 Figure 5 Python scripts, rendered
+  all 9 Figure 5 PNGs to `/tmp/sslo_plot_check`, and ran all preprocessing
+  scripts to `/tmp/sslo_preprocess_check`, producing the expected 13 CSVs.
+
+## 2026-05-25 (Figure 5.3 batch-size cleanup)
+
+- Modified content: Updated
+  `exp/plots/figures/scripts/figs/fig5_3_stall_capacity_frontier.py` so Figure
+  5.3 keeps only batch sizes 16 and 32, aggregates by concrete
+  `max_num_seqs`, removes the Beta reference line and legend entry, labels the
+  legend as `Baseline (Batch Size N)` / `ProgressServe (Batch Size N)`, and
+  increases the left/right panel spacing to avoid label overlap.
+- Added content: Regenerated
+  `exp/plots/figures/processed/fig5_3_stall_capacity_frontier.csv` and
+  `exp/plots/figures/fig5_3_stall_capacity_frontier.png` inside
+  `sk-sslo-vllm`.
+- Debugging/verification: Compiled the Figure 5.3 script in `sk-sslo-vllm`,
+  regenerated preprocessing and the PNG, asserted the processed CSV contains
+  only `max_num_seqs` values 16 and 32 with no `batch_group` column, checked no
+  Beta/Max Batch strings remain, and visually inspected the refreshed PNG.
+
+## 2026-05-25 (Figure 5.4-5.8 plot revisions)
+
+- Modified content: Updated Figure 5.4 to use fixed per-model violation-rate
+  scales, method labels above the heatmap columns, tighter model-row spacing,
+  and hidden upper-row x-axis labels to avoid overlap.
+- Modified content: Updated Figure 5.5 to a single-column pressure boxplot and
+  removed the now-unused `chunks.jsonl` / future-stall preprocessing dependency.
+- Modified content: Reworked Figure 5.6 into boxplots for Queue Stall P95,
+  Pending Time P95, and TTFC P95 at batch size 128 and request rates 2, 8, and
+  20 req/s.
+- Modified content: Updated Figure 5.7 to reuse the Figure 5.0 model colors.
+- Modified content: Updated Figure 5.8 to use concrete batch sizes 16 and 32
+  with thin connecting lines, hollow dashed markers for batch size 16, and
+  solid filled markers for batch size 32.
+- Added content: Regenerated processed CSVs and PNG outputs for Figures 5.4
+  through 5.8 inside `sk-sslo-vllm`.
+- Debugging/verification: Ran touched-script `py_compile`, regenerated
+  preprocessing and plots in `sk-sslo-vllm`, checked processed CSV invariants,
+  visually inspected refreshed PNGs, ran `git diff --check`, and completed a
+  separate verifier-agent pass with no remaining issues.
+
+## 2026-05-25 (Figure 5.5 and 5.6 distribution revisions)
+
+- Modified content: Updated Figure 5.5 to plot request-level max pressure
+  against chunk violation volume, with policy-colored scatter points and trend
+  lines on a log-scale pressure axis.
+- Modified content: Updated Figure 5.6 preprocessing to use request-level
+  Queue Stall, TTFC, and Pending Time distributions from `requests.jsonl`,
+  keeping batch size 128 and request rates 2, 8, and 20 req/s, with Pending
+  Time as the rightmost metric.
+- Added content: Regenerated
+  `exp/plots/figures/processed/fig5_5_refill_risk_diagnostic.csv`,
+  `exp/plots/figures/processed/fig5_6_policy_behavior_no_harm.csv`, and their
+  corresponding PNG outputs inside `sk-sslo-vllm`.
+- Debugging/verification: Compiled the touched Figure 5.5 and Figure 5.6
+  scripts, regenerated preprocessing and plots in `sk-sslo-vllm`, asserted the
+  processed CSV schemas and selected Figure 5.6 batch/rate/metric invariants,
+  visually inspected the refreshed PNGs, and ran `git diff --check`.

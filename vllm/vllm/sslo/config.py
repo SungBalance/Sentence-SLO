@@ -49,6 +49,9 @@ class SsloConfig:
     # the base throughput isn't worth the latency relief.
     adaptive_batching_low_cap_throughput_ratio: float = 0.25
     seconds_per_word: float = 0.28
+    consume_mode: str = "read"
+    tts_profile_path: str | None = None
+    tts_model: str | None = None
     chunk_unit: str = "sentence"
     # Chunk-length predictor strategy: "ema" / "p90" / "p99" /
     # "past-future" (placeholder). Picks the conservatism point for
@@ -128,6 +131,22 @@ class SsloConfig:
                 f"chunk_len_strategy must be one of "
                 f"{sorted(_VALID_CHUNK_LEN_STRATEGIES)}, "
                 f"got {self.chunk_len_strategy!r}")
+        if self.consume_mode not in {"read", "tts"}:
+            raise ValueError(
+                "consume_mode must be one of ['read', 'tts'], "
+                f"got {self.consume_mode!r}")
+        if self.consume_mode == "tts" and self.tts_profile_path is None:
+            raise ValueError(
+                "tts_profile_path must be set when consume_mode='tts'")
+        if self.consume_mode == "tts" and self.tts_model is None:
+            raise ValueError(
+                "tts_model must be set when consume_mode='tts'")
+        if (self.consume_mode == "read"
+                and (self.tts_profile_path is not None
+                     or self.tts_model is not None)):
+            raise ValueError(
+                "tts_profile_path and tts_model must be None when "
+                "consume_mode='read'")
         if self.num_warmup_chunks < 1:
             raise ValueError(
                 f"num_warmup_chunks must be >= 1, "

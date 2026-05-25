@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ MAX_NUM_SEQS = 64
 DEFAULT_OUTPUT_DIR = "exp/run_sslo/output"
 SSLO_MODES = ("sslo", "sslo_offload", "sslo_adaptive", "sslo_adaptive_offload", "sslo_mlp")
 ALL_MODES = ("baseline",) + SSLO_MODES
+SIX_STAT_KEYS = ("mean", "p50", "p90", "p95", "p99", "max")
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,12 +41,150 @@ def dist_for_key(rows: list[dict[str, Any]], key: str) -> dict[str, float | int 
     return distribution_stats(numeric_values(rows, key))
 
 
+def flatten_distribution(
+    out: dict[str, Any],
+    prefix: str,
+    stats: dict[str, float | int | None],
+    *,
+    suffix: str = "_s",
+) -> None:
+    for key in SIX_STAT_KEYS:
+        out[f"{prefix}_{key}{suffix}"] = stats.get(key)
+
+
+def finalize_round2_metrics(
+    metrics: dict[str, Any],
+    modes: tuple[str, ...],
+    request_progress_distributions: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Return the Round 2 summary.json metrics shape."""
+    final: dict[str, Any] = {}
+
+    for key in (
+        "slack",
+        "slo_compliance",
+        "inter_chunk_delay",
+        "prediction_ratio",
+        "stall_time",
+        "measurement_window",
+    ):
+        if key in metrics:
+            final[key] = metrics[key]
+
+    if "workload" in metrics:
+        final["workload"] = {}
+        for mode, workload in metrics["workload"].items():
+            final["workload"][mode] = {
+                k: v for k, v in workload.items()
+                if k != "num_chunks_total"
+            }
+
+    if "request_cu_slo_violation" in metrics:
+        final["request_cu_slo_violation"] = metrics["request_cu_slo_violation"]
+
+    if "scheduler" in metrics:
+        final["scheduler"] = {}
+        flattened_scheduler_keys = {
+            "mean_running_time_weighted",
+            "mean_pending_time_weighted",
+            "mean_waiting_time_weighted",
+            "mean_handling_users_time_weighted",
+        }
+        for mode, sched in metrics["scheduler"].items():
+            final["scheduler"][mode] = {
+                k: v for k, v in sched.items()
+                if k not in flattened_scheduler_keys
+            }
+
+    if "handling_users" in metrics:
+        final["handling_users"] = {}
+        for mode, handling in metrics["handling_users"].items():
+            final["handling_users"][mode] = {
+                k: v for k, v in handling.items()
+                if k != "time_avg"
+            }
+
+    if "throughput" in metrics:
+        final["throughput"] = {}
+        for mode, throughput in metrics["throughput"].items():
+            final["throughput"][mode] = {
+                k: v for k, v in throughput.items()
+                if k != "tokens_per_second"
+            }
+
+    for mode in modes:
+        mode_metrics: dict[str, Any] = {}
+        progress = request_progress_distributions.get(mode) or {}
+        flatten_distribution(
+            mode_metrics, "request_max_stall_s",
+            progress.get("request_max_stall_s") or {},
+            suffix="")
+        flatten_distribution(
+            mode_metrics, "request_total_stall_s",
+            progress.get("request_total_stall_s") or {},
+            suffix="")
+        flatten_distribution(
+            mode_metrics, "request_stall_fraction",
+            progress.get("request_stall_fraction") or {},
+            suffix="")
+        flatten_distribution(
+            mode_metrics, "completion_latency",
+            progress.get("completion_latency") or {})
+
+        ttft_all = ((metrics.get("ttft") or {}).get(mode) or {}).get("all") or {}
+        flatten_distribution(mode_metrics, "ttft", ttft_all)
+        flatten_distribution(
+            mode_metrics, "ttfc",
+            (metrics.get("ttfc") or {}).get(mode) or {})
+        flatten_distribution(
+            mode_metrics, "tpot",
+            (metrics.get("tpot") or {}).get(mode) or {})
+        flatten_distribution(
+            mode_metrics, "queue_stall",
+            (metrics.get("queue_stall") or {}).get(mode) or {})
+        pending_time = (
+            ((metrics.get("pending") or {}).get(mode) or {}).get("time") or {}
+        )
+        flatten_distribution(mode_metrics, "pending_time", pending_time)
+
+        scheduler = (metrics.get("scheduler") or {}).get(mode) or {}
+        mode_metrics["mean_running"] = scheduler.get("mean_running_time_weighted")
+        mode_metrics["mean_pending"] = scheduler.get("mean_pending_time_weighted")
+        mode_metrics["mean_waiting"] = scheduler.get("mean_waiting_time_weighted")
+        mode_metrics["mean_handling_users"] = scheduler.get(
+            "mean_handling_users_time_weighted")
+
+        throughput = (metrics.get("throughput") or {}).get(mode) or {}
+        mode_metrics["corrected_processed_tokens_per_s"] = throughput.get(
+            "tokens_per_second")
+
+        workload = (metrics.get("workload") or {}).get(mode) or {}
+        total = workload.get("num_requests_total") or 0
+        completed = workload.get("num_requests_completed") or 0
+        mode_metrics["drop_timeout_rate"] = (
+            ((total - completed) / total) if total else None
+        )
+        mode_metrics["starvation_count"] = workload.get("starvation_count")
+        mode_metrics["unit_deadline_miss_rate"] = workload.get(
+            "unit_deadline_miss_rate")
+        final[mode] = mode_metrics
+
+    return final
+
+
 def slack_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
-    # Exclude chunk_idx == 0: chunk_slack is fixed at 0.0 for the first
-    # chunk by definition (deadline starts there), so including it dilutes
-    # both the violation ratio and the distribution stats.
-    rows = [r for r in rows if r.get("chunk_idx") not in (None, 0)]
-    values = numeric_values(rows, "chunk_slack")
+    if any("unit_deadline_miss_s" in r for r in rows):
+        values = [
+            -float(r.get("unit_deadline_miss_s") or 0.0)
+            for r in rows
+            if r.get("unit_index") is not None
+        ]
+    else:
+        # Exclude chunk_idx == 0: chunk_slack is fixed at 0.0 for the first
+        # chunk by definition (deadline starts there), so including it dilutes
+        # both the violation ratio and the distribution stats.
+        filtered = [r for r in rows if r.get("chunk_idx") not in (None, 0)]
+        values = numeric_values(filtered, "chunk_slack")
     neg_count = sum(1 for v in values if v < 0)
     return {
         "count": len(values),
@@ -60,18 +200,24 @@ def slack_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
 
 
 def stall_time_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
-    """Per-chunk stall = max(0, -slack) statistics over chunks (idx >= 1).
+    """Per-unit stall statistics.
 
     Returns:
-      - mean        : average stall over chunks where stall > 0 (violated).
-      - mean_with_0 : average stall over ALL chunks (idx >= 1), counting
-                      on-time chunks as 0. Reflects overall slack burn.
-      - p50, p90, p99 : percentiles of stall across ALL chunks (idx >= 1),
-                        with on-time chunks contributing 0.
+      - mean        : average stall over units where stall > 0 (violated).
+      - mean_with_0 : average stall over all eligible units, counting on-time
+                      units as 0. Reflects overall slack burn.
+      - p50, p90, p99 : percentiles of stall across all eligible units.
     """
-    rows = [r for r in rows if r.get("chunk_idx") not in (None, 0)
-            and r.get("chunk_slack") is not None]
-    stalls_all = [max(0.0, -float(row["chunk_slack"])) for row in rows]
+    if any("unit_deadline_miss_s" in r for r in rows):
+        stalls_all = [
+            max(0.0, float(row.get("unit_deadline_miss_s") or 0.0))
+            for row in rows
+            if row.get("unit_index") is not None
+        ]
+    else:
+        filtered = [r for r in rows if r.get("chunk_idx") not in (None, 0)
+                    and r.get("chunk_slack") is not None]
+        stalls_all = [max(0.0, -float(row["chunk_slack"])) for row in filtered]
     stalls_violated = [s for s in stalls_all if s > 0]
     mean_violated = (
         statistics.fmean(stalls_violated) if stalls_violated else None)
@@ -89,15 +235,18 @@ def stall_time_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None
 
 
 def prediction_ratio_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
-    """Per-chunk ratio of actual / predicted token count.
+    """Per-unit ratio of actual / predicted token count.
 
-    Skips chunk_idx == 0 (predictor has no history yet) and rows where
+    Skips unit/chunk 0 (predictor has no history yet) and rows where
     expected_len is None or non-positive. ratio == 1 means perfect
     prediction; > 1 means actual exceeded prediction (under-estimate).
     """
     values: list[float] = []
     for row in rows:
-        if row.get("chunk_idx") in (None, 0):
+        unit_index = row.get("unit_index")
+        if unit_index is None:
+            unit_index = row.get("chunk_idx")
+        if unit_index in (None, 0):
             continue
         actual = row.get("num_token")
         expected = row.get("expected_len")
@@ -123,8 +272,11 @@ def request_compliance_stats(rows: list[dict[str, Any]]) -> dict[str, float | in
             continue
         rid = str(rid)
         seen.add(rid)
+        miss = row.get("unit_deadline_miss_s")
         slack = row.get("chunk_slack")
-        if slack is not None and float(slack) < 0:
+        if miss is not None and float(miss) > 0:
+            violated.add(rid)
+        elif slack is not None and float(slack) < 0:
             violated.add(rid)
     total = len(seen)
     compliant = total - len(violated)
@@ -136,10 +288,16 @@ def request_compliance_stats(rows: list[dict[str, Any]]) -> dict[str, float | in
 
 
 def pending_request_stats(rows: list[dict[str, Any]]) -> dict[str, dict[str, float | int | None]]:
+    intervals = []
+    for row in rows:
+        value = row.get("num_pending_intervals")
+        if value is None:
+            value = row.get("num_pending_iters_per_request")
+        if value is not None:
+            intervals.append(float(value))
     return {
         "time": dist_for_key(rows, "total_pending_time_s"),
-        "intervals": distribution_stats(
-            numeric_values(rows, "num_pending_iters_per_request")),
+        "intervals": distribution_stats(intervals),
     }
 
 
@@ -147,15 +305,22 @@ def inter_chunk_delay_stats(rows: list[dict[str, Any]]) -> dict[str, float | int
     by_request: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         request_id = row.get("request_id")
-        if request_id is None or row.get("chunk_idx") is None or row.get("end_time_ts") is None:
+        unit_index = row.get("unit_index")
+        end_ts = row.get("text_generation_end_time")
+        if unit_index is None:
+            unit_index = row.get("chunk_idx")
+        if end_ts is None:
+            end_ts = row.get("end_time_ts")
+        if request_id is None or unit_index is None or end_ts is None:
             continue
-        by_request.setdefault(str(request_id), []).append(row)
+        normalized = {**row, "_unit_index": unit_index, "_end_ts": end_ts}
+        by_request.setdefault(str(request_id), []).append(normalized)
     delays: list[float] = []
     for request_rows in by_request.values():
-        ordered = sorted(request_rows, key=lambda r: int(r["chunk_idx"]))
+        ordered = sorted(request_rows, key=lambda r: int(r["_unit_index"]))
         for prev, cur in zip(ordered, ordered[1:]):
-            cur_end = float(cur["end_time_ts"])
-            prev_end = float(prev["end_time_ts"])
+            cur_end = float(cur["_end_ts"])
+            prev_end = float(prev["_end_ts"])
             if cur_end >= prev_end:
                 delays.append(cur_end - prev_end)
     return distribution_stats(delays)
@@ -230,11 +395,16 @@ def _filter_by_window(
     """Keep only requests in the measurement window and their chunks.
 
     Prefers the per-row `in_window` flag (set by run_test.py from the
-    completion timestamp under the new completion-gated workflow). Falls
-    back to injection_ts ∈ [mw0, mw1) for runs that predate the flag."""
+    completion timestamp under the new completion-gated workflow). Falls back
+    to completion_wall_ts when compact request rows omit the flag, then to
+    injection_ts in [mw0, mw1) for older rows."""
     has_flag = any("in_window" in r for r in req_rows)
     if has_flag:
         kept_req = [r for r in req_rows if r.get("in_window")]
+    elif any("completion_wall_ts" in r for r in req_rows):
+        kept_req = [r for r in req_rows
+                    if r.get("completion_wall_ts") is not None
+                    and mw0 <= float(r["completion_wall_ts"]) <= mw1]
     else:
         kept_req = [r for r in req_rows
                     if r.get("injection_ts") is not None
@@ -301,6 +471,12 @@ def analyze(
     request_rows_mode = read_jsonl(output_dir / "requests.jsonl")
     chunk_rows_mode = read_jsonl(output_dir / "chunks.jsonl")
     sched_rows_mode = read_jsonl(output_dir / "scheduler_stats.jsonl")
+    # Per-rate outputs are already single-mode; tag rows here because the
+    # compact R1 writers no longer carry a mode field per row.
+    for row in request_rows_mode:
+        row.setdefault("mode", mode)
+    for row in chunk_rows_mode:
+        row.setdefault("mode", mode)
     # scheduler_stats.jsonl is written by the scheduler with no mode awareness;
     # tag rows here for the per-mode split downstream.
     for row in sched_rows_mode:
@@ -356,17 +532,17 @@ def analyze(
 
     baseline_req = req_by_mode["baseline"]
     is_control = bool(baseline_req) and len(baseline_req) <= max_num_seqs
-    queue_stall_available = any(r.get("queue_stall") is not None for r in request_rows_all)
+    queue_stall_available = any(
+        r.get("queue_stall_s") is not None for r in request_rows_all)
 
     metrics: dict[str, Any] = {
         "ttft": {}, "ttfc": {}, "tpot": {}, "queue_stall": {}, "slack": {},
         "slo_compliance": {}, "scheduler": {}, "pending": {}, "inter_chunk_delay": {},
         "prediction_ratio": {}, "stall_time": {},
-        "progress_request": {}, "workload": {}, "throughput": {},
-        "cp_slo_violation": {}, "chunk_slo_violation": {}, "measurement_window": {}, "handling_users": {},
-        # Phase 5: new top-level section for merged-interval CP-SLO metrics.
-        "cpslo": {},
+        "workload": {}, "throughput": {},
+        "request_cu_slo_violation": {}, "measurement_window": {}, "handling_users": {},
     }
+    request_progress_distributions: dict[str, dict[str, Any]] = {}
 
     for mode in ALL_MODES:
         req_rows = req_by_mode[mode]
@@ -384,7 +560,7 @@ def analyze(
         metrics["ttft"][mode] = {"all": dist_for_key(req_rows, "ttft"), "post_cap": ttft_pc}
         metrics["ttfc"][mode] = dist_for_key(req_rows, "ttfc")
         metrics["tpot"][mode] = dist_for_key(req_rows, "tpot")
-        metrics["queue_stall"][mode] = dist_for_key(req_rows, "queue_stall")
+        metrics["queue_stall"][mode] = dist_for_key(req_rows, "queue_stall_s")
         metrics["slack"][mode] = slack_stats(ch_rows)
         metrics["stall_time"][mode] = stall_time_stats(ch_rows)
         metrics["slo_compliance"][mode] = request_compliance_stats(ch_rows)
@@ -486,59 +662,90 @@ def analyze(
         def vals(key):
             return [p[key] for p in per_req if p.get(key) is not None]
 
-        metrics["progress_request"][mode] = {
-            "total_stall_time":    distribution_stats(vals("total_stall_time")),
-            "max_stall_time":      distribution_stats(vals("max_stall_time")),
-            "num_stall_intervals": distribution_stats(vals("num_stall_intervals")),
-            "stall_fraction":      distribution_stats(vals("stall_fraction")),
-            "completion_latency":  distribution_stats(vals("completion_latency")),
-            "demand_duration":     distribution_stats(vals("demand_duration")),
-        }
-        # Phase 5: new merged-interval CP-SLO aggregates per mode.
-        metrics["cpslo"][mode] = {
-            "max_stall_interval_distribution": distribution_stats(
-                vals("max_stall_interval_s")),
-            "num_stall_intervals_merged_distribution": distribution_stats(
-                vals("num_stall_intervals_merged")),
+        request_progress_distributions[mode] = {
+            "request_total_stall_s": distribution_stats(
+                vals("request_total_stall_s")),
+            "request_max_stall_s": distribution_stats(
+                vals("request_max_stall_s")),
+            "num_stall_intervals": distribution_stats(
+                vals("num_stall_intervals")),
+            "request_stall_fraction": distribution_stats(
+                vals("request_stall_fraction")),
+            "completion_latency": distribution_stats(vals("completion_latency")),
+            "request_demand_duration_s": distribution_stats(
+                vals("request_demand_duration_s")),
         }
         metrics["workload"][mode] = {
             "num_prompt_tokens": dist_for_key(req_rows, "num_prompt_tokens"),
             "num_output_tokens": dist_for_key(req_rows, "num_output_tokens"),
-            "num_chunks":        dist_for_key(req_rows, "num_chunks"),
+            "num_consumable_units": dist_for_key(
+                req_rows, "num_consumable_units"),
             # SSLO: pending-time + consume-time distributions for summary CSV.
             "total_pending_time_s": dist_for_key(req_rows, "total_pending_time_s"),
             "num_pending_intervals": dist_for_key(req_rows, "num_pending_intervals"),
-            "chunk_consume_time_s": dist_for_key(ch_rows, "chunk_consume_time_s"),
+            "consume_duration": dist_for_key(ch_rows, "consume_duration"),
         }
         metrics["throughput"][mode] = pm.throughput_stats(
             req_rows, per_req, run_meta=run_meta)
         # SSLO Phase 6: scalar run-level workload counts consumed by
         # validate_run (drop/timeout/throughput predicates).
         num_total = len(req_rows)
-        num_completed = sum(
-            1 for r in req_rows if r.get("terminal_outcome") == "completed")
-        num_timeout = sum(
-            1 for r in req_rows if r.get("terminal_outcome") == "timeout")
-        num_chunks_total = sum(
-            int(r.get("num_chunks") or 0) for r in req_rows)
+        has_terminal_outcome = any("terminal_outcome" in r for r in req_rows)
+        if has_terminal_outcome:
+            num_completed = sum(
+                1 for r in req_rows
+                if r.get("terminal_outcome") == "completed")
+            num_timeout = sum(
+                1 for r in req_rows if r.get("terminal_outcome") == "timeout")
+        elif mode == modes_run[0]:
+            num_total = int(run_meta.get("num_requests_total", num_total) or 0)
+            num_completed = int(
+                run_meta.get("num_requests_completed", len(req_rows)) or 0)
+            num_timeout = int(run_meta.get("num_requests_timeout", 0) or 0)
+        else:
+            num_completed = sum(
+                1 for r in req_rows if r.get("completion_wall_ts") is not None)
+            num_timeout = 0
+        num_consumable_units_total = sum(
+            int(r.get("num_consumable_units") or 0) for r in req_rows)
+        has_pending_intervals = any(
+            r.get("num_pending_intervals") is not None
+            or r.get("num_pending_iters_per_request") is not None
+            for r in req_rows)
+        starvation_count = (
+            sum(
+                int(r.get("num_pending_intervals")
+                    if r.get("num_pending_intervals") is not None
+                    else (r.get("num_pending_iters_per_request") or 0))
+                for r in req_rows)
+            if has_pending_intervals
+            else None
+        )
+        # Spec section 5: unit_deadline_miss_rate = sum(unit_deadline_missed)
+        # / count(consumable units) over this mode's in-window chunks
+        # (chunk_filter already applied upstream). chunk_by_mode is the
+        # post-filter, in-window chunk set for this mode.
+        mode_chunks = chunk_by_mode.get(mode, [])
+        unit_deadline_miss_rate = None
+        if mode_chunks:
+            missed = sum(int(c.get("unit_deadline_missed") or 0)
+                         for c in mode_chunks)
+            unit_deadline_miss_rate = missed / len(mode_chunks)
         metrics["workload"][mode].update({
             "num_requests_total": num_total,
             "num_requests_completed": num_completed,
             "num_requests_timeout": num_timeout,
-            "num_chunks_total": num_chunks_total,
+            "num_consumable_units_total": num_consumable_units_total,
+            # Internal compatibility for validate_run(); omitted from the
+            # final Round 2 metrics shape.
+            "num_chunks_total": num_consumable_units_total,
+            "starvation_count": starvation_count,
+            "unit_deadline_miss_rate": unit_deadline_miss_rate,
             "tokens_per_second": (
                 metrics["throughput"][mode].get("tokens_per_second")),
         })
-        metrics["cp_slo_violation"][mode] = pm.cp_slo_violation_rates(per_req, list(pm.DEFAULT_TAUS))
-        metrics["chunk_slo_violation"][mode] = pm.chunk_slo_violation_rates(
-            ch_rows, list(pm.DEFAULT_TAUS))
-        # Phase 5: also surface the same violation table under the new
-        # cpslo namespace so downstream readers don't have to know the
-        # legacy key.
-        metrics["cpslo"][mode]["cp_slo_violation_rates_by_tau"] = (
-            metrics["cp_slo_violation"][mode])
-        metrics["cpslo"][mode]["chunk_slo_violation_rates_by_tau"] = (
-            metrics["chunk_slo_violation"][mode])
+        metrics["request_cu_slo_violation"][mode] = (
+            pm.request_cu_slo_violation_rates(per_req, list(pm.DEFAULT_TAUS)))
         duration = mw1 - mw0
         metrics["measurement_window"][mode] = {
             "start_ts":   mw0,
@@ -557,10 +764,6 @@ def analyze(
             nhu = metrics["scheduler"][mode].get("num_handling_users")
             if isinstance(nhu, dict):
                 nhu["mean_time_weighted"] = hu_stats.get("time_avg")
-        # Phase 5: promote time-weighted mean into cpslo headline.
-        metrics["cpslo"].setdefault(mode, {})
-        metrics["cpslo"][mode]["mean_handling_users_time_weighted"] = (
-            hu_stats.get("time_avg"))
 
     scheduler_saturation: dict[str, Any] = {}
     for mode in SSLO_MODES:
@@ -587,24 +790,12 @@ def analyze(
             mode_neg is not None and bl_neg is not None and mode_neg <= bl_neg * 1.1
         )
 
-    # SSLO Phase 6: feed validate_run with per-mode queueing distributions
-    # so the no-harm gate can read p99 queue_stall / pending_time.
-    for mode in ALL_MODES:
-        req_rows = req_by_mode[mode]
-        queue_stalls = [r["queue_stall_s"] for r in req_rows
-                        if r.get("queue_stall_s") is not None]
-        pending_times = [r["total_pending_time_s"] for r in req_rows
-                         if r.get("total_pending_time_s") is not None]
-        metrics["cpslo"].setdefault(mode, {})
-        metrics["cpslo"][mode]["queue_stall_distribution"] = distribution_stats(
-            queue_stalls)
-        metrics["cpslo"][mode]["pending_time_distribution"] = distribution_stats(
-            pending_times)
-
     # Surface window-level counts from run_meta in summary.
     injected_count = run_meta.get("injected_count", 0)
     in_window_count = run_meta.get("in_window_count", 0)
 
+    final_metrics = finalize_round2_metrics(
+        metrics, ALL_MODES, request_progress_distributions)
     summary: dict[str, Any] = {
         "config": {
             "model": model,
@@ -619,7 +810,7 @@ def analyze(
             "sslo_config": sslo_config_by_mode,
             "run_kind": modes_run[0] if modes_run else None,
         },
-        "metrics": metrics,
+        "metrics": final_metrics,
         "queue_stall_available": queue_stall_available,
         "scheduler_saturation": scheduler_saturation,
         "passes": passes,
@@ -637,13 +828,17 @@ def analyze(
     # skipped; _consolidate_mode_outputs.py / sweep-level analysis recompute
     # against the paired baseline when both modes are present.
     baseline_tps = (
-        metrics.get("workload", {}).get("baseline", {}).get("tokens_per_second"))
-    report = validate_run(summary, baseline_tokens_per_second=baseline_tps)
-    summary["validity"] = {
-        "validity_pass": report.validity_pass,
-        "no_harm_pass": report.no_harm_pass,
-        "invalid_reason": report.invalid_reason,
-    }
+        final_metrics.get("workload", {}).get("baseline", {}).get(
+            "tokens_per_second")
+        if len(modes_run) > 1
+        else None
+    )
+    report = validate_run(
+        summary,
+        baseline_tokens_per_second=baseline_tps,
+        request_rows=request_rows_mode,
+    )
+    summary["validity"] = asdict(report)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")

@@ -126,7 +126,7 @@ if [[ "${run_kind}" == *offload* ]]; then
   export SSLO_OFFLOAD_LOG_PATH="${OUTPUT_DIR}/offload_log.jsonl"
 fi
 
-python3 exp/run_sslo/run_test.py \
+python3 exp/run_sslo/filter_prompt/run_test.py \
   --run-kind "${run_kind}" \
   --model "${model}" \
   --max-num-seqs "${max_num_seqs}" \
