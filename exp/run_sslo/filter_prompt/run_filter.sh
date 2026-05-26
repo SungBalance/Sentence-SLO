@@ -28,9 +28,9 @@ CAP="${CAP:-128}"
 RATE="${RATE:-32}"
 GPU="${GPU:-0}"
 
-# Use the entire cache as the prompt pool. combine_2.jsonl has ~3303
-# unique prompts; we want to classify each once.
-CACHE_PATH="${CACHE_PATH:-exp/tools/dataset_cache/combine_2.jsonl}"
+# Use the entire current curated cache (processed_dataset.jsonl, ~2692
+# prompts after prior filter passes).
+CACHE_PATH="${CACHE_PATH:-exp/tools/dataset_cache/processed_dataset.jsonl}"
 NUM_PROMPTS="${NUM_PROMPTS:-$(wc -l < "${CACHE_PATH}")}"
 
 GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS:-2048}"

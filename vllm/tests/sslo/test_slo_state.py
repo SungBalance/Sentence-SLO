@@ -4,12 +4,27 @@
 import pytest
 
 from vllm.sslo.slo_state import (
+    ChunkConsumeEstimator,
     ChunkLengthPredictor,
     ChunkRecord,
     ChunkSeparator,
     Phase,
     RequestSLOState,
 )
+
+
+class WordScaledTtsEstimator(ChunkConsumeEstimator):
+
+    def estimate(
+        self,
+        chunk_text: str,
+        word_count: int,
+    ) -> tuple[float, float | None]:
+        del chunk_text
+        return 0.3 * word_count, 0.1 * word_count
+
+    def predict_conversion(self, word_count: int) -> float:
+        return 0.1 * word_count
 
 
 def measured_state() -> RequestSLOState:
@@ -63,6 +78,36 @@ def test_chunk_record_and_diagnostics_append():
     assert record.unit_deadline_missed == 0
     # consume_start_time is stamped at chunk 0 finish.
     assert state.consume_start_time == pytest.approx(5.5)
+
+
+def test_tts_chunk0_deadline_is_consumer_side():
+    state = RequestSLOState(num_warmup_chunks=1)
+    state.on_token(9.0)
+    state.on_chunk_boundary(
+        10.0, word_count=2, consume_duration=5.0, conversion_time=1.0)
+
+    record = state.chunk_records[0]
+    assert record.deadline == pytest.approx(11.0)
+    assert record.consumer_ready_time == pytest.approx(11.0)
+    assert record.unit_deadline_miss_s == pytest.approx(0.0)
+    assert state.consume_start_time == pytest.approx(11.0)
+    assert state.next_deadline_ts == pytest.approx(16.0)
+
+
+def test_tts_deadline_miss_subtracts_current_conversion():
+    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
+    state.on_token(0.0)
+    state.on_chunk_boundary(
+        1.0, word_count=1, consume_duration=2.0, conversion_time=0.2)
+    state.on_token(1.0)
+    state.on_chunk_boundary(
+        3.0, word_count=2, consume_duration=1.0, conversion_time=0.5)
+
+    rec = state.chunk_records[1]
+    assert rec.deadline == pytest.approx(3.2)
+    assert rec.unit_deadline_miss_s == pytest.approx(0.3)
+    assert rec.consumer_ready_time == pytest.approx(3.5)
+    assert state.next_deadline_ts == pytest.approx(4.5)
 
 
 def test_on_step_tracks_total_and_prefill_counts():
@@ -296,6 +341,30 @@ def test_score_formula_and_deadline_sign():
     assert state.expected_remaining_len() == pytest.approx(7.5)
     assert state.pressure(5.1, tpot_s=0.2) == pytest.approx(7.5 * 0.2 / 5.0)
     assert state.pressure(20.0, tpot_s=0.2) == float("inf")
+
+
+def test_tts_time_to_deadline_subtracts_current_conversion_estimate():
+    state = RequestSLOState(
+        num_warmup_chunks=1,
+        min_chunk_tokens=0,
+        consume_estimator=WordScaledTtsEstimator(),
+    )
+    for _ in range(8):
+        state.on_token(9.0)
+    consume_s, conversion_s = state.consume_estimator.estimate("", 4)
+    assert conversion_s is not None
+    state.on_chunk_boundary(
+        10.0,
+        word_count=4,
+        consume_duration=consume_s,
+        conversion_time=conversion_s,
+    )
+
+    assert state.last_num_token == 8
+    assert state.last_word_count == 4
+    assert state._predict_current_conversion() == pytest.approx(0.4)
+    assert state.time_to_deadline(10.5) == pytest.approx(
+        11.6 - 1.2 * 0.4 - 10.5)
 
 
 def test_score_none_during_warmup_or_missing_inputs():

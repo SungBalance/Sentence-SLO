@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 from bisect import bisect_left
 from collections import deque
@@ -140,6 +141,10 @@ class ChunkLengthPredictor:
         # logic in expected_remaining_len() falls through.
         self.value_mid: float | None = None
         self.value_high: float | None = None
+        # SSLO: full percentile ladder for strategy=="p90":
+        # [p50, p60, p70, p80, p90, p95, p99]. expected_remaining_len
+        # escalates through these on overshoot. None for other strategies.
+        self.tier_values: list[float] | None = None
         # SSLO: strategy-agnostic sample counter (deque length is wrong
         # for ema strategy where _history isn't used).
         self._sample_count: int = 0
@@ -170,10 +175,12 @@ class ChunkLengthPredictor:
         percentile = 90.0 if self.strategy == "p90" else 99.0
         self.value = float(np.percentile(arr, percentile, method="nearest"))
         if self.strategy == "p90":
+            # Ladder: p90 → p95 → p99 → overshoot(2.5×).
             self.value_mid = float(
                 np.percentile(arr, 95.0, method="nearest"))
             self.value_high = float(
                 np.percentile(arr, 99.0, method="nearest"))
+            self.tier_values = [self.value, self.value_mid, self.value_high]
 
     def update_past_future(self, generated_len: int) -> None:
         pass
@@ -211,6 +218,12 @@ class ChunkConsumeEstimator:
     ) -> tuple[float, float | None]:
         del chunk_text  # unused in the default rate-based estimator
         return word_count * self.seconds_per_word, None
+
+    def predict_conversion(self, word_count: int) -> float:
+        """Predict conversion_time for a chunk of `word_count` words.
+        Read mode has no conversion → 0.0. TTS subclass overrides."""
+        del word_count
+        return 0.0
 
 
 class TtsProfileConsumeEstimator(ChunkConsumeEstimator):
@@ -280,6 +293,10 @@ class TtsProfileConsumeEstimator(ChunkConsumeEstimator):
         wc = self._nearest_word_count(word_count)
         return self._consume_by_wc[wc], self._conversion_by_wc[wc]
 
+    def predict_conversion(self, word_count: int) -> float:
+        wc = self._nearest_word_count(max(1, int(word_count)))
+        return self._conversion_by_wc[wc]
+
 
 class ChunkSeparator:
     """Stream-aware chunk boundary detector.
@@ -316,6 +333,11 @@ class ChunkSeparator:
         self._pending_text = ""
         self._unflushed_token_count = 0
         self._search_offset = 0
+
+    @property
+    def pending_word_count(self) -> int:
+        """Words accumulated in the current (not-yet-flushed) chunk."""
+        return len(self._pending_text.split())
 
     def feed(self, text: str, num_tokens: int) -> Iterator[str]:
         """Feed a streamed text delta; yield chunk strings as boundaries form."""
@@ -526,21 +548,38 @@ class SsloRequestStats:
     terminal_outcome: str = "in_progress"
 
 
+def _quantized_pressure(remaining: float, time_budget: float,
+                        tpot_s: float) -> float:
+    """remaining tokens / floor(time_budget / tpot_s).
+    Returns +inf when fewer than one iteration fits.
+
+    Adds a tiny epsilon (1e-9) before floor to suppress floating-point
+    pathology — e.g., ``1.0 - 0.3 == 0.6999999999999999`` would otherwise
+    floor 0.6999.../0.1 to 6 instead of 7."""
+    iters = math.floor(time_budget / tpot_s + 1e-9)
+    if iters <= 0:
+        return float("inf")
+    return remaining / iters
+
+
 @dataclass
 class RequestSLOState:
     # Lifecycle.
     decoding_start_ts: float | None = None
-    # Absolute wall-clock deadline for the chunk currently being generated.
-    # Updated at each chunk boundary by the stall-aware recurrence
-    #   deadline(t) = max(deadline(t-1), finish(t-1)) + consume(t-1)
-    # so the next chunk must arrive before this timestamp to be on-time.
+    # Consumer-side wall-clock deadline for the chunk currently being
+    # generated. Updated at each chunk boundary by the stall-aware recurrence
+    #   deadline_consumer(t) = max(deadline_consumer(t-1),
+    #                              text_end(t-1) + conv(t-1)) + consume(t-1)
+    # so the next chunk's audio can start before this timestamp.
     next_deadline_ts: float | None = None
     chunks_completed: int = 0
     current_chunk_generated_len: int = 0
+    last_num_token: int | None = None
+    last_word_count: int | None = None
 
-    # Wall-clock when consumption can start; set once at chunk 0 finish.
-    # d(0) = chunk 0 text generation end, not decoding_start_ts, because the
-    # consumer cannot start until the first chunk is actually available.
+    # Wall-clock when consumption can start; set once at chunk 0 audio-ready
+    # time, because the consumer cannot start until the first chunk is
+    # converted.
     consume_start_time: float | None = None
 
     # Wall-clock of first waiting→running transition. Idempotent — only
@@ -675,14 +714,38 @@ class RequestSLOState:
 
     def chunk_deadline(self) -> float | None:
         # Bootstrapped to decoding_start_ts at first token / chunk event,
-        # overwritten to chunk 0 text generation end when chunk 0 completes (so
-        # d(0) = consume_start_time), then advanced by the stall-aware
-        # recurrence at each subsequent chunk boundary.
+        # overwritten to chunk 0 consumer-ready time when chunk 0 completes,
+        # then advanced by the consumer-side stall-aware recurrence at each
+        # subsequent chunk boundary.
         return self.next_deadline_ts
 
     def time_to_deadline(self, now: float) -> float | None:
         deadline = self.chunk_deadline()
-        return None if deadline is None else deadline - now
+        if deadline is None:
+            return None
+        conv_est = self._predict_current_conversion()
+        return deadline - 1.2 * conv_est - now
+
+    def _predict_current_conversion(self) -> float:
+        """Estimate next-chunk conv based on the CURRENT chunk's in-progress
+        text. Scale current word count by (expected_tokens / generated_tokens
+        so far) to project the total wc, then look up profile."""
+        consume_estimator = getattr(self, "consume_estimator", None)
+        if consume_estimator is None:
+            return 0.0
+        predicted_tokens = self._chunk_len_predictor.value
+        if predicted_tokens is None or predicted_tokens <= 0:
+            return 0.0
+        cur_tokens = self.current_chunk_generated_len
+        if cur_tokens <= 0:
+            return 0.0
+        cur_words = self.chunk_separator.pending_word_count
+        if cur_words <= 0:
+            return 0.0
+        # Scale current-chunk word count by expected vs generated token ratio.
+        ratio = predicted_tokens / cur_tokens
+        estimated_total_wc = max(1, int(round(cur_words * ratio)))
+        return consume_estimator.predict_conversion(estimated_total_wc)
 
     def expected_remaining_len(self) -> float | None:
         # SSLO: predictor ladder (strategy=="p90") with early escalation
@@ -718,17 +781,21 @@ class RequestSLOState:
         if pred.value is None:
             return None
         thr = pred.escalate_threshold
+        tiers = pred.tier_values
+        if tiers is not None:
+            # Full ladder: p50→p60→p70→p80→p90→p95→p99→overshoot
+            # Find first tier where cur is still below thr×tier.
+            for v in tiers:
+                if cur < v * thr:
+                    return max(1.0, v - cur)
+            # Past topmost tier: overshoot mode anchored at p99.
+            anchor = tiers[-1]
+            return max(1.0, (cur - anchor) * pred.overshoot_safety_factor)
+        # Single-tier strategies (p99, ema): legacy single-tier check then
+        # overshoot at pred.value.
         if cur < pred.value * thr:
             return max(1.0, pred.value - cur)
-        mid = pred.value_mid
-        if mid is not None and cur < mid * thr:
-            return max(1.0, mid - cur)
-        high = pred.value_high
-        if high is not None and cur < high * thr:
-            return max(1.0, high - cur)
-        anchor = high if high is not None else (
-            mid if mid is not None else pred.value)
-        return max(1.0, (cur - anchor) * pred.overshoot_safety_factor)
+        return max(1.0, (cur - pred.value) * pred.overshoot_safety_factor)
 
     def pressure_components(
         self, now: float, tpot_s: float | None
@@ -774,7 +841,7 @@ class RequestSLOState:
         elif ttd <= 0:
             depletion = float("inf")
         else:
-            depletion = refill / ttd
+            depletion = _quantized_pressure(remaining, ttd, tpot_s)
         return PressureComponents(
             remaining_tokens=remaining,
             estimated_step_time_s=tpot_s,
@@ -878,8 +945,8 @@ class RequestSLOState:
             # deadline further into the red); report it for logging.
             defer_buffer = (None if epoch_s is None else ttd - epoch_s)
         else:
-            depletion = refill / ttd
-            serve = refill / max(ttd, _PRESSURE_DENOM_EPSILON)
+            depletion = _quantized_pressure(remaining, ttd, tpot_s)
+            serve = _quantized_pressure(remaining, ttd, tpot_s)
             if epoch_s is None:
                 defer_buffer = None
                 defer = serve
@@ -888,8 +955,8 @@ class RequestSLOState:
                 if defer_buffer <= 0:
                     defer = float("inf")
                 else:
-                    defer = refill / max(
-                        defer_buffer, _PRESSURE_DENOM_EPSILON)
+                    defer = _quantized_pressure(
+                        remaining, defer_buffer, tpot_s)
         return PressureComponents(
             remaining_tokens=remaining,
             estimated_step_time_s=tpot_s,
@@ -961,30 +1028,25 @@ class RequestSLOState:
         deadline = self.chunk_deadline()
         assert deadline is not None
 
-        if self.chunks_completed == 0:
-            # next_deadline_ts is TEXT-side (when text must be generated).
-            # For TTS, text-side deadline = consumer_deadline - conversion.
-            # Bootstrap text_side_deadline[0] = consume_start - conv = now,
-            # regardless of conv. consume_start_time keeps the audio-start
-            # real-world timestamp (= now + conv for TTS, now for read).
-            if conversion_time is None:
-                self.consume_start_time = now
-            else:
-                self.consume_start_time = now + conversion_time
-            self.next_deadline_ts = now
-            deadline = now
-
         if conversion_time is None:
             record_conversion_time = 0.0
             consumer_ready_time = now
         else:
             record_conversion_time = conversion_time
             consumer_ready_time = now + record_conversion_time
-        # Miss is computed in TEXT-side time: was the text late vs its
-        # text-side deadline? consumer_ready_time is recorded for
-        # downstream timeline reconstruction but NOT used in deadline
-        # math (would double-count conv).
-        unit_deadline_miss_s = max(0.0, now - deadline)
+
+        if self.chunks_completed == 0:
+            # next_deadline_ts is consumer-side (when playback can start).
+            # Chunk 0's text-side deadline is consumer deadline - conversion,
+            # which equals now, so it is on-time by construction.
+            self.consume_start_time = consumer_ready_time
+            self.next_deadline_ts = consumer_ready_time
+            deadline = consumer_ready_time
+
+        # Miss is computed in TEXT-side time: was the text late vs the time
+        # it had to finish so conversion could meet the consumer deadline?
+        deadline_text = deadline - record_conversion_time
+        unit_deadline_miss_s = max(0.0, now - deadline_text)
 
         # Invariant: tokens are always accumulated (via on_token /
         # on_text_delta) before a chunk boundary is observed. on_finish's
@@ -1024,14 +1086,16 @@ class RequestSLOState:
         # this sample during their warm-up window.
         if self._global_chunk_len_predictor is not None:
             self._global_chunk_len_predictor.update(num_token)
+        self.last_num_token = num_token
+        self.last_word_count = word_count
 
-        # Text-side stall-aware recurrence (t = chunk just completed):
-        #   text_deadline(t+1) = max(text_deadline(t), text_end(t)) + consume(t)
-        # Derived from consumer-side recurrence by subtracting conv from
-        # both sides — the conv terms cancel exactly. So the scheduler
-        # sees a deadline that's already shifted earlier for TTS without
-        # subtracting conv elsewhere.
-        self.next_deadline_ts = max(deadline, now) + consume_duration
+        # Sequential-TTS recurrence (user spec):
+        #   deadline(t+1) = max(deadline(t), text_end(t)) + conv(t) + consume(t)
+        # Conv added OUTSIDE max so each chunk contributes conv + consume,
+        # treating conversion as serial after previous chunk's playback
+        # (no pipelining overlap). Read mode (conv=0) unaffected.
+        self.next_deadline_ts = (
+            max(deadline, now) + record_conversion_time + consume_duration)
         self.chunks_completed += 1
         self.current_chunk_generated_len = 0
 

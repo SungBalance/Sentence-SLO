@@ -120,7 +120,6 @@ class SsloConfig:
     global_warmup_predictor_samples: int = 128
     cold_start_max_remaining_tokens: int = 2048
 
-
     def __post_init__(self) -> None:
         if self.chunk_unit not in _VALID_CHUNK_UNITS:
             raise ValueError(

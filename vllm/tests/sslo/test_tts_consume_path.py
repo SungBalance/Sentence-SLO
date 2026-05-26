@@ -17,6 +17,9 @@ class WordScaledTtsEstimator(ChunkConsumeEstimator):
         del chunk_text
         return 0.3 * word_count, 0.1 * word_count
 
+    def predict_conversion(self, word_count: int) -> float:
+        return 0.1 * word_count
+
 
 def _add_one_token_and_close_chunk(
     state: RequestSLOState,
@@ -79,13 +82,13 @@ def test_tts_path_uses_audio_ready_time_for_slack_and_deadline():
         consumer_ready_time = record.text_generation_end_time + 0.1 * word_count
         assert record.conversion_time == pytest.approx(0.1 * word_count)
         assert record.consumer_ready_time == pytest.approx(consumer_ready_time)
-        # Text-side miss: text_generation_end vs text-side deadline.
-        # (Equivalent to consumer-side miss; the two differ only by a
-        # fixed conv shift on the time axis.)
+        # Text-side miss: text_generation_end vs consumer deadline minus
+        # this chunk's conversion time.
+        text_deadline = record.deadline - record.conversion_time
         assert record.unit_deadline_miss_s == pytest.approx(
-            max(0.0, record.text_generation_end_time - record.deadline))
+            max(0.0, record.text_generation_end_time - text_deadline))
         assert state.next_deadline_ts == pytest.approx(
-            max(record.deadline, record.text_generation_end_time)
+            max(record.deadline, consumer_ready_time)
             + 0.3 * word_count)
 
 
@@ -101,6 +104,7 @@ def test_tts_chunk0_consume_start_waits_for_audio_ready_time():
     )
 
     assert state.consume_start_time == pytest.approx(5.4)
+    assert state.chunk_records[0].deadline == pytest.approx(5.4)
 
 
 def test_consume_mode_tts_requires_profile_path():

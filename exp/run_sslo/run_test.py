@@ -437,6 +437,9 @@ async def collect_one(
     return {
         "request_id": request_id,
         "request_idx": request_idx,
+        # SSLO: store prompt for offline dataset-filter analysis. Truncated
+        # to 2000 chars to avoid jsonl bloat; full text not needed.
+        "prompt": (prompt[:2000] if isinstance(prompt, str) else ""),
         "arrival_ts": arrival_ts,
         "completion_wall_ts": completion_wall_ts,
         "num_output_tokens": num_gen,
@@ -1031,12 +1034,15 @@ async def _run_one_rate(
     `output_dir`. Returns the number of requests injected (for the
     caller to advance request_idx_offset).
     """
-    # Per-rate sampling RNG. Different seed per rate so consecutive
-    # rates draw distinct prompt orderings but each is reproducible.
+    # SSLO: same prompt order across all rates within a cell. Each rate
+    # starts from prompt 0 of the SAME shuffled pool, so rate is the only
+    # variable in the experiment. Seed depends ONLY on base_seed, not on
+    # rate. Cursor is reset to 0 below so each rate iterates from the
+    # beginning.
     base_seed = (
         args.sampling_seed if args.sampling_seed is not None
         else args.request_rate_seed)
-    seed = int(base_seed) + int(round(rate * 1000))
+    seed = int(base_seed)
     rng = _random.Random(seed)
     order = list(range(len(pool)))
     rng.shuffle(order)
@@ -1154,6 +1160,7 @@ async def _run_one_rate(
 
         request_fields = (
             "request_id",
+            "prompt",
             "arrival_ts",
             "consume_start_time",
             "num_consumable_units",

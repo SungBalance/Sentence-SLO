@@ -1112,30 +1112,29 @@ class Scheduler(SchedulerInterface):
 
     # SSLO
     def _sslo_step_ema_lookup(self, admitted: list[Request]) -> float | None:
-        """Pick the wall-step EMA cell that best matches the upcoming step.
+        """Pick the wall-step EMA cell — worst-case (max num_prefills) for
+        this batch size.
+
+        Using the max-prefills cell gives a conservative latency estimate:
+        admission pressure denominator (floor(ttd/tpot)) shrinks → pressure
+        grows → admission tightens. This prevents over-admission when prior
+        steps happened to be decode-only (low tpot).
 
         Fallback chain:
-          1. exact (batch_size, num_prefills)
-          2. average of same-batch cells
-          3. global average across all cells
-          4. None (cold-start, no samples yet)
+          1. max-prefill cell at exact batch_size
+          2. global max across all (batch, prefills) cells
+          3. None (cold-start, no samples yet)
         """
         batch_size = len(admitted)
-        num_prefills = sum(
-            1 for req in admitted
-            if (getattr(req, "num_computed_tokens", 0)
-                < getattr(req, "num_prompt_tokens", 0)))
         bucket = self._sslo_step_wall_ema.get(batch_size)
         if bucket:
-            if num_prefills in bucket:
-                return bucket[num_prefills]
-            return sum(bucket.values()) / len(bucket)
+            return max(bucket.values())
         all_vals = [
             v for cells in self._sslo_step_wall_ema.values()
             for v in cells.values()
         ]
         if all_vals:
-            return sum(all_vals) / len(all_vals)
+            return max(all_vals)
         return None
 
     # SSLO
@@ -2103,7 +2102,10 @@ class Scheduler(SchedulerInterface):
         # but is now interpreted as a single unified pressure.
         n_admitted = len(admitted)
         denom_cap = cap_n if cap_n is not None else self.max_num_running_reqs
-        scale = n_admitted / max(1, denom_cap)
+        # SSLO F1: floor scale at 1.0 — when N<cap, raw pressure already
+        # reflects per-req load; scaling DOWN under-counts contention and
+        # opens admission too wide, letting handling_users overshoot cap.
+        scale = max(1.0, n_admitted / max(1, denom_cap))
         serve: dict[str, float | None] = {}
         defer: dict[str, float | None] = {}
         components: dict[str, PressureComponents] = {}

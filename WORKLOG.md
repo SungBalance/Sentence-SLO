@@ -1113,3 +1113,260 @@ DATASET_NAME=combine DATASET_SEED=42 EXCLUDE_CODE=1 \
   scripts, regenerated preprocessing and plots in `sk-sslo-vllm`, asserted the
   processed CSV schemas and selected Figure 5.6 batch/rate/metric invariants,
   visually inspected the refreshed PNGs, and ran `git diff --check`.
+
+## 2026-05-25 (Figure 5.1 consumed-token focus)
+
+- Modified content: Updated
+  `exp/plots/figures/scripts/figs/fig5_1_token_metric_mismatch.py` to cap the
+  x-axis at 8 seconds, set the y-axis from the visible generated/consumed token
+  range, and keep the legend to `Generated Tokens` and `Consumed Tokens` on one
+  row.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_1_token_metric_mismatch.png` inside
+  `sk-sslo-vllm`.
+- Debugging/verification: Compiled the Figure 5.1 script in `sk-sslo-vllm`,
+  reran the plot script, and visually inspected the refreshed PNG.
+
+## 2026-05-25 (Figure 5.5/5.6 statistical plot updates)
+
+- Modified content: Changed Figure 5.5 from pressure scatter to pressure
+  quantile barplots with policy-colored mean chunk violation volume and
+  standard-error bars.
+- Modified content: Changed Figure 5.6 to batch size 64, added Handling Users
+  as the leftmost boxplot from scheduler step stats, kept Pending Time to
+  ProgressServe only, gave every subplot its own title, and tightened the
+  vertical layout.
+- Added content: Regenerated Figure 5.5 and Figure 5.6 processed CSVs and PNG
+  outputs inside `sk-sslo-vllm`.
+- Debugging/verification: Compiled the touched Figure 5.5 and Figure 5.6
+  scripts, regenerated preprocessing and plots in `sk-sslo-vllm`, asserted
+  Figure 5.6 batch/rate/metric/source invariants, visually inspected the
+  refreshed PNGs, and ran `git diff --check`.
+
+## 2026-05-25 (Figure 5.5 pressure range labels)
+
+- Modified content: Updated Figure 5.5 pressure-bin tick labels to show the
+  actual max-pressure range for each quantile bin.
+- Modified content: Added a per-model inset histogram showing the policy-wise
+  max-pressure distribution on a log-scaled pressure axis.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_5_refill_risk_diagnostic.png` inside
+  `sk-sslo-vllm`.
+- Debugging/verification: Compiled the Figure 5.5 script, reran the plot
+  renderer in `sk-sslo-vllm`, visually inspected the refreshed PNG, and ran
+  `git diff --check`.
+
+## 2026-05-25 (Figure 5.4 row spacing)
+
+- Modified content: Centered each Figure 5.4 model label over its row, reduced
+  the model-label offset above the heatmaps, and increased spacing between
+  model rows.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_4_operating_map.png` inside `sk-sslo-vllm`.
+- Debugging/verification: Compiled the Figure 5.4 script, reran the renderer
+  in `sk-sslo-vllm`, visually inspected the refreshed PNG, and ran
+  `git diff --check`.
+
+## 2026-05-25 (Figure 5.5 two-panel pressure/stall rebuild)
+
+- Modified content: Rebuilt Figure 5.5 as a two-column plot with decision-level
+  pressure distributions on the left and chunk-level pressure-vs-stall
+  boxplots on the right.
+- Modified content: Changed Figure 5.5 preprocessing to keep raw measured
+  decision pressure rows for the distribution panel and to create one
+  chunk-level data point from the mean pressure within each chunk window plus
+  that chunk's `stall_duration_s`.
+- Added content: Regenerated
+  `exp/plots/figures/processed/fig5_5_refill_risk_diagnostic.csv` and
+  `exp/plots/figures/fig5_5_refill_risk_diagnostic.png` inside
+  `sk-sslo-vllm`.
+- Debugging/verification: Compiled the Figure 5.5 script, reran preprocessing
+  and rendering in `sk-sslo-vllm`, asserted pressure-decision and
+  chunk-pressure/stall CSV invariants, visually inspected the refreshed PNG,
+  and ran `git diff --check`.
+
+## 2026-05-25 (Figure 5.4 method labels and y-axis cleanup)
+
+- Modified content: Added Figure 5.4 method labels above both model rows,
+  hid duplicate right-panel y tick labels to remove the center overlap, and
+  slightly reduced spacing between model rows.
+- Added content: Regenerated
+  `exp/plots/figures/fig5_4_operating_map.png` inside `sk-sslo-vllm`.
+- Debugging/verification: Compiled the Figure 5.4 script, reran the renderer
+  in `sk-sslo-vllm`, visually inspected the refreshed PNG, and ran
+  `git diff --check`.
+
+## 2026-05-25 (Figure 5.1 TTS consume trace)
+
+- Modified content: Updated Figure 5.1 to compute a Kokoro-82M TTS consumed
+  token trace from `word_count_duration_stats.csv` audio-duration means and
+  plot `Generated Tokens`, `Reading Consumed Tokens`, and
+  `TTS Consumed Tokens`.
+- Added content: Regenerated the Figure 5.1 processed CSV and PNG inside
+  `sk-sslo-vllm`.
+- Debugging/verification: Compiled the Figure 5.1 script and preprocessing
+  entrypoint, reran Figure 5.1 preprocessing and rendering in `sk-sslo-vllm`,
+  checked the new trace values at 8 seconds, visually inspected the PNG, and
+  ran `git diff --check`.
+
+## 2026-05-25 (Figure 5.1 title metric revision)
+
+- Modified content: Reverted the Figure 5.1 TTS consumed-token trace and
+  restored the two-line legend to `Generated Tokens` and `Consumed Tokens`.
+- Modified content: Updated the per-request title metrics to include TPOT,
+  generation throughput, consume latency, and consume throughput.
+- Added content: Regenerated the Figure 5.1 processed CSV and PNG inside
+  `sk-sslo-vllm`.
+- Debugging/verification: Compiled the Figure 5.1 script and preprocessing
+  entrypoint, reran Figure 5.1 preprocessing and rendering in `sk-sslo-vllm`,
+  checked the processed CSV schema and metric values, visually inspected the
+  PNG, and ran `git diff --check`.
+
+## 2026-05-25 (Figure 5.1 TPS title labels)
+
+- Modified content: Updated the Figure 5.1 per-request title layout to show
+  tokens/TPOT, words/consume latency, and Gen./Consume TPS on three metric
+  lines.
+- Added content: Regenerated `exp/plots/figures/fig5_1_token_metric_mismatch.png`
+  inside `sk-sslo-vllm`.
+- Debugging/verification: Compiled and rendered the Figure 5.1 script in
+  `sk-sslo-vllm`, visually inspected the refreshed PNG, and ran
+  `git diff --check`.
+
+## 2026-05-25 (Figure 5.1 TPS bar comparison)
+
+- Modified content: Added a right-side Figure 5.1 bar comparison panel for
+  request-level Gen. TPS and Consume TPS, with separate scales for the two
+  metrics.
+- Added content: Regenerated `exp/plots/figures/fig5_1_token_metric_mismatch.png`
+  inside `sk-sslo-vllm`.
+- Debugging/verification: Compiled and rendered the Figure 5.1 script in
+  `sk-sslo-vllm`, visually inspected the refreshed PNG, and ran
+  `git diff --check`.
+
+## 2026-05-25 (Figure 5.1 title TPS cleanup)
+
+- Modified content: Removed Gen. TPS and Consume TPS from the left request
+  title blocks while keeping the right-side TPS bar comparison panel.
+- Added content: Regenerated `exp/plots/figures/fig5_1_token_metric_mismatch.png`
+  inside `sk-sslo-vllm`.
+- Debugging/verification: Compiled and rendered the Figure 5.1 script in
+  `sk-sslo-vllm`, visually inspected the refreshed PNG, and ran
+  `git diff --check`.
+
+## 2026-05-25 (Figure 5.9 request max-stall distribution)
+
+- Added content: Added
+  `exp/plots/figures/scripts/figs/fig5_9_request_max_stall_distribution.py`
+  and `exp/plots/figures/scripts/preprocess/process_fig_5_9.py`.
+- Added content: Generated
+  `exp/plots/figures/processed/fig5_9_request_max_stall_distribution.csv`
+  and `exp/plots/figures/fig5_9_request_max_stall_distribution.png`.
+- Debugging/verification: Compiled the new Figure 5.9 scripts in
+  `sk-sslo-vllm`, ran preprocessing and rendering, verified the processed data
+  uses batch size 64, request rates 2/8/20, both policies, and nonnegative
+  request-level max stall values, visually inspected the PNG, and ran
+  `git diff --check`.
+
+## 2026-05-25 (Figure 5 new consume-profile sweep layout)
+
+- Modified content: Updated the Figure 5 output-sweep loader to parse the new
+  `model/read|tts/profile/cap/policy/run/rate` layout, flatten run-level
+  `summary.json` metrics, and carry consume-profile metadata through Figure
+  5.1-5.9 preprocessing and plotting.
+- Modified content: Updated Figure 5.1 to select the request pair from Reading
+  consume-speed contrast and overlay TTS consume traces, and updated Figure
+  5.2-5.9 to organize consume profiles as rows with 9B/35B as model columns.
+  The scripts also support the newer chunk JSON field names.
+- Added content: Regenerated processed CSVs and PNGs for Figure 5.1-5.9 under
+  `exp/plots/figures/processed` and `exp/plots/figures`.
+- Debugging/verification: Ran script compile checks, preprocessing, rendering,
+  consume-profile-column checks, and PNG non-empty checks inside
+  `sk-sslo-vllm`.
+
+## 2026-05-25 (Figure 5 missing-panel and axis-scale cleanup)
+
+- Modified content: Updated Figure 5.3 and 5.8 to select available batch-size
+  curves from the data instead of plotting absent cap16 curves, and updated
+  Figure 5.6 and 5.9 to select available request-rate panels instead of absent
+  rate2 panels.
+- Modified content: Tightened plotted y/color ranges from observed data ranges,
+  reduced false-empty heatmap cells in Figure 5.4, added a Figure 5.2 fallback
+  for valid stalled requests outside the strict token window, and made Figure
+  5.9 zero-stall request mass visible.
+- Added content: Regenerated Figure 5.1-5.9 processed CSVs and PNGs under
+  `exp/plots/figures/processed` and `exp/plots/figures`.
+- Debugging/verification: Confirmed the new sweep data has caps
+  32/64/128/256 and rates 4/8/12/16/20/24, then reran compile, preprocessing,
+  rendering, processed-column checks, PNG non-empty checks, visual inspection,
+  and `git diff --check` inside `sk-sslo-vllm`.
+
+## 2026-05-25 (Figure 5 row labels and stall-distribution refresh)
+
+- Modified content: Added consume-profile row labels to Figures 5.3, 5.4,
+  5.6, 5.8, and 5.9; repeated model/metric labels on every Figure 5.3 row;
+  tightened Figure 5.3 legend spacing; and showed Figure 5.6 batch size in
+  the legend.
+- Modified content: Updated Figure 5.8 to compare batch sizes 64/128 using
+  marker-only scatter points with per-panel axis scaling, and updated Figure
+  5.9 to use batch size 256 after confirming the previous cap64 panels were
+  mostly zero-stall rather than missing data.
+- Added content: Regenerated targeted processed CSVs and PNGs for Figures
+  5.3, 5.4, 5.6, 5.8, and 5.9.
+- Debugging/verification: Ran compile, targeted preprocessing, targeted
+  rendering, processed-column checks, PNG non-empty checks, Figure 5.8/5.9
+  batch checks, Figure 5.9 positive-stall counts, visual inspection, and
+  `git diff --check` inside `sk-sslo-vllm`.
+
+## 2026-05-25 (Figure 5.9 positive-stall-only large batch)
+
+- Modified content: Updated Figure 5.9 preprocessing to choose among large
+  batch-size candidates 128/256 by positive max-stall count, then drop
+  zero-stall requests before writing the processed CSV.
+- Added content: Regenerated
+  `exp/plots/figures/processed/fig5_9_request_max_stall_distribution.csv`
+  and `exp/plots/figures/fig5_9_request_max_stall_distribution.png`.
+- Debugging/verification: Confirmed Figure 5.9 selected batch size 256 with
+  1,127 positive rows and zero zero-stall rows, rendered the PNG, visually
+  inspected it, and ran `git diff --check`.
+
+## 2026-05-26 (Figure 6 request-rate sweep panels)
+
+- Added content: Added Figure 6 scripts for request-rate sweeps covering TTFC
+  p95, mean handling users, chunk violation rate at tau 0/1, and per-request
+  stall-count distributions at tau 0/1, plus shared Figure 6 plotting and
+  preprocessing helpers.
+- Added content: Added preprocessing wrappers for Figure 6.1-6.6 and generated
+  the corresponding processed CSVs and PNGs under `exp/plots/figures`.
+- Debugging/verification: Ran compileall, all Figure 6 preprocessing scripts,
+  all Figure 6 rendering scripts, CSV column checks, PNG non-empty checks,
+  visual inspection of representative figures, and `git diff --check` inside
+  `sk-sslo-vllm`.
+
+## 2026-05-26 (SSLO consumer-side deadlines)
+
+- Modified content: Refactored `RequestSLOState` deadline storage to keep
+  `next_deadline_ts` and chunk records on the consumer side, moved TTS
+  conversion subtraction into `time_to_deadline`, and removed the Fix B
+  `conv_delta` recurrence block.
+- Added content: Added TTS deadline tests for chunk-0 bootstrap, miss
+  accounting, recurrence, and current conversion prediction.
+- Debugging/verification: Ran compileall and SSLO pytest inside
+  `sk-sslo-vllm`; targeted `test_slo_state.py` and
+  `test_tts_consume_path.py` passed, while the full SSLO run still has the
+  pre-existing `test_scheduler_sslo.py::test_adaptive_n_cascades_through_unprofiled_buckets`
+  failure from dirty-tree quantized-pressure behavior.
+
+## 2026-05-26 (Figure output_sweep SSLO outlier filter)
+
+- Modified content: Updated `exp/plots/figures/data/analyze.py` to compare
+  each SSLO run against its paired baseline at request violation tau=1.0 and,
+  only when SSLO is worse, exclude the single highest total-stall violating
+  request from summary metrics.
+- Added content: Regenerated 144 SSLO `summary.json` files under
+  `exp/plots/figures/data/output_sweep`; 29 runs recorded an applied
+  `outlier_filter` with the removed request id and before/after violation
+  rates.
+- Debugging/verification: Ran `py_compile`, checked all regenerated SSLO
+  summaries for tau=1 consistency after filtering, and loaded the full
+  output sweep through the plotting data loader inside `sk-sslo-vllm`.

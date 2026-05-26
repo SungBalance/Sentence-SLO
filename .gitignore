@@ -66,9 +66,6 @@ exp/run_sslo/filter_prompt/output/
 exp/measure_tts_duration/output/
 exp/measure_tts_duration/input_chunks.jsonl
 
-# Plots and rendered figures
-exp/plots/
-
 # Dataset cache backups (current file kept; .bak rotations local-only)
 exp/tools/dataset_cache/*.bak
 
