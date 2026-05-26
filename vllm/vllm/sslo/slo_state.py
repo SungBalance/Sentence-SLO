@@ -17,7 +17,7 @@ import numpy as np
 if TYPE_CHECKING:
     from vllm.sslo.config import SsloConfig
 
-_SENTENCE_END_CHARS = frozenset(".!?。！？…")
+_SENTENCE_END_CHARS = frozenset(".!?。！？…;,；，")
 _VALID_CHUNK_UNITS = frozenset({"sentence", "paragraph"})
 
 _VALID_CHUNK_LEN_STRATEGIES = frozenset({"ema", "p90", "p99", "past-future"})

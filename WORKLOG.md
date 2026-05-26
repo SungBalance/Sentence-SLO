@@ -1390,3 +1390,23 @@ DATASET_NAME=combine DATASET_SEED=42 EXCLUDE_CODE=1 \
   0.004 → 0.000 (TPS +27%), Supertone 0.012 → 0.009 (TPS +3%). Targeted
   pytest inside `sk-sslo-vllm`: my changes add 0 new failures vs HEAD
   (6 pre-existing slo_state failures unrelated to predictor change).
+
+## 2026-05-26 (SSLO sub-sentence chunking + non-English filter)
+
+- Modified content: Added `;,；，` to `_SENTENCE_END_CHARS` so the
+  ChunkSeparator splits long compound sentences at semicolons and
+  commas. `min_chunk_tokens=16` still merges short fragments so list
+  items and inline parentheticals don't over-fragment.
+- Added content: Removed 30 prompts from
+  `exp/tools/dataset_cache/processed_dataset.jsonl` whose generated
+  output was non-English (detected via `langdetect` on smoke chunk
+  texts, threshold lang != 'en'). Languages: es 7, de 6, fr 5, it 4,
+  pt 3, af/et/id/nl/sl 1 each. rid 1264 (Pokemon Spanish refusal)
+  caught by the langdetect path.
+- Debugging/verification: Smoke at cap=256 r=16 across 6 cells in
+  `sk-sslo-vllm`. SSLO viol@1: read 0.000 (unchanged), Kokoro
+  0.000 → 0.002 (1 viol), Supertone 0.009 → 0.001 (9x improvement,
+  matches baseline 0.001). Per-cell chunk p99 in Supertone dropped
+  63 → 45 tok confirming sub-sentence split worked. 1 remaining
+  Supertone viol (rid 1976) is an em-dash-delimited academic compound
+  sentence — accepted as noise floor.
