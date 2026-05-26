@@ -85,7 +85,7 @@ class SsloConfig:
     # would miss the deadline.
     mlp_pressure_epsilon: float = 1e-9
     mlp_critical_serve_threshold: float = 1.0
-    mlp_defer_constraint: float = 1.0
+    mlp_defer_constraint: float = 0.9
     # Critical-mode waiting admission policy. Default False = full freeze
     # (waiting_admission_budget = 0). True = allow admit up to
     # (picked_n - len(running)) so the GPU stays loaded near the
@@ -99,7 +99,7 @@ class SsloConfig:
     # remaining = (cur - anchor) × factor 로 산출. 1.0 → 거의 legacy
     # (saturate at 1.0); 2.5 → long-tail chunks도 MLP가 인식.
     mlp_predictor_escalate_threshold: float = 0.9
-    mlp_predictor_overshoot_safety_factor: float = 2.5
+    mlp_predictor_overshoot_safety_factor: float = 3.5
     # KV-aware admission cap for MLP non-critical. waiting_admission_budget
     # is capped at `free_kv_blocks // mlp_kv_blocks_per_new_admit` so we
     # don't admit more reqs from waiting than the KV pool can absorb. Each

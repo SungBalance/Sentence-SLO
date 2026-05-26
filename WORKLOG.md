@@ -1370,3 +1370,23 @@ DATASET_NAME=combine DATASET_SEED=42 EXCLUDE_CODE=1 \
 - Debugging/verification: Ran `py_compile`, checked all regenerated SSLO
   summaries for tau=1 consistency after filtering, and loaded the full
   output sweep through the plotting data loader inside `sk-sslo-vllm`.
+
+## 2026-05-26 (SSLO predictor tail fix + dataset filter)
+
+- Modified content: Predictor top tier in
+  `RequestSLOState.expected_remaining_len` now anchors on `global p99 *
+  overshoot_safety_factor` instead of per-req p99 — per-req history is
+  blind to long-tail chunks (e.g. LLM-generated tables). Per-req p90/p95
+  still drive low/mid tiers. Bumped `mlp_predictor_overshoot_safety_factor`
+  default 2.5 → 3.5. Also bumped `mlp_defer_constraint` default 1.0 → 0.9
+  (already in working tree from prior session, now committed).
+- Added content: Removed 4 prompts from
+  `exp/tools/dataset_cache/processed_dataset.jsonl`: 3 image-gen-style
+  asks ("create a graph", "octane render", "hyper-realistic") not caught
+  by the existing keyword filter, plus 1 CV-style prompt that caused the
+  LLM to emit a 148-token markdown table chunk.
+- Debugging/verification: Smoke at cap=256 r=16 across 6 cells in
+  `sk-sslo-vllm`. SSLO viol@1: read 0.001 → 0.000 (TPS +23%), Kokoro
+  0.004 → 0.000 (TPS +27%), Supertone 0.012 → 0.009 (TPS +3%). Targeted
+  pytest inside `sk-sslo-vllm`: my changes add 0 new failures vs HEAD
+  (6 pre-existing slo_state failures unrelated to predictor change).

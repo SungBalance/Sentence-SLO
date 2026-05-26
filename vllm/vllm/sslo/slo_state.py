@@ -783,14 +783,23 @@ class RequestSLOState:
         thr = pred.escalate_threshold
         tiers = pred.tier_values
         if tiers is not None:
-            # Full ladder: p50→p60→p70→p80→p90→p95→p99→overshoot
-            # Find first tier where cur is still below thr×tier.
-            for v in tiers:
+            # SSLO: ladder = [per-req p90, per-req p95, global p99 × factor].
+            # Per-req p90/p95 still drive low/mid tiers (req-specific
+            # signal), but the catastrophic upper bound is anchored on
+            # the global p99 × overshoot_safety_factor so per-req
+            # tail-blindness can't trap us into too-small predictions
+            # when a chunk turns out to be a true outlier (e.g. tables).
+            # Fall back to per-req p99 when global has no value yet.
+            top = tiers[-1]
+            if (glob is not None and glob is not pred
+                    and getattr(glob, "value_high", None) is not None):
+                top = glob.value_high * pred.overshoot_safety_factor
+            effective_tiers = [tiers[0], tiers[1], top]
+            for v in effective_tiers:
                 if cur < v * thr:
                     return max(1.0, v - cur)
-            # Past topmost tier: overshoot mode anchored at p99.
-            anchor = tiers[-1]
-            return max(1.0, (cur - anchor) * pred.overshoot_safety_factor)
+            # Past topmost tier: overshoot mode anchored at top.
+            return max(1.0, (cur - top) * pred.overshoot_safety_factor)
         # Single-tier strategies (p99, ema): legacy single-tier check then
         # overshoot at pred.value.
         if cur < pred.value * thr:
