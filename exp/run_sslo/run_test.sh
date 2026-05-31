@@ -53,8 +53,10 @@ if [[ -n "${REQUEST_RATES:-}" ]]; then
 else
   RATES_ARG="${REQUEST_RATE:-4}"
 fi
-# Measurement window is now completion-count gated (warmup=max_num_seqs*2,
-# measurement=max_num_seqs*4). No safety timeout — caller picks
+# Measurement window is completion-count gated (warmup=max_num_seqs*2,
+# measurement=1024 by default — fixed across caps for statistical
+# confidence at small caps). Override via --warmup-target / --measurement-target
+# on run_test.py if needed. No safety timeout — caller picks
 # reachable (cap, rate) combinations.
 CHUNK_UNIT="${CHUNK_UNIT:-sentence}"
 SECONDS_PER_WORD="${SECONDS_PER_WORD:-0.28}"

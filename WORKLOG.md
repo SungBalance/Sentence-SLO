@@ -1,5 +1,23 @@
 # Work Log
 
+## 2026-05-28 (plots/figures updates)
+
+- Modified content: Regenerated Figure 6.7g as a request-rate grouped plot under the `<0.5%` unit-miss budget, keeping Baseline/Ours color grouping and annotating the selected batch size for each request rate.
+- Debugging/verification details: Ran container `py_compile`, regenerated the Figure 6.7g processed CSV/PNG in `sk-sslo-vllm`, confirmed 60 rows across request rates 8/12/16/20/24 with `run_count == 3`, threshold `0.005`, and max unit miss rate below `<0.5%`.
+
+## 2026-05-27 (plots/figures updates)
+
+- Modified content: Updated Figure 5.4 so only the leftmost subplot shows the y-axis label/ticks, row spacing is tighter, and the model/method title is shown on every subplot; normalized Figure 5/6 plot labels from `Max Batch Size`/`Batch Size` to `Batch size`.
+- Modified content: Revised the new Figure 6.7a panel so Baseline vs Ours are encoded by legend color/marker, unit-miss budgets are separate subplots, selected batch sizes remain annotated, and supported users are computed from 3-run aggregates only.
+- Modified content: Removed the relaxed 5% unit-miss budget from Figure 6.7a and regenerated its processed CSV/PNG from the current `data/output_sweep` contents.
+- Modified content: Updated Figure 6.7a unit-miss budgets to strict `0`, conservative `<0.5%`, and relaxed `<1%`.
+- Added content: Added shared unit-miss diagnostic preprocessing helpers plus Figure 6.7b unit violation ratio curve, Figure 6.7c batch-size operating heatmap, and Figure 6.7d request-any-unit-miss ratio scripts.
+- Added content: Added Figure 6.7e violated-chunk grouped barplot and Figure 6.7f in-flight-user grouped barplot with model/consume subplots, Baseline/ProgressServe legend, and hierarchical batch-size/request-rate x-axis.
+- Modified content: Changed Figure 6.7e from absolute violated chunk counts to violated-unit ratio over all valid units.
+- Added content: Added Figure 6.7g best in-flight users under the `<0.5%` unit-miss budget, selecting the highest in-flight point per model/consume/policy from Figure 6.7a and annotating the chosen batch size and request rate.
+- Added content: Added Figure 6.1.2 TTFC p99 preprocessing/plotting output and Figure 6.7a unit-miss budget preprocessing/plotting output under `exp/plots/figures/`.
+- Debugging/verification details: Ran targeted container `py_compile` checks in `sk-sslo-vllm`, regenerated Figure 6.1.2 and 6.7a-g processed CSV/PNG outputs, confirmed Figure 6.7 outputs all have `run_count == 3`, and visually checked the regenerated Figure 6.7a-g PNGs.
+
 ## 2026-05-25 (Figure 5.1 request metrics)
 
 - Modified: `exp/plots/figures/scripts/figs/fig5_1_token_metric_mismatch.py` — added two-line `Request N` / TPOT labels inside the upper-left corner of each existing trace panel, shifted the labels slightly right, removed the temporary bottom metric tables, and changed the consumed-token trace to a solid line.
@@ -1410,3 +1428,430 @@ DATASET_NAME=combine DATASET_SEED=42 EXCLUDE_CODE=1 \
   63 → 45 tok confirming sub-sentence split worked. 1 remaining
   Supertone viol (rid 1976) is an em-dash-delimited academic compound
   sentence — accepted as noise floor.
+
+## 2026-05-28 (Figure analysis README data contract)
+
+- Modified content: Expanded `exp/plots/README.md` from Figure 5-only wording
+  to Figure 5/6 plotting, documented the SSLO sweep data contract, warmup and
+  measurement-window filtering rules, clock-domain guidance, and run-level
+  preprocessing/averaging expectation.
+- Debugging/verification: Reviewed plotting helpers and figure preprocessors
+  for `output_sweep` usage, request/chunk `in_window` filtering, summary-based
+  aggregation, direct `decisions.jsonl`/`scheduler_stats.jsonl` handling, and
+  noted current scripts that need rechecking before final analysis.
+
+## 2026-05-28 (Figure 6.7g request-rate view)
+
+- Modified content: Updated Figure 6.7g preprocessing to keep every
+  conservative `<0.5%` request-rate point from Figure 6.7a instead of selecting
+  only the single best point per model/profile/policy.
+- Modified content: Redrew Figure 6.7g as grouped Baseline/Ours bars by
+  request rate within each model/profile panel, retaining selected batch-size
+  annotations on each bar.
+- Debugging/verification: Ran targeted `py_compile`, regenerated the Figure
+  6.7g processed CSV and PNG inside `sk-sslo-vllm`, confirmed all
+  model/profile/policy groups have five request-rate rows with `run_count == 3`,
+  and visually inspected the regenerated PNG.
+
+## 2026-05-28 (Figure 6.7g redraw after data update)
+
+- Modified content: Relaxed Figure 6.7a preprocessing to accept available-run
+  aggregates while retaining `run_count`, so updated single-seed data can feed
+  downstream plots.
+- Modified content: Updated Figure 6.7g to render only policies present in the
+  processed data and regenerated the request-rate bar plot from the updated
+  `output_sweep` data.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 6.7a
+  and Figure 6.7g processed CSVs plus the Figure 6.7g PNG inside
+  `sk-sslo-vllm`; confirmed the updated data contains only `sslo`, request
+  rates 8/16/24/32, and `run_count == 1`; visually inspected the regenerated
+  PNG.
+
+## 2026-05-27 (Figure 5/6 handling-user labels and layout)
+
+- Modified content: Updated Figure 5.2 to keep only 35B request 1023;
+  renamed handling-user labels to `# of In-flight Users`; added consume
+  model row titles to Figures 5.4, 5.8, and 5.9; changed Figure 5.8
+  tradeoff x-axis to average stall count per request; removed Figure 5.9
+  dot overlays.
+- Debugging/verification: Re-ran targeted compile, preprocess, and
+  plotting inside `sk-sslo-vllm`; checked regenerated PNG dimensions and
+  visually inspected Figures 5.2, 5.3, 5.4, 5.6, 5.8, 5.9, and 6.2.
+
+## 2026-05-27 (Figure 5.1 Reading-only view)
+
+- Modified content: Updated Figure 5.1 request selection to use Reading
+  traces only, removed the TTS consumed-token overlay, fixed the x-axis
+  window to 4 seconds, and added the model label below the plot.
+- Debugging/verification: Re-ran Figure 5.1 compile, preprocessing, and
+  plotting inside `sk-sslo-vllm`; confirmed processed traces contain only
+  the Reading profile and visually inspected the regenerated PNG.
+
+## 2026-05-27 (Figure rerender with run averages)
+
+- Modified content: Updated Figure 6 summary/violation preprocessing so
+  reporting CSVs average `run_1`/`run_2`/`run_3` by
+  `model × consume profile × policy × max batch size × request rate`, with
+  `run_count` retained for audit.
+- Debugging/verification: Re-ran compile, preprocessing, and plotting for
+  Figures 5.1-5.9 and 6.1-6.6 inside `sk-sslo-vllm`; confirmed all PNGs
+  are non-empty and summary reporting CSVs have no duplicate report keys.
+
+## 2026-05-27 (Figure plotting analysis)
+
+- Modified content: No plot code or rendered figures changed; only reviewed
+  the Figure 5/6 plotting pipeline and available outputs.
+- Debugging/verification: Inspected `exp/plots/figures` layout, shared
+  plotting helpers, figure/preprocess entrypoints, processed CSV schemas,
+  PNG dimensions, and representative rendered figures to prepare for targeted
+  plot edits.
+
+## 2026-05-27 (Figure 5.4 and Figure 6 p99 edits)
+
+- Modified content: Updated Figure 5.4 to show the y-axis tick labels and
+  `Batch size` axis label only on the leftmost subplot, tightened row spacing,
+  and printed model/method titles on every heatmap panel. Replaced visible
+  `Max Batch Size`/`Batch Size` wording in Figure 5/6 scripts with
+  `Batch size`.
+- Added content: Added Figure 6.1.2 TTFC p99 preprocessing and plotting
+  scripts, plus generated `fig6_1_2_ttfc_p99_by_rate.csv` and PNG output.
+- Debugging/verification: Ran targeted `py_compile`, generated the new p99
+  CSV, re-rendered affected Figure 5/6 PNGs inside `sk-sslo-vllm`, checked
+  output image metadata, searched for stale batch-size labels, and visually
+  inspected Figure 5.4 and Figure 6.1.2.
+
+## 2026-05-27 (Figure 6.7a unit-miss budget panel)
+
+- Added content: Added Figure 6.7a preprocessing and plotting scripts for
+  the unit-miss budget supported-users panel. The processed CSV reports, per
+  model/profile/request-rate/threshold, the max supported
+  `mean_admitted_inflight_requests`, selected `max_num_seqs`, raw
+  `violated_unit_count / valid_consumable_unit_count`, and run count.
+- Debugging/verification: Ran targeted `py_compile`, generated
+  `fig6_7a_unit_miss_budget_supported_users.csv`, rendered the PNG inside
+  `sk-sslo-vllm`, checked output metadata, and visually inspected the
+  resulting Panel A with threshold lines and batch-size annotations.
+
+## 2026-05-28 (Full figure rerender after data update)
+
+- Modified content: Regenerated all Figure 5 and Figure 6 processed CSVs and
+  PNGs from the updated `exp/plots/figures/data/output_sweep` data.
+- Modified content: Updated the shared Figure 6.7 unit-miss diagnostic helper
+  to accept the current single-run-per-cell sweep data (`run_count >= 1`),
+  matching Figure 6.7a's aggregation requirement, so Figures 6.7b-f can be
+  regenerated from the new data instead of stale processed CSVs.
+- Debugging/verification: Ran targeted `py_compile`, full Figure 5/6
+  preprocessing and plotting inside `sk-sslo-vllm`, reran Figure 6.7b-g after
+  fixing the run-count gate, confirmed all PNGs are valid image files, checked
+  Figure 6.7 processed CSV row counts and `run_count == 1`, and visually
+  inspected the regenerated Figure 6.7g request-rate view.
+
+## 2026-05-28 (Figure 6.7 legend and spacing polish)
+
+- Modified content: Tightened Figure 6.7 row-title/subplot spacing, reduced
+  Figure 6.7a and 6.7c subplot title padding, moved hierarchical grouped-bar
+  batch-size labels closer to the x-axis, removed `Policy` legend titles, and
+  changed policy legend glyphs from rounded line handles to square color
+  patches.
+- Debugging/verification: Re-ran targeted `py_compile` and regenerated Figure
+  6.7a-g PNGs inside `sk-sslo-vllm`; confirmed valid PNG outputs, searched for
+  stale `Policy` legend titles and old spacing constants, and visually
+  inspected representative Figure 6.7 panels.
+
+## 2026-05-28 (Figure 6.7a missing-feasible markers)
+
+- Modified content: Added colored `x` markers to Figure 6.7a for
+  policy/request-rate points that are absent after threshold filtering, and
+  increased the consume-method row title spacing from the subplot grid.
+- Debugging/verification: Ran targeted `py_compile` and regenerated Figure
+  6.7a inside `sk-sslo-vllm`; visually inspected the updated PNG to confirm
+  missing feasible points and method spacing.
+
+## 2026-05-28 (Figure 7 unit-miss follow-up panels)
+
+- Modified content: Renamed the Figure 6.7a y-axis to `# of in-flight
+  requests` and regenerated the PNG.
+- Added content: Added Figure 7.1/7.2/7.3 preprocessing and plotting scripts
+  for the conservative `<0.5%` unit-miss operating points selected by Figure
+  6.7a: in-flight request line plot, queue-stall request-level boxplot, and
+  TTFC p99 line plot.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 6.7a,
+  generated Figure 7.1-7.3 processed CSVs and PNGs inside `sk-sslo-vllm`,
+  checked output schemas and valid PNG metadata, and visually inspected the
+  new Figure 7 panels.
+
+## 2026-05-28 (Figure 7 missing markers and label polish)
+
+- Modified content: Added colored `x` markers to Figure 7.1-7.3 for missing
+  policy/request-rate data points, reduced row spacing in the shared Figure 7
+  layout, and renamed the policy label from `Ours` to `ProgressServe`.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure
+  7.1-7.3 PNGs inside `sk-sslo-vllm`, checked valid PNG metadata, and visually
+  inspected the updated panels.
+
+## 2026-05-28 (Figure 7 x-axis labels)
+
+- Modified content: Updated the shared Figure 7 plotter so every subplot shows
+  the `Request rate (req/s)` x-axis label.
+- Debugging/verification: Ran targeted `py_compile` and regenerated Figure
+  7.1-7.3 PNGs inside `sk-sslo-vllm`; confirmed valid PNG outputs.
+
+## 2026-05-28 (Figure 7 x-tick polish and violation-ratio panel)
+
+- Modified content: Updated Figure 7.1-7.3 x-axis tick labels to render
+  horizontally, enlarged the batch-size annotations, and centered missing-data
+  `x` markers on their request-rate positions.
+- Added content: Added Figure 7.y preprocessing and plotting scripts for
+  violated chunk ratio by batch size and request rate, with processed CSV and
+  PNG outputs.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 6.7a
+  and Figure 7.1-7.3 from the updated data, generated the new Figure 7.y CSV
+  and PNG inside `sk-sslo-vllm`, checked PNG metadata and CSV row counts, and
+  visually inspected representative Figure 7 outputs.
+
+## 2026-05-28 (Figure 7.z violating-request count boxplot)
+
+- Added content: Added Figure 7.z preprocessing and plotting scripts for the
+  per-request violated chunk count distribution among requests with at least
+  one unit miss.
+- Modified content: The Figure 7.z processed CSV records both run-level cell
+  metadata and violating-request samples, so empty violation cells remain
+  visible as `x` markers while non-empty cells render policy-colored boxplots.
+- Debugging/verification: Ran targeted `py_compile`, regenerated the Figure
+  7.z processed CSV and PNG inside `sk-sslo-vllm`, checked output metadata and
+  row counts, and visually inspected the generated figure.
+
+## 2026-05-28 (Figure 7.aa unit violation severity boxplot)
+
+- Added content: Added Figure 7.aa preprocessing and plotting scripts for the
+  distribution of unit-level violation severity among units with positive
+  `unit_deadline_miss_s`.
+- Modified content: The Figure 7.aa processed CSV includes run-level cell
+  metadata plus violated-unit samples, preserving empty cells as `x` markers
+  while rendering non-empty cells as policy-colored boxplots.
+- Debugging/verification: Ran targeted `py_compile`, generated the Figure
+  7.aa processed CSV and PNG inside `sk-sslo-vllm`, checked output metadata and
+  sample counts, and visually inspected the generated figure.
+
+## 2026-05-28 (Figure 7 missing-marker scope)
+
+- Modified content: Limited missing-value `x` markers to non-distribution
+  Figure 7 plots, added optional missing markers to the hierarchical grouped
+  bar helper for Figure 7.y, and removed missing markers from Figure 7.2,
+  7.z, and 7.aa boxplot-style distribution panels.
+- Debugging/verification: Ran targeted `py_compile` and regenerated Figure
+  7.1, 7.2, 7.3, 7.y, 7.z, and 7.aa inside `sk-sslo-vllm`; visually inspected
+  representative non-distribution and distribution panels, and confirmed Figure
+  7.y currently has no missing policy cells in the processed data.
+
+## 2026-05-28 (Figure 7 threshold variants and rank-2 points)
+
+- Modified content: Increased max-batch-size annotations and made request-rate
+  tick labels horizontal for Figure 6.7a, Figure 6.7g, and Figure 7 line
+  plots.
+- Modified content: Extended Figure 6.7a preprocessing to preserve the top two
+  feasible operating points per threshold, while keeping Figure 6.7a and
+  follow-up distribution plots on the best point only.
+- Added content: Figure 7.1 now plots the second-largest in-flight request
+  point as a faint dotted line with batch-size labels, and Figure 7.1-7.3 now
+  regenerate both strict `0` and conservative `0.5` processed CSV/PNG outputs.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 6.7a,
+  Figure 6.7g, and Figure 7.1-7.3 for both `0` and `0.5` thresholds inside
+  `sk-sslo-vllm`, checked PNG metadata and row counts, and visually inspected
+  representative outputs.
+
+## 2026-05-28 (Figure 7.1 rank-1 only)
+
+- Modified content: Restored Figure 7.1 preprocessing to emit only the
+  best feasible operating point (`selection_rank == 1`) for each threshold,
+  removing the second-largest in-flight request points from the plotted CSVs.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.1
+  strict `0` and conservative `0.5` CSV/PNG outputs inside `sk-sslo-vllm`,
+  confirmed both CSVs contain only rank-1 rows, checked PNG metadata, and
+  visually inspected the conservative Figure 7.1 output.
+
+## 2026-05-28 (Figure 7 row spacing)
+
+- Modified content: Reduced subplot row spacing across Figure 7 line, grouped
+  bar, and distribution panels by lowering shared `hspace` values and tightening
+  the Figure 7 line-panel row-title offset.
+- Debugging/verification: Ran targeted `py_compile` and regenerated Figure
+  7.1, 7.2, and 7.3 for both strict `0` and conservative `0.5`, plus Figure
+  7.y, 7.z, and 7.aa inside `sk-sslo-vllm`; visually inspected representative
+  outputs for reduced row spacing and no label/title overlap.
+
+## 2026-05-28 (Figure 7.y and 7.aa profile-column layout)
+
+- Modified content: Reoriented Figure 7.y and Figure 7.aa to place consume
+  profiles horizontally as columns and model variants as rows, reducing each
+  subplot's horizontal footprint in the six-panel layout.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.y
+  and Figure 7.aa inside `sk-sslo-vllm`, checked PNG metadata, and visually
+  inspected the new 2x3 layout.
+
+## 2026-05-28 (Figure 7.4 violation amount)
+
+- Modified content: Added Figure 7.4 using the same selected operating points
+  as Figure 7.1, with the y-axis changed to mean unit violation amount in
+  seconds.
+- Added content: Added Figure 7.4 preprocessing and plotting entry points, and
+  generated strict `0` and conservative `0.5` CSV/PNG outputs.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.4
+  data and both threshold plots inside `sk-sslo-vllm`, checked PNG metadata,
+  and visually inspected both outputs.
+
+## 2026-05-28 (Figure 7 model-row layout)
+
+- Modified content: Reoriented Figure 7.1-7.4 and Figure 7.z so model variants
+  are rows and consume profiles are columns, matching the existing Figure 7.y
+  and Figure 7.aa orientation.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.1-
+  7.4 for both strict `0` and conservative `0.5` thresholds plus Figure 7.z
+  inside `sk-sslo-vllm`, checked PNG metadata, and visually inspected the new
+  2x3 layout.
+
+## 2026-05-28 (Figure 7 point labels)
+
+- Modified content: Removed batch-size text annotations from the points in
+  Figure 7 line plots.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.1,
+  Figure 7.3, and Figure 7.4 for both strict `0` and conservative `0.5`
+  thresholds inside `sk-sslo-vllm`, checked PNG metadata, and visually
+  inspected Figure 7.1.
+
+## 2026-05-28 (Figure 7.y/z/aa scale tuning)
+
+- Modified content: Tuned Figure 7.y to use per-panel y-axis scaling and
+  tuned Figure 7.z/7.aa boxplot y-axes to follow the visible whisker range
+  rather than hidden outlier values.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.y,
+  Figure 7.z, and Figure 7.aa inside `sk-sslo-vllm`, checked PNG metadata, and
+  visually inspected all three outputs for readable panel scales.
+
+## 2026-05-28 (Figure 7.1-7.4 axis and metric updates)
+
+- Modified content: Updated Figure 7.1, Figure 7.2, and Figure 7.3 to share
+  y-axis limits by model row with a fixed zero lower bound.
+- Modified content: Changed Figure 7.3 from TTFC p99 to TTFT p99 and added a
+  TTFT-named plotting wrapper/output.
+- Modified content: Added max/min annotations to Figure 7.4 for plotted points
+  with chunk violation rate below `0.5%`.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.3
+  and Figure 7.4 processed CSVs, regenerated Figure 7.1-7.4 strict `0` and
+  conservative `0.5` PNGs inside `sk-sslo-vllm`, checked PNG metadata, and
+  visually inspected representative outputs.
+
+## 2026-05-28 (Figure 7 title hierarchy)
+
+- Modified content: Updated Figure 7 titles so consume-profile names are
+  larger subplot titles, model names are larger row-level labels shown once per
+  row, and `Reading` renders as `Human Reading`.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.1-
+  7.4 for both strict `0` and conservative `0.5`, plus Figure 7.y, Figure 7.z,
+  and Figure 7.aa inside `sk-sslo-vllm`; checked PNG metadata and visually
+  inspected representative line, bar, and boxplot outputs.
+
+## 2026-05-28 (Figure 7 row-title spacing)
+
+- Modified content: Moved the second model row title slightly downward to add
+  more space between the upper subplots and the lower model label.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.1-
+  7.4 for both strict `0` and conservative `0.5`, plus Figure 7.y, Figure 7.z,
+  and Figure 7.aa inside `sk-sslo-vllm`; checked PNG metadata and visually
+  inspected Figure 7.y for the adjusted inter-row spacing.
+
+## 2026-05-28 (Figure 7.ab violation P99)
+
+- Added content: Added a separate Figure 7.ab script and PNG that computes
+  cell-level P99 unit violation amount from the Figure 7.aa processed
+  unit-level severity samples.
+- Debugging/verification: Ran targeted `py_compile`, generated the Figure 7.ab
+  PNG inside `sk-sslo-vllm`, checked PNG metadata, and visually inspected the
+  new P99 grouped-bar figure.
+
+## 2026-05-28 (Figure 7.y style and KV cache audit)
+
+- Modified content: Updated Figure 7.y to remove the request-rate axis label,
+  append `= lambda` to the rightmost rate tick, draw batch-size boundaries as
+  black solid lines, and use thicker adjacent policy bars.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.y
+  processed data and PNG inside `sk-sslo-vllm`, and visually inspected the
+  output.
+- Debugging/verification: Scanned all `output_sweep` summaries and scheduler
+  stats for KV/cache/block fields; only `bf_kv_full` is present in scheduler
+  stats and it is zero in all scanned rows.
+
+## 2026-05-28 (Figure output legacy folder)
+
+- Modified content: Created `exp/plots/figures/legacy/` and moved non-Figure-7
+  PNG outputs from the figure root into that folder.
+- Debugging/verification: Listed the figure root to confirm only `fig7_*.png`
+  outputs remain and listed `legacy/` to confirm the Figure 5 and Figure 6
+  PNG outputs were moved there.
+
+## 2026-05-28 (Figure preprocess legacy folder)
+
+- Modified content: Created `exp/plots/figures/scripts/preprocess/legacy/`
+  and moved Figure 5 and Figure 6 preprocess entrypoints into it.
+- Debugging/verification: Listed the preprocess root to confirm only Figure 7
+  preprocess entrypoints remain and listed the preprocess legacy folder to
+  confirm the 24 Figure 5 and Figure 6 files were moved.
+
+## 2026-05-28 (Figure 7 renumbering)
+
+- Modified content: Removed the old Figure 7.4 violation-amount line plot code
+  and outputs.
+- Modified content: Renamed Figure 7.y to Figure 7.4, Figure 7.ab to Figure
+  7.5, and Figure 7.z to Figure 7.6, including preprocess entrypoints,
+  processed CSVs, and PNG outputs.
+- Modified content: Changed Figure 7.6 to plot the percentage of in-window
+  requests that include at least one violated unit.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.4,
+  Figure 7.5, and Figure 7.6 processed CSVs and PNGs inside `sk-sslo-vllm`,
+  checked for stale old file names, and visually inspected the new outputs.
+
+## 2026-05-28 (Figure 7 PNG refresh)
+
+- Modified content: Regenerated current numbered Figure 7 PNG outputs from
+  existing processed CSVs without rerunning preprocess.
+- Debugging/verification: Ran targeted `py_compile` and regenerated Figure
+  7.1, 7.2, 7.3, 7.4, 7.5, and 7.6 PNG outputs inside `sk-sslo-vllm`; Figure
+  7.aa was not regenerated because its processed CSV is not currently present.
+
+## 2026-05-28 (Figure 7.4-7.6 grouped-bar layout)
+
+- Modified content: Unified Figure 7.4, Figure 7.5, and Figure 7.6 on the
+  same grouped-bar layout, with tighter batch spacing, compact request-rate
+  ticks, separate lambda text, black batch boundaries, and adjacent thicker
+  policy bars.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.4,
+  Figure 7.5, and Figure 7.6 PNG outputs inside `sk-sslo-vllm`, and visually
+  inspected the refreshed figures.
+
+## 2026-05-28 (Figure 7.4-7.6 batch boundaries)
+
+- Modified content: Corrected grouped-bar batch boundary placement so the
+  vertical divider sits halfway between adjacent batch-size groups.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.4,
+  Figure 7.5, and Figure 7.6 PNG outputs inside `sk-sslo-vllm`, and visually
+  inspected the boundary positions across all three figures.
+
+## 2026-05-28 (Figure 7.4-7.6 missing-cell markers)
+
+- Modified content: Updated grouped-bar plotting to preserve the full
+  batch-size/request-rate grid from the source CSV and mark missing policy
+  cells with X markers.
+- Modified content: Moved batch-size labels closer to their request-rate ticks
+  for Figure 7.4, Figure 7.5, and Figure 7.6.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.4,
+  Figure 7.5, and Figure 7.6 PNG outputs inside `sk-sslo-vllm`, and visually
+  inspected the restored Figure 7.5 batch-size grid and missing markers.
+
+## 2026-05-28 (Figure 7.4-7.6 x-label tuning)
+
+- Modified content: Adjusted lambda annotation placement, increased
+  request-rate tick readability, and moved batch-size labels upward for Figure
+  7.4, Figure 7.5, and Figure 7.6.
+- Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.4,
+  Figure 7.5, and Figure 7.6 PNG outputs inside `sk-sslo-vllm`, and visually
+  inspected the label placement.

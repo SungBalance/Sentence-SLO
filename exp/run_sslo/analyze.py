@@ -631,6 +631,13 @@ def analyze(
         sched_decode_tokens = _sum("num_decode_tokens")
         sched_prefill_tokens = _sum("num_prefill_tokens")
         sched_total_tokens = _sum("num_scheduled_tokens_total")
+        # SSLO: KV cache block usage from scheduler step stats.
+        kv_used_values = numeric_values(in_win_sched, "kv_blocks_used")
+        kv_blocks_used_max = max(kv_used_values) if kv_used_values else None
+        kv_blocks_used_mean = _time_weighted_mean(
+            sched_rows, "kv_blocks_used", sched_mw0, sched_mw1)
+        kv_total_values = numeric_values(in_win_sched, "kv_blocks_total")
+        kv_blocks_total = kv_total_values[0] if kv_total_values else None
         metrics["scheduler"][mode] = {
             "running": dist_for_key(sched_rows, "running"),
             "num_handling_users": nhu_dist,
@@ -649,6 +656,10 @@ def analyze(
             "scheduled_tokens_per_second": (
                 sched_total_tokens / win_dur
                 if win_dur and win_dur > 0 else None),
+            # SSLO: KV cache block occupancy.
+            "kv_blocks_used_max": kv_blocks_used_max,
+            "kv_blocks_used_mean": kv_blocks_used_mean,
+            "kv_blocks_total": kv_blocks_total,
         }
 
     # Use run_meta window as the single authoritative window for all modes.

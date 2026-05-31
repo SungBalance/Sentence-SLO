@@ -22,7 +22,7 @@
 #   CAPS             max_num_seqs values (space-sep)  (default "32 64 128 256")
 #   MODES            modes (comma-sep)                (default baseline,sslo_mlp)
 #   REPEATS          number of repeats                (default 3)
-#   RATES            rate ladder (space-sep)          (default "1 2 4 8 12 16")
+#   RATES            rate ladder (space-sep)          (default "8 12 16 20 24")
 #   CONSUME_CELLS    entries: "read" or "tts:<HF id>" (default read + 2 TTS models)
 #   TTS_PROFILE_PATH path to profile CSV              (default exp/run_sslo/profiles/word_count_duration_stats.csv)
 #   OUTPUT_ROOT      sweep destination dir            (default exp/run_sslo/output_sweep)
@@ -39,7 +39,7 @@ CAPS=(${CAPS:-32 64 128 256})
 MODES_CSV="${MODES:-baseline,sslo_mlp}"
 IFS=',' read -ra MODE_ARR <<< "${MODES_CSV}"
 REPEATS="${REPEATS:-1}"
-RATES="${RATES:-4 8 12 16 20 24}"
+RATES="${RATES:-8 12 16 20 24}"
 CONSUME_CELLS=(${CONSUME_CELLS:-read tts:hexgrad/Kokoro-82M tts:Supertone/supertonic-3})
 
 NUM_GPUS="${NUM_GPUS:-4}"
@@ -216,10 +216,13 @@ fi
 phase3_label="2..${REPEATS}"
 [[ "$REPEATS" -le 1 ]] && phase3_label="(skipped)"
 
-run_phase "1 (${m0_slug} run_1)" "${p1[@]}"
-run_phase "2 (${m1_slug} run_1)" "${p2[@]}"
-run_phase "3 (${m0_slug} run_${phase3_label})" "${p3[@]}"
-run_phase "4 (${m1_slug} run_${phase3_label})" "${p4[@]}"
+# START_PHASE (default 1) lets you skip already-completed phases. Set to 3
+# to run only run_2..REPEATS (preserving existing run_1 outputs).
+START_PHASE="${START_PHASE:-1}"
+(( START_PHASE <= 1 )) && run_phase "1 (${m0_slug} run_1)" "${p1[@]}"
+(( START_PHASE <= 2 )) && run_phase "2 (${m1_slug} run_1)" "${p2[@]}"
+(( START_PHASE <= 3 )) && run_phase "3 (${m0_slug} run_${phase3_label})" "${p3[@]}"
+(( START_PHASE <= 4 )) && run_phase "4 (${m1_slug} run_${phase3_label})" "${p4[@]}"
 
 echo
 echo "===== sweep complete ====="

@@ -1907,6 +1907,12 @@ class Scheduler(SchedulerInterface):
             "bf_too_few_tokens": self._sslo_step.bf_too_few_tokens,
             "bf_encoder_skipped": self._sslo_step.bf_encoder_skipped,
             "bf_budget_exhausted": self._sslo_step.bf_budget_exhausted,
+            # SSLO: per-step KV cache block usage
+            "kv_blocks_used": (
+                self.kv_cache_manager.block_pool.num_gpu_blocks
+                - self.kv_cache_manager.block_pool.get_num_free_blocks()),
+            "kv_blocks_total": (
+                self.kv_cache_manager.block_pool.num_gpu_blocks),
         }
         with open(log_path, "a") as f:
             f.write(json.dumps(stats_row) + "\n")

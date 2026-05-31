@@ -76,6 +76,23 @@ def parse_args() -> argparse.Namespace:
              "let vLLM derive from the model's HF config.",
     )
     parser.add_argument("--max-num-seqs", type=int, default=64)
+    # SSLO
+    parser.add_argument(
+        "--warmup-target",
+        type=int,
+        default=0,
+        help="In-window gate opens after N completed requests (steady-state "
+             "primer). 0 = auto: max_num_seqs * 2.",
+    )
+    # SSLO
+    parser.add_argument(
+        "--measurement-target",
+        type=int,
+        default=1024,
+        help="Number of completed requests measured per rate after the "
+             "warmup gate. Default 1024 gives statistical confidence at "
+             "small caps too.",
+    )
     parser.add_argument("--generation-max-tokens", type=int, default=512)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
@@ -820,6 +837,8 @@ _SUMMARY_CSV_HEADER = [
     "units_per_request_p90", "units_per_request_p99",
     "consume_time_per_unit_mean", "consume_time_per_unit_p50",
     "consume_time_per_unit_p90", "consume_time_per_unit_p99",
+    # SSLO: KV cache block occupancy (mean used / total capacity)
+    "kv_blocks_used_mean", "kv_blocks_total",
 ]
 
 
@@ -953,6 +972,8 @@ def _summary_row(
         _fmt(units_dist.get("p90"), 1), _fmt(units_dist.get("p99"), 1),
         _fmt(consume_dist.get("mean")), _fmt(consume_dist.get("p50")),
         _fmt(consume_dist.get("p90")), _fmt(consume_dist.get("p99")),
+        _fmt(sched.get("kv_blocks_used_mean"), 1),
+        _fmt(sched.get("kv_blocks_total"), 0),
     ]
 
 
@@ -1068,8 +1089,10 @@ async def _run_one_rate(
     measurement_done_event = asyncio.Event()
     warmup_counter: list[int] = [0]
     measurement_counter: list[int] = [0]
-    warmup_target = args.max_num_seqs * 2
-    measurement_target = args.max_num_seqs * 4
+    warmup_target = (
+        args.warmup_target if args.warmup_target > 0
+        else args.max_num_seqs * 2)
+    measurement_target = args.measurement_target
     max_total_requests = len(pool)
     # Window timestamps are written inline by the gate-flipping task in
     # collect_one (see comment there) and read here after the watcher
