@@ -20,7 +20,7 @@
 # Env overrides:
 #   MODEL_SPECS      space-sep "<slug>:<HF_id>" pairs (default 9B + 35B-A3B; must be 2)
 #   CAPS             max_num_seqs values (space-sep)  (default "32 64 128 256")
-#   MODES            modes (comma-sep)                (default baseline,sslo_mlp)
+#   MODES            modes (comma-sep)            (default baseline,progress_serve)
 #   REPEATS          number of repeats                (default 3)
 #   RATES            rate ladder (space-sep)          (default "8 12 16 20 24")
 #   CONSUME_CELLS    entries: "read" or "tts:<HF id>" (default read + 2 TTS models)
@@ -36,7 +36,7 @@ mkdir -p "$ROOT"
 
 MODEL_SPECS=(${MODEL_SPECS:-Qwen3.5-9B:Qwen/Qwen3.5-9B Qwen3.5-35B-A3B:Qwen/Qwen3.5-35B-A3B})
 CAPS=(${CAPS:-32 64 128 256})
-MODES_CSV="${MODES:-baseline,sslo_mlp}"
+MODES_CSV="${MODES:-baseline,progress_serve}"
 IFS=',' read -ra MODE_ARR <<< "${MODES_CSV}"
 REPEATS="${REPEATS:-1}"
 RATES="${RATES:-8 12 16 20 24}"

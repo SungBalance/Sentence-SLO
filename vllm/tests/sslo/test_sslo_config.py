@@ -1,29 +1,48 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for SSLO config."""
+"""Tests for SSLO config (ProgressServe)."""
 
 import pytest
 
 from vllm.sslo.config import SsloConfig
-from vllm.sslo.slo_state import RequestSLOState
+from vllm.sslo.slo_state import ChunkLengthPredictor, RequestSLOState
 
 
 def test_defaults():
     cfg = SsloConfig()
     assert cfg.method == "baseline"
-    assert cfg.policy == "threshold"
-    assert cfg.adaptive_batching is False
     assert cfg.num_warmup_chunks == 16
     assert cfg.tpot_ema_alpha == 0.1
-    assert cfg.critical_threshold == 1.0
-    assert cfg.pending_in_threshold == 0.3
-    assert cfg.pending_out_threshold == 0.7
-    assert cfg.adaptive_batching_min_throughput_ratio == 0.9
     assert cfg.seconds_per_word == 0.28
     assert cfg.chunk_unit == "sentence"
     assert cfg.min_chunk_tokens == 16
-    assert not hasattr(cfg, "adaptive_batch_size")
-    assert not hasattr(cfg, "max_pending_num")
-    assert not hasattr(cfg, "iter_time_ema_alpha")
+    assert cfg.kv_blocks_per_new_admit == 8
+    assert cfg.progress_serve_min_denom == 4
+    # Removed policy knobs must be gone.
+    assert not hasattr(cfg, "policy")
+    assert not hasattr(cfg, "adaptive_batching")
+    assert not hasattr(cfg, "critical_threshold")
+    assert not hasattr(cfg, "pending_in_threshold")
+    assert not hasattr(cfg, "mlp_defer_constraint")
+    assert not hasattr(cfg, "allow_admit_critical")
+
+
+def test_method_progress_serve_valid():
+    cfg = SsloConfig(method="progress_serve")
+    assert cfg.method == "progress_serve"
+
+
+def test_method_validation_rejects_old_modes():
+    for bad in ("sslo", "sslo_mlp", "threshold"):
+        with pytest.raises(ValueError, match="method"):
+            SsloConfig(method=bad)
+
+
+def test_removed_knobs_rejected_as_kwargs():
+    for bad in ("policy", "adaptive_batching", "critical_threshold",
+                "pending_in_threshold", "mlp_defer_constraint",
+                "mlp_kv_blocks_per_new_admit"):
+        with pytest.raises(TypeError):
+            SsloConfig(**{bad: 1})
 
 
 @pytest.mark.parametrize(
@@ -32,11 +51,10 @@ def test_defaults():
         ("num_warmup_chunks", 0),
         ("tpot_ema_alpha", 0.0),
         ("tpot_ema_alpha", 1.1),
-        ("critical_threshold", -0.1),
-        ("pending_in_threshold", -0.1),
-        ("adaptive_batching_min_throughput_ratio", 0.0),
         ("seconds_per_word", -0.1),
         ("min_chunk_tokens", -1),
+        ("kv_blocks_per_new_admit", -1),
+        ("progress_serve_min_denom", 0),
     ],
 )
 def test_validation_rejects_invalid_values(field, value):
@@ -44,57 +62,55 @@ def test_validation_rejects_invalid_values(field, value):
         SsloConfig(**{field: value})
 
 
-def test_validation_rejects_bad_threshold_ordering():
-    with pytest.raises(ValueError, match="pending_in_threshold"):
-        SsloConfig(pending_in_threshold=0.8, pending_out_threshold=0.7)
-
-
 def test_invalid_chunk_unit_raises():
     with pytest.raises(ValueError, match="chunk_unit"):
         SsloConfig(chunk_unit="token")
 
 
-def test_decision_log_mode_default():
+def test_decision_log_mode_default_and_validation():
     cfg = SsloConfig()
     assert cfg.decision_log_mode == "tier_changes"
     assert cfg.decision_heartbeat_steps == 200
-
-
-def test_decision_log_mode_validation():
     with pytest.raises(ValueError, match="decision_log_mode"):
         SsloConfig(decision_log_mode="invalid")
-
-
-def test_decision_heartbeat_validation():
     with pytest.raises(ValueError, match="decision_heartbeat_steps"):
         SsloConfig(decision_heartbeat_steps=0)
 
 
-def test_mlp_valid_when_adaptive_true():
-    cfg = SsloConfig(
-        method="sslo",
-        policy="multi_level_pressure",
-        adaptive_batching=True,
-    )
-    assert cfg.policy == "multi_level_pressure"
-    assert cfg.mlp_pressure_epsilon == 1e-9
-    assert cfg.mlp_critical_serve_threshold == 1.0
-    assert cfg.mlp_defer_constraint == 1.0
+def test_tts_mode_requires_profile_and_model():
+    with pytest.raises(ValueError, match="tts_profile_path"):
+        SsloConfig(consume_mode="tts")
 
 
 def test_from_config_freezes_constants():
     cfg = SsloConfig(
+        method="progress_serve",
         seconds_per_word=0.5,
         num_warmup_chunks=7,
         chunk_unit="paragraph",
         min_chunk_tokens=24,
+        progress_serve_min_denom=6,
     )
     state = RequestSLOState.from_config(cfg)
     assert isinstance(state, RequestSLOState)
-    # num_warmup_chunks persists on the instance (phase property reads it).
     assert state.num_warmup_chunks == 7
-    # The other knobs propagate into the helpers built in __post_init__,
-    # not onto the instance.
+    assert state.progress_serve_min_denom == 6
     assert state.chunk_separator.chunk_unit == "paragraph"
     assert state.chunk_separator.min_chunk_tokens == 24
     assert state.consume_estimator.seconds_per_word == 0.5
+
+
+def test_from_config_wires_global_predictor_for_tail():
+    cfg = SsloConfig(method="progress_serve",
+                     global_warmup_predictor_samples=3,
+                     progress_serve_min_denom=2)
+    glob = ChunkLengthPredictor(strategy="p90")
+    state = RequestSLOState.from_config(cfg, global_chunk_len_predictor=glob)
+    for v in (10, 20, 30, 40, 50):
+        glob.update(v)
+    # c_q=5: P(L>25 | L>5) = |{>25}|/|{>5}| = 3/5
+    state.current_chunk_generated_len = 5
+    assert abs(state.length_tail_prob(25) - 0.6) < 1e-9
+    # cold-start fallback when c_q exceeds all samples (denom 0).
+    state.current_chunk_generated_len = 100
+    assert state.length_tail_prob(120) == 1.0  # < c_q + cold_start_max

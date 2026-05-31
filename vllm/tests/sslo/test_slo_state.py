@@ -91,7 +91,9 @@ def test_tts_chunk0_deadline_is_consumer_side():
     assert record.consumer_ready_time == pytest.approx(11.0)
     assert record.unit_deadline_miss_s == pytest.approx(0.0)
     assert state.consume_start_time == pytest.approx(11.0)
-    assert state.next_deadline_ts == pytest.approx(16.0)
+    # next_deadline = max(deadline, now) + conv + consume
+    #              = max(11.0, 10.0) + 1.0 + 5.0 = 17.0.
+    assert state.next_deadline_ts == pytest.approx(17.0)
 
 
 def test_tts_deadline_miss_subtracts_current_conversion():
@@ -103,11 +105,15 @@ def test_tts_deadline_miss_subtracts_current_conversion():
     state.on_chunk_boundary(
         3.0, word_count=2, consume_duration=1.0, conversion_time=0.5)
 
+    # chunk 0 deadline(consumer) = 1.0 + 0.2 = 1.2;
+    # next_deadline = max(1.2, 1.0) + 0.2 + 2.0 = 3.4 → chunk 1's deadline.
     rec = state.chunk_records[1]
-    assert rec.deadline == pytest.approx(3.2)
-    assert rec.unit_deadline_miss_s == pytest.approx(0.3)
+    assert rec.deadline == pytest.approx(3.4)
+    # deadline_text = 3.4 - conv(0.5) = 2.9; text arrived at 3.0 → miss 0.1.
+    assert rec.unit_deadline_miss_s == pytest.approx(0.1)
     assert rec.consumer_ready_time == pytest.approx(3.5)
-    assert state.next_deadline_ts == pytest.approx(4.5)
+    # next_deadline = max(3.4, 3.0) + 0.5 + 1.0 = 4.9.
+    assert state.next_deadline_ts == pytest.approx(4.9)
 
 
 def test_on_step_tracks_total_and_prefill_counts():
@@ -187,6 +193,7 @@ def test_expected_remaining_escalates_at_90pct_threshold():
     pred.value = 10.0
     pred.value_mid = 15.0
     pred.value_high = 20.0
+    pred.tier_values = [10.0, 15.0, 20.0]
 
     # cur=8 (< 10×0.9=9): use p90 tier → remaining = 10 - 8 = 2.
     state.current_chunk_generated_len = 8
@@ -214,6 +221,7 @@ def test_expected_remaining_overshoot_grows_past_topmost():
     pred.value = 10.0
     pred.value_mid = 15.0
     pred.value_high = 20.0
+    pred.tier_values = [10.0, 15.0, 20.0]
 
     state.current_chunk_generated_len = 30
     assert state.expected_remaining_len() == pytest.approx((30 - 20) * 2.5)
@@ -235,6 +243,7 @@ def test_expected_remaining_legacy_threshold_and_factor():
     pred.value = 10.0
     pred.value_mid = 15.0
     pred.value_high = 20.0
+    pred.tier_values = [10.0, 15.0, 20.0]
 
     # cur=9 (< 10): legacy uses p90 → remaining = 10 - 9 = 1.
     state.current_chunk_generated_len = 9
@@ -339,8 +348,6 @@ def test_score_formula_and_deadline_sign():
     # branch fires: remaining = (cur - anchor) * 2.5 = (4 - 1) * 2.5 = 7.5.
     assert state.time_to_deadline(5.1) == pytest.approx(5.0)
     assert state.expected_remaining_len() == pytest.approx(7.5)
-    assert state.pressure(5.1, tpot_s=0.2) == pytest.approx(7.5 * 0.2 / 5.0)
-    assert state.pressure(20.0, tpot_s=0.2) == float("inf")
 
 
 def test_tts_time_to_deadline_subtracts_current_conversion_estimate():
@@ -362,21 +369,13 @@ def test_tts_time_to_deadline_subtracts_current_conversion_estimate():
 
     assert state.last_num_token == 8
     assert state.last_word_count == 4
-    assert state._predict_current_conversion() == pytest.approx(0.4)
-    assert state.time_to_deadline(10.5) == pytest.approx(
-        11.6 - 1.2 * 0.4 - 10.5)
-
-
-def test_score_none_during_warmup_or_missing_inputs():
-    # WARMUP now means chunks_completed == 0 (first chunk not yet done).
-    warmup = RequestSLOState(num_warmup_chunks=4)
-    warmup.on_token(0.0)
-    assert warmup.pressure(0.05, 0.1) is None  # still WARMUP — no chunks yet
-
-    measured = measured_state()
-    assert measured.pressure(0.2, None) is None
-    measured._chunk_len_predictor.value = None
-    assert measured.pressure(0.2, 0.1) is None
+    # No in-progress chunk after the boundary (token counter reset to 0),
+    # so the current-conversion estimate is 0 and time_to_deadline reduces
+    # to deadline - now. deadline = next_deadline_ts after chunk 0:
+    #   chunk 0 deadline(consumer) = 10.0 + conv(0.4) = 10.4;
+    #   next_deadline = max(10.4, 10.0) + conv(0.4) + consume(1.2) = 12.0.
+    assert state._predict_current_conversion() == pytest.approx(0.0)
+    assert state.time_to_deadline(10.5) == pytest.approx(12.0 - 10.5)
 
 
 def test_text_delta_compatibility_flushes_by_chunk_unit():
@@ -652,192 +651,19 @@ def test_admitted_ts_propagates_to_stats():
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 tests: PressureComponents + pressure_components()
+# Empirical tail API on ChunkLengthPredictor (ProgressServe primitives)
 # ---------------------------------------------------------------------------
 
-def test_pressure_components_prefill():
-    state = RequestSLOState(num_warmup_chunks=2)
-    # Phase is PREFILL (decoding_start_ts is None)
-    assert state.phase.name == "PREFILL"
-    pc = state.pressure_components(1.0, tpot_s=0.05)
-    assert not pc.pressure_available
-    assert pc.pressure_missing_reason == "prefill"
-    assert pc.depletion_pressure is None
-
-
-def test_pressure_components_warmup():
-    state = RequestSLOState(num_warmup_chunks=2, min_chunk_tokens=0)
-    # Trigger decoding start but stay in WARMUP (chunks_completed < num_warmup_chunks)
-    state.on_token(0.0)
-    assert state.phase.name == "WARMUP"
-    pc = state.pressure_components(0.1, tpot_s=0.05)
-    assert not pc.pressure_available
-    assert pc.pressure_missing_reason == "warmup"
-    assert pc.depletion_pressure is None
-
-
-def test_pressure_components_no_tpot():
-    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
-    # Advance to MEASURED phase: complete warmup chunk
-    for _ in range(10):
-        state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
-    assert state.phase.name == "MEASURED"
-    pc = state.pressure_components(0.2, tpot_s=None)
-    assert not pc.pressure_available
-    assert pc.pressure_missing_reason == "no_tpot"
-    assert pc.depletion_pressure is None
-
-
-def test_pressure_components_no_predictor():
-    state = RequestSLOState(
-        num_warmup_chunks=1, chunk_len_strategy="past-future", min_chunk_tokens=0)
-    # "past-future" strategy never sets predictor.value
-    for _ in range(10):
-        state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
-    assert state.phase.name == "MEASURED"
-    assert state._chunk_len_predictor.value is None
-    pc = state.pressure_components(0.2, tpot_s=0.05)
-    assert not pc.pressure_available
-    assert pc.pressure_missing_reason == "no_predictor"
-    assert pc.depletion_pressure is None
-
-
-def test_pressure_components_available_finite():
-    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
-    for _ in range(10):
-        state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
-    assert state.phase.name == "MEASURED"
-    now = 0.5
-    tpot = 0.04
-    pc = state.pressure_components(now, tpot_s=tpot)
-    assert pc.pressure_available
-    assert pc.pressure_missing_reason is None
-    assert pc.remaining_tokens is not None
-    assert pc.estimated_refill_time_s is not None
-    assert pc.buffer_slack_s is not None
-    assert pc.refill_slack_s is not None
-    assert pc.depletion_pressure is not None
-    # depletion_pressure >= 1 iff refill_slack_s <= 0
-    if pc.refill_slack_s <= 0:
-        assert pc.depletion_pressure >= 1.0
-    else:
-        assert pc.depletion_pressure < 1.0
-
-
-def test_pressure_components_deadline_passed():
-    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
-    for _ in range(10):
-        state.on_token(0.0)
-    # chunk 0 completes very late (now=100.0), consume=1.0 → next deadline ≈ 101.0
-    state.on_chunk_boundary(100.0, word_count=2, consume_duration=1.0)
-    assert state.phase.name == "MEASURED"
-    # Query well after the deadline (now=200.0)
-    pc = state.pressure_components(200.0, tpot_s=0.05)
-    assert pc.pressure_available
-    assert pc.buffer_slack_s is not None and pc.buffer_slack_s <= 0
-    assert pc.depletion_pressure == float("inf")
-
-
-def test_pressure_equals_depletion_pressure():
-    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
-    for _ in range(10):
-        state.on_token(0.0)
-    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
-    now = 0.5
-    tpot = 0.04
-    p = state.pressure(now, tpot)
-    pc = state.pressure_components(now, tpot_s=tpot)
-    assert p == pc.depletion_pressure
-
-
-# ---------------------------------------------------------------------------
-# multi_level_pressure_components() tests (policy="multi_level_pressure")
-# ---------------------------------------------------------------------------
-
-def _measured_state_with_history(now_chunk_finish: float = 0.1):
-    """Build a MEASURED-phase state with predictor populated.
-
-    Mirrors the pattern used by other pressure_components tests: 10
-    tokens accumulated, one warmup chunk closed at now_chunk_finish so
-    chunks_completed becomes 1 and phase advances to MEASURED.
-    """
-    state = RequestSLOState(num_warmup_chunks=1, min_chunk_tokens=0)
-    for _ in range(10):
-        state.on_token(0.0)
-    state.on_chunk_boundary(
-        now_chunk_finish, word_count=2, consume_duration=1.0)
-    assert state.phase.name == "MEASURED"
-    return state
-
-
-def test_mlp_components_prefill():
-    state = RequestSLOState(num_warmup_chunks=2)
-    pc = state.multi_level_pressure_components(1.0, tpot_s=0.05, epoch_s=0.05)
-    assert not pc.pressure_available
-    assert pc.pressure_missing_reason == "prefill"
-    assert pc.serve_pressure is None
-    assert pc.defer_pressure is None
-
-
-def test_mlp_components_warmup():
-    state = RequestSLOState(num_warmup_chunks=2, min_chunk_tokens=0)
-    state.on_token(0.0)
-    assert state.phase.name == "WARMUP"
-    pc = state.multi_level_pressure_components(
-        0.1, tpot_s=0.05, epoch_s=0.05)
-    assert not pc.pressure_available
-    assert pc.pressure_missing_reason == "warmup"
-    assert pc.serve_pressure is None
-    assert pc.defer_pressure is None
-
-
-def test_mlp_components_no_tpot():
-    state = _measured_state_with_history()
-    pc = state.multi_level_pressure_components(
-        0.2, tpot_s=None, epoch_s=None)
-    assert not pc.pressure_available
-    assert pc.pressure_missing_reason == "no_tpot"
-    assert pc.serve_pressure is None
-    assert pc.defer_pressure is None
-
-
-def test_mlp_components_no_epoch_defaults_to_serve():
-    state = _measured_state_with_history()
-    pc = state.multi_level_pressure_components(
-        0.2, tpot_s=0.04, epoch_s=None)
-    assert pc.pressure_available
-    assert pc.serve_pressure is not None
-    # epoch_s=None collapses defer onto serve.
-    assert pc.defer_pressure == pc.serve_pressure
-    assert pc.defer_buffer_slack_s is None
-
-
-def test_mlp_components_deadline_passed():
-    state = _measured_state_with_history(now_chunk_finish=100.0)
-    pc = state.multi_level_pressure_components(
-        200.0, tpot_s=0.05, epoch_s=0.05)
-    assert pc.pressure_available
-    assert pc.buffer_slack_s is not None and pc.buffer_slack_s <= 0
-    # ttd <= 0 → both serve and defer saturate to +inf.
-    assert pc.serve_pressure == float("inf")
-    assert pc.defer_pressure == float("inf")
-
-
-def test_mlp_components_defer_blows_when_epoch_exceeds_slack():
-    state = _measured_state_with_history()
-    # State sets deadline at ~1.1s (now_chunk_finish=0.1 + consume=1.0).
-    # Query at now=1.0 so ttd ≈ 0.1, then pick epoch_s > 0.1 so
-    # defer_buffer goes non-positive while serve stays finite.
-    pc = state.multi_level_pressure_components(
-        1.0, tpot_s=0.04, epoch_s=0.2)
-    assert pc.pressure_available
-    assert pc.buffer_slack_s is not None and pc.buffer_slack_s > 0
-    assert pc.serve_pressure is not None
-    assert pc.serve_pressure != float("inf")
-    # defer_buffer = ttd - epoch_s ≤ 0 → defer saturates to +inf.
-    assert pc.defer_buffer_slack_s is not None
-    assert pc.defer_buffer_slack_s <= 0
-    assert pc.defer_pressure == float("inf")
+def test_predictor_empirical_tail_api():
+    pred = ChunkLengthPredictor(strategy="p90")
+    for v in [10, 20, 30, 40, 50]:
+        pred.update(v)
+    # |{h > 25}| = {30, 40, 50} = 3.
+    assert pred.sample_count_above(25) == 3
+    # P(L > 25 | L > 5) = |{>25}| / |{>5}| = 3 / 5 = 0.6.
+    assert pred.tail_prob(25, 5) == pytest.approx(0.6)
+    # Non-increasing in x.
+    probs = [pred.tail_prob(x, 5) for x in (5, 15, 25, 35, 45, 55)]
+    assert all(b <= a for a, b in zip(probs, probs[1:]))
+    # Conditioning event {L > 95} is empty → denominator 0 → None.
+    assert pred.tail_prob(100, 95) is None

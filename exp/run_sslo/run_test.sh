@@ -5,7 +5,7 @@
 #   run_test.sh <run_kind> <max_num_seqs> <model>
 #
 # Required positional args:
-#   $1  run_kind   (baseline | sslo | sslo_offload | sslo_adaptive | sslo_adaptive_offload | sslo_mlp)
+#   $1  run_kind   (baseline | progress_serve)
 #   $2  max_num_seqs
 #   $3  model
 #
@@ -21,7 +21,6 @@
 #   CHUNK_UNIT=sentence
 #   SECONDS_PER_WORD=0.28
 #   CUDA_VISIBLE_DEVICES=1
-#   SSLO_KV_OFFLOAD_EXTRA='{"cpu_bytes_to_use": 17179869184}'
 #
 # Run inside the sk-sslo container from /workspace/mlsys.
 set -euo pipefail
@@ -61,7 +60,6 @@ fi
 CHUNK_UNIT="${CHUNK_UNIT:-sentence}"
 SECONDS_PER_WORD="${SECONDS_PER_WORD:-0.28}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
-SSLO_KV_OFFLOAD_EXTRA="${SSLO_KV_OFFLOAD_EXTRA:-{\"cpu_bytes_to_use\": 17179869184}}"
 # Consume-time selection. Defaults to fixed seconds-per-word ("read");
 # set CONSUME_MODE=tts plus TTS_PROFILE_PATH + TTS_MODEL to drive
 # chunk_consume_time + conversion_time from a measured TTS profile CSV.
@@ -121,12 +119,8 @@ export HF_HUB_CACHE=/cache/hub
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export CHUNK_UNIT
 export CUDA_VISIBLE_DEVICES
-export SSLO_KV_OFFLOAD_EXTRA
 
 export SSLO_STATS_LOG_PATH="${OUTPUT_DIR}/scheduler_stats.jsonl"
-if [[ "${run_kind}" == *offload* ]]; then
-  export SSLO_OFFLOAD_LOG_PATH="${OUTPUT_DIR}/offload_log.jsonl"
-fi
 
 python3 exp/run_sslo/run_test.py \
   --run-kind "${run_kind}" \

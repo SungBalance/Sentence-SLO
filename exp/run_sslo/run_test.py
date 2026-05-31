@@ -503,17 +503,13 @@ def _format_rate(r: float) -> str:
 
 
 def _policy_label(args: argparse.Namespace) -> str:
-    # run_kind identifies the scheduling mode (baseline / sslo / sslo_adaptive / ...).
+    # run_kind identifies the scheduling mode (baseline / progress_serve).
     return args.run_kind
 
 
 def _make_variant_label(args: argparse.Namespace) -> str:
-    parts = [args.run_kind]
-    if "adaptive" in args.run_kind:
-        parts.append("abatch=on")
-    else:
-        parts.append("abatch=off")
-    return "/".join(parts)
+    # Adaptive batching was removed; ProgressServe runs at a fixed cap.
+    return f"{args.run_kind}/abatch=off"
 
 
 def _gpu_peak_bytes() -> int | None:
@@ -593,7 +589,6 @@ def write_run_meta(
 
 async def run_one(args: argparse.Namespace) -> None:
     from vllm import AsyncLLMEngine, SamplingParams
-    from vllm.config import KVTransferConfig
     from vllm.engine.arg_utils import AsyncEngineArgs
 
     output_dir = Path(args.output_dir)
@@ -602,14 +597,15 @@ async def run_one(args: argparse.Namespace) -> None:
     pool = _build_pool(args)
     print(f"{args.run_kind}: built pool of {len(pool)} prompts (wildchat2048+lmsys2048)")
 
-    # Build sslo_params. Both baseline and sslo modes run through
-    # schedule_sslo() so chunk records / scheduler_stats / tpot EMA are
-    # collected uniformly; method="baseline" skips the SSLO placement
-    # logic so admission is equivalent to vanilla vLLM.
+    # Build sslo_params. Both baseline and progress_serve modes run through
+    # schedule_sslo() so chunk records / scheduler_stats / wall-step EMA are
+    # collected uniformly; method="baseline" skips the SSLO placement logic
+    # so admission is equivalent to vanilla vLLM.
     sslo_params = {
         "chunk_unit": args.chunk_unit,
         "seconds_per_word": args.seconds_per_word,
-        "method": "baseline" if args.run_kind == "baseline" else "sslo",
+        "method": (
+            "baseline" if args.run_kind == "baseline" else "progress_serve"),
     }
     # SSLO
     if args.consume_mode == "tts":
@@ -619,42 +615,6 @@ async def run_one(args: argparse.Namespace) -> None:
         sslo_params["tts_profile_path"] = args.tts_profile_path
         # SSLO
         sslo_params["tts_model"] = args.tts_model
-    if args.run_kind != "baseline":
-        # SSLO_POLICY env selects placement algorithm:
-        #   threshold (default) | pressure | buffer | combined.
-        sslo_params["policy"] = os.environ.get(
-            "SSLO_POLICY", "threshold")
-        if "adaptive" in args.run_kind:
-            sslo_params["adaptive_batching"] = True
-        if "offload" in args.run_kind:
-            sslo_params["offloading"] = True
-        # SSLO: sslo_mlp pins method=sslo with policy=multi_level_pressure
-        # and forces adaptive_batching=True (MLP's critical branch already
-        # shrinks the cap; KV offload connector is wired by needs_kv_offload).
-        if args.run_kind == "sslo_mlp":
-            sslo_params["policy"] = "multi_level_pressure"
-            sslo_params["adaptive_batching"] = (
-                os.environ.get("SSLO_ADAPTIVE_BATCHING", "1") != "0")
-            # SSLO: allow waiting admission under critical mode.
-            if os.environ.get("ALLOW_ADMIT_CRITICAL", "0") == "1":
-                sslo_params["allow_admit_critical"] = True
-
-    # KV transfer config: only enable the CPU-offload connector for the two
-    # offload SSLO modes. Non-offload modes (baseline, sslo, sslo_adaptive)
-    # run with the engine's default — no kv_transfer plumbing — so the
-    # baseline truly is vanilla vLLM and the sslo/sslo_adaptive comparisons
-    # don't carry connector overhead. Extra config overridable via
-    # SSLO_KV_OFFLOAD_EXTRA env (JSON).
-    needs_kv_offload = args.run_kind in ("sslo_offload", "sslo_adaptive_offload")
-    kv_transfer_config = None
-    if needs_kv_offload:
-        kv_transfer_config = KVTransferConfig(
-            kv_connector="SimpleCPUOffloadConnector",
-            kv_role="kv_both",
-            kv_connector_extra_config=json.loads(
-                os.environ.get("SSLO_KV_OFFLOAD_EXTRA", "{}")
-            ),
-        )
 
     engine_kwargs: dict[str, Any] = dict(
         model=args.model,
@@ -671,10 +631,6 @@ async def run_one(args: argparse.Namespace) -> None:
     if args.max_model_len > 0:
         engine_kwargs["max_model_len"] = args.max_model_len
     # else: omit so vLLM picks the model's config max.
-    if kv_transfer_config is not None:
-        engine_kwargs["kv_transfer_config"] = kv_transfer_config
-        engine_kwargs["disable_hybrid_kv_cache_manager"] = False
-        engine_kwargs["enable_prefix_caching"] = True
     if args.enable_thinking:
         engine_kwargs["reasoning_parser"] = "qwen3"
     engine_args = AsyncEngineArgs(**engine_kwargs)

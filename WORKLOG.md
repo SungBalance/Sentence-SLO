@@ -1855,3 +1855,56 @@ DATASET_NAME=combine DATASET_SEED=42 EXCLUDE_CODE=1 \
 - Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.4,
   Figure 7.5, and Figure 7.6 PNG outputs inside `sk-sslo-vllm`, and visually
   inspected the label placement.
+
+## 2026-05-31 (ProgressServe: single posterior tail-risk SSLO policy)
+
+Replaced the multi-policy SSLO scheduler (threshold / pressure /
+multi_level_pressure + adaptive-batching + offload) with a single
+posterior tail-risk policy `progress_serve`; kept `baseline` as the control.
+Modes are now exactly `{baseline, progress_serve}`.
+
+- Added content: `vllm/vllm/sslo/progress_serve.py` — pure-Python ProgressServe
+  primitives (`ProgressView`, `horizon`, `service_share`, `n_run_defer`,
+  `request_risk`, `build_plan`, `schedule_step`); admission via FCFS-prefix
+  `k* = max{k : E_viol(A+(k),B) < 1}`, running selection by marginal benefit
+  `M = R_defer − R_run`. Fixed batch size B = `max_num_seqs`; deferred reqs
+  stay resident.
+- Added content: `ChunkLengthPredictor.tail_prob`/`sample_count_above` (cached
+  sorted snapshot + `bisect_right`) and `RequestSLOState.length_tail_prob`
+  (global-distribution empirical tail → analytic cold-start fallback) in
+  `slo_state.py`; `_apply_sslo_progress_serve` + dispatch in `scheduler.py`;
+  per-step `e_viol`/`k_star` in scheduler stats; new `progress_serve_min_denom`
+  config knob; `vllm/tests/sslo/test_progress_serve.py`.
+- Modified content: stripped the old policies/adaptive/offload/backfill from
+  `scheduler.py` (~1180 lines removed; collapsed `schedule_sslo` to a single
+  FCFS admission); removed pressure methods (`pressure`,
+  `pressure_components`, `multi_level_pressure_components`, `serve_pressure`,
+  `defer_pressure`, `_quantized_pressure`) from `slo_state.py`; rewrote
+  `SsloConfig` (dropped policy/hysteresis/adaptive/mlp knobs, renamed
+  `mlp_kv_blocks_per_new_admit`→`kv_blocks_per_new_admit`); narrowed the
+  harness (`metrics_utils`, `analyze.py`, `run_test.py`/`.sh`, `run_sweep.sh`)
+  to the two modes and removed KV-offload plumbing; rewrote the affected unit
+  tests. Net −2121 lines across the 11 touched files.
+- Debugging/verification: dev/verify agent loop per phase (no Critical/Important
+  findings); `python3 -m compileall` clean; `pytest tests/sslo/` → 91 passed,
+  1 pre-existing failure (`test_tts_consume_path` deadline-recurrence assertion,
+  fails at HEAD, untouched); 1-cell smoke (9B/read/cap128/rate8) in
+  `sk-sslo-vllm` for both modes — no crash, `e_viol`/`k_star`/`kv_blocks_*`
+  recorded, running capped at B=128 with active deferral (pending up to 260),
+  KV never overshoots.
+- Tuning (certain-defer-miss → max benefit): violation analysis on a 9B/read/
+  cap128 baseline-vs-progress_serve comparison showed misses concentrated at
+  the FIRST measured consumable unit (unit_index 1), driven by a starvation
+  pathology — a request with a far deadline has marginal benefit M≈0 (deferred
+  as "not urgent yet"), and once past deadline R_run=R_defer=1 ⇒ M=0 again
+  ("abandoned"), compounding the stall. Fix in `progress_serve.request_risk`:
+  when `R_defer == 1` (deferring is a certain miss) return `M = 1` instead of
+  `R_defer - R_run`, so certain-miss requests win a decode slot. Effect (single
+  run, rates 8/16/24): unit-deadline violations 0.32%/0.22% → **0% at all
+  rates**, mean handling-users +40–61% (315→508 @16, 354→495 @24), stall_p99
+  19.7s→0, lower TTFC — because servicing certain-miss requests drops them out
+  of the E_viol sum, which reopens admission (virtuous cycle). An earlier
+  experiment extending WARMUP through unit 1 only shifted the hotspot to unit 2
+  and was reverted in favor of this rule.
+- Follow-up: `vllm/vllm/sslo/README.md` still documents the old policies and is
+  now stale — needs a ProgressServe rewrite (docs only, non-blocking).
