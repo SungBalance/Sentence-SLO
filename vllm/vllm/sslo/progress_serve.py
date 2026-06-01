@@ -38,6 +38,11 @@ DEFAULT_MIN_DENOM = 4
 # only when MEASURED and holding a finite deadline.
 PHASE_MEASURED = 2
 
+# Operating rule: an expected-violation count below this is "feasible".
+# Shared single source for BOTH admission (schedule_step) and the adaptive
+# batch trigger (pick_adaptive_batch) so the two stay in lock-step.
+E_VIOL_FEASIBLE = 1.0
+
 
 @dataclass
 class ProgressView:
@@ -194,13 +199,13 @@ def schedule_step(
     best = build_plan(views_A, [], b, delta)
     best_k = 0
     # If even admitting nobody is already over budget, defer-only at k=0.
-    if best.e_viol < 1.0:
+    if best.e_viol < E_VIOL_FEASIBLE:
         n = len(waiting_views)
         for k in range(1, n + 1):
             if not kv_feasible(k):
                 break
             plan = build_plan(views_A, waiting_views[:k], b, delta)
-            if plan.e_viol < 1.0:
+            if plan.e_viol < E_VIOL_FEASIBLE:
                 best, best_k = plan, k
             else:
                 break
@@ -210,3 +215,50 @@ def schedule_step(
         k_star=best_k,
         e_viol=best.e_viol,
     )
+
+
+def pick_adaptive_batch(
+    views_A: list[ProgressView],
+    base_b: int,
+    base_delta: float,
+    candidates: list[int],
+    delta_of: Callable[[int], float | None],
+) -> tuple[int, Plan]:
+    """Choose the decode batch size that minimizes E_viol over the in-flight
+    set, shrinking from ``base_b`` only when it is infeasible.
+
+    Rationale: a smaller batch → lower per-iteration latency Δ → larger
+    deadline horizon H_q → lower violation risk for the urgent few (at the
+    cost of deferring more of the slack-rich rest). E_viol(b) is NOT monotone
+    in b (Δ↓ helps, but decode_cap↓ and service-share↓ hurt), so this is a
+    hill-climb: step down through CUDA-graph-captured sizes and stop at the
+    first size where E_viol rises, returning the previous (minimizing) size.
+
+    - Trigger: only searches when E_viol(base_b) >= E_VIOL_FEASIBLE (same
+      threshold admission uses). Otherwise keeps base_b for throughput.
+    - ``candidates``: captured sizes strictly below base_b, DESCENDING.
+    - ``delta_of(b)``: Δ estimate for size b (None ⇒ no sample yet, skip).
+    The search uses the in-flight set only (no new admits); admission is
+    handled afterward by schedule_step at the chosen size.
+    """
+    best_b = base_b
+    best_plan = build_plan(views_A, [], base_b, base_delta)
+    if best_plan.e_viol < E_VIOL_FEASIBLE:
+        return best_b, best_plan  # not under pressure → keep full batch
+    # Forced (PREFILL/WARMUP) requests are always scheduled, so the batch
+    # cannot shrink below their count — otherwise build_plan would schedule
+    # more requests than the cap and the engine's len(running) <= cap assert
+    # would fire.
+    n_forced = sum(1 for v in views_A if not v.is_measurable())
+    prev_e = best_plan.e_viol
+    for b in candidates:
+        if b >= base_b or b < n_forced:
+            continue
+        d = delta_of(b)
+        if d is None or d <= 0:
+            continue
+        plan = build_plan(views_A, [], b, d)
+        if plan.e_viol > prev_e:
+            break  # shrinking made it worse → stop, keep previous size
+        best_b, best_plan, prev_e = b, plan, plan.e_viol
+    return best_b, best_plan

@@ -224,6 +224,14 @@ class Scheduler(SchedulerInterface):
             overshoot_safety_factor=(
                 sslo_cfg.mlp_predictor_overshoot_safety_factor),
         )
+        # SSLO: CUDA-graph-captured decode batch sizes strictly below the cap,
+        # descending — the search space for adaptive batching. Each shrink step
+        # moves to the next captured size so the graph is reused.
+        _cap_sizes = (
+            self.vllm_config.compilation_config.cudagraph_capture_sizes or [])
+        self._sslo_capture_sizes_below_base = tuple(sorted(
+            (s for s in _cap_sizes if s < self.max_num_running_reqs),
+            reverse=True))
         # SSLO: wall-clock-per-step EMA keyed by (batch_size, num_prefills).
         # Used by pressure() so forward projection picks the cell matching
         # the upcoming step's expected composition. Falls back through
@@ -1517,6 +1525,15 @@ class Scheduler(SchedulerInterface):
                 self.kv_cache_manager.block_pool.get_num_free_blocks())
             return free_blocks // kv_per_admit >= k
 
+        # SSLO: adaptive batching — shrink the decode batch when E_viol(B) >= 1
+        # so the urgent few get faster iterations (lower Δ). Search only over
+        # captured sizes that have a wall-EMA sample; keep B otherwise.
+        if self.sslo_config.adaptive_batching:
+            b, _ = ps.pick_adaptive_batch(
+                views_a, b, delta, list(self._sslo_capture_sizes_below_base),
+                self._wall_ema_for_batch)
+            delta = self._wall_ema_for_batch(b) or delta
+
         result = ps.schedule_step(views_a, waiting_views, b, delta, kv_feasible)
         self._sslo_step.e_viol = result.e_viol
         self._sslo_step.k_star = result.k_star
@@ -1948,7 +1965,9 @@ class Scheduler(SchedulerInterface):
                 # (set to 0 by default in critical, or to slack when the
                 # waiting-floor knob is on). Removed the unconditional
                 # `has_critical → break` so the budget alone controls admission.
-                if len(self.running) == self.max_num_running_reqs:
+                # Fence on the step's cap (cur_max_num_requests) so adaptive
+                # batching's shrunk batch actually limits admission.
+                if len(self.running) >= self._sslo_step.cur_max_num_requests:
                     break
                 # SSLO: stop when this step's admission budget is exhausted.
                 if sslo_admit_remaining <= 0:

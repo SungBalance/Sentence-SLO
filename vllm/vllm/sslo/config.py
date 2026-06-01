@@ -70,6 +70,11 @@ class SsloConfig:
     # ProgressServe: min global-history samples above c_q required to trust
     # the empirical tail posterior (else the analytic cold-start fallback).
     progress_serve_min_denom: int = 4
+    # When True, ProgressServe may shrink the decode batch (to a smaller
+    # CUDA-graph-captured size) when E_viol(B) >= 1, trading throughput for a
+    # lower per-iteration latency so the few urgent requests meet their
+    # deadlines. See vllm.sslo.progress_serve.pick_adaptive_batch.
+    adaptive_batching: bool = False
 
     def __post_init__(self) -> None:
         if self.method not in ("baseline", "progress_serve"):

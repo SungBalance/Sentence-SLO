@@ -10,6 +10,8 @@ MODES_DEFAULT = (
     "baseline",
     # SSLO
     "progress_serve",
+    # SSLO
+    "progress_serve_adaptive",
 )
 
 

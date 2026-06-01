@@ -607,6 +607,12 @@ async def run_one(args: argparse.Namespace) -> None:
         "method": (
             "baseline" if args.run_kind == "baseline" else "progress_serve"),
     }
+    # SSLO: adaptive batching on for the dedicated mode, or via env toggle on
+    # the plain progress_serve mode. Never for baseline.
+    if args.run_kind != "baseline":
+        sslo_params["adaptive_batching"] = (
+            args.run_kind == "progress_serve_adaptive"
+            or os.environ.get("SSLO_ADAPTIVE_BATCHING", "0") != "0")
     # SSLO
     if args.consume_mode == "tts":
         # SSLO

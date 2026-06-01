@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from vllm.sslo.progress_serve import (
+    E_VIOL_FEASIBLE,
     ProgressView,
     build_plan,
     horizon,
     n_run_defer,
+    pick_adaptive_batch,
     request_risk,
     schedule_step,
     service_share,
@@ -199,3 +201,58 @@ def test_schedule_step_defer_only_when_infeasible_at_zero():
     assert res.e_viol >= 1.0
     assert len(res.scheduled_A) == 1
     assert len(res.deferred_A) == 2
+
+
+# ---- pick_adaptive_batch -----------------------------------------------
+
+def _expected_pick(views, base_b, base_delta, candidates, delta_of):
+    """Independent re-derivation of the search for oracle comparison."""
+    base_e = build_plan(views, [], base_b, base_delta).e_viol
+    if base_e < E_VIOL_FEASIBLE:
+        return base_b
+    best_b, prev = base_b, base_e
+    for b in candidates:
+        if b >= base_b:
+            continue
+        d = delta_of(b)
+        if d is None or d <= 0:
+            continue
+        e = build_plan(views, [], b, d).e_viol
+        if e > prev:
+            break
+        best_b, prev = b, e
+    return best_b
+
+
+def test_pick_adaptive_batch_no_trigger_keeps_base():
+    # Low risk → E_viol(base) < 1 → no search, keep base regardless of cands.
+    views = [_measurable(f"v{i}", 0, 100.0, lambda x: 0.0) for i in range(3)]
+    b, plan = pick_adaptive_batch(
+        views, 128, 0.1, [96, 64, 32], delta_of=lambda b: 0.05)
+    assert b == 128
+    assert plan.e_viol < E_VIOL_FEASIBLE
+
+
+def test_pick_adaptive_batch_stops_at_first_increase():
+    # Slow base (large Δ) → H small → high risk → trigger. Shrinking lowers Δ
+    # (more iters before deadline) until b=16's Δ bump raises E_viol again.
+    tail = lambda x: max(0.0, 1.0 - x / 40.0)
+    views = [_measurable(f"v{i}", 0, 4.0, tail) for i in range(3)]
+    deltas = {128: 2.0, 96: 1.5, 64: 1.0, 32: 0.5, 16: 3.0}
+    cands = [96, 64, 32, 16]
+    delta_of = lambda b: deltas.get(b)
+    exp = _expected_pick(views, 128, deltas[128], cands, delta_of)
+    got, _ = pick_adaptive_batch(views, 128, deltas[128], cands, delta_of)
+    assert got == exp
+    assert got == 32  # hand-checked: 16's Δ bump stops the descent
+
+
+def test_pick_adaptive_batch_skips_missing_ema():
+    tail = lambda x: max(0.0, 1.0 - x / 40.0)
+    views = [_measurable(f"v{i}", 0, 4.0, tail) for i in range(3)]
+    deltas = {128: 2.0, 96: 1.5, 64: None, 32: 0.5, 16: 3.0}
+    cands = [96, 64, 32, 16]
+    delta_of = lambda b: deltas.get(b)
+    got, _ = pick_adaptive_batch(views, 128, deltas[128], cands, delta_of)
+    # 64 (no EMA) is skipped; descent still reaches 32 and stops at 16.
+    assert got == 32

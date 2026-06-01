@@ -5,7 +5,7 @@
 #   run_test.sh <run_kind> <max_num_seqs> <model>
 #
 # Required positional args:
-#   $1  run_kind   (baseline | progress_serve)
+#   $1  run_kind   (baseline | progress_serve | progress_serve_adaptive)
 #   $2  max_num_seqs
 #   $3  model
 #

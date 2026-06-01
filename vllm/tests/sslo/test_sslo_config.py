@@ -19,7 +19,6 @@ def test_defaults():
     assert cfg.progress_serve_min_denom == 4
     # Removed policy knobs must be gone.
     assert not hasattr(cfg, "policy")
-    assert not hasattr(cfg, "adaptive_batching")
     assert not hasattr(cfg, "critical_threshold")
     assert not hasattr(cfg, "pending_in_threshold")
     assert not hasattr(cfg, "mlp_defer_constraint")
@@ -38,7 +37,7 @@ def test_method_validation_rejects_old_modes():
 
 
 def test_removed_knobs_rejected_as_kwargs():
-    for bad in ("policy", "adaptive_batching", "critical_threshold",
+    for bad in ("policy", "critical_threshold",
                 "pending_in_threshold", "mlp_defer_constraint",
                 "mlp_kv_blocks_per_new_admit"):
         with pytest.raises(TypeError):
@@ -114,3 +113,9 @@ def test_from_config_wires_global_predictor_for_tail():
     # cold-start fallback when c_q exceeds all samples (denom 0).
     state.current_chunk_generated_len = 100
     assert state.length_tail_prob(120) == 1.0  # < c_q + cold_start_max
+
+
+def test_adaptive_batching_default_and_settable():
+    assert SsloConfig().adaptive_batching is False
+    assert SsloConfig(method="progress_serve",
+                      adaptive_batching=True).adaptive_batching is True
