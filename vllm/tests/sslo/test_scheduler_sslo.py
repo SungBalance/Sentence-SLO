@@ -115,6 +115,9 @@ def make_scheduler(
     scheduler._sslo_step_wall_ema = {max_num_running_reqs: {0: 1.0}}
     scheduler._sslo_prev_step_num_prefills = 0
     scheduler._sslo_prev_step_batch = None
+    # SSLO: capture-time decode-latency profile (empty unless a test loads it).
+    scheduler._sslo_decode_profile = {}
+    scheduler._sslo_decode_profile_keys = []
     scheduler._sslo_prev_step_decoding_only = False
     scheduler._sslo_prev_step_start_ts = None
     scheduler._sslo_step = SsloStepState(
@@ -238,6 +241,43 @@ def test_progress_serve_partitions_running_and_pending():
     assert scheduler._sslo_step.has_critical is False
     placed = request_ids(scheduler.running) + request_ids(scheduler.sslo_pending)
     assert sorted(placed) == ["r0", "r1", "r2"]
+
+
+# ---------------------------------------------------------------------------
+# Hybrid Δ(b) for adaptive batching
+# ---------------------------------------------------------------------------
+
+def test_hybrid_delta_rescales_profile_by_live_ema():
+    sched = make_scheduler(max_num_running_reqs=128)
+    # Profile shape: forward latency grows sublinearly with batch.
+    sched.set_cudagraph_decode_profile({64: 40.0, 128: 60.0})
+    # Live scheduler-step wall-EMA at the currently-running batch (128).
+    sched._sslo_step_wall_ema = {128: {0: 90.0}}
+    sched._sslo_prev_step_batch = 128
+    # scale = wall_ema(128)/profile(128) = 90/60 = 1.5
+    # Δ(64) = profile(64) * 1.5 = 60.0 ; Δ(128) = 90.0 (== live)
+    assert sched._sslo_hybrid_delta(64) == pytest.approx(60.0)
+    assert sched._sslo_hybrid_delta(128) == pytest.approx(90.0)
+
+
+def test_hybrid_delta_falls_back_to_wall_ema_without_profile():
+    sched = make_scheduler(max_num_running_reqs=128)
+    sched._sslo_step_wall_ema = {128: {0: 90.0}}
+    sched._sslo_prev_step_batch = 128
+    # No profile loaded → exact wall-EMA for known batch, None otherwise.
+    assert sched._sslo_hybrid_delta(128) == pytest.approx(90.0)
+    assert sched._sslo_hybrid_delta(64) is None
+
+
+def test_hybrid_delta_nearest_size_and_uncalibrated():
+    sched = make_scheduler(max_num_running_reqs=128)
+    sched.set_cudagraph_decode_profile({64: 40.0, 128: 60.0})
+    # No live EMA anchor → return raw profile shape (uncalibrated).
+    sched._sslo_step_wall_ema = {}
+    sched._sslo_prev_step_batch = None
+    assert sched._sslo_hybrid_delta(64) == pytest.approx(40.0)
+    # Non-captured size 96 → nearest captured (64 and 128 equidistant → min=64).
+    assert sched._sslo_hybrid_delta(96) == pytest.approx(40.0)
 
 
 # ---------------------------------------------------------------------------

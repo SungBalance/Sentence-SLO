@@ -232,6 +232,13 @@ class Scheduler(SchedulerInterface):
         self._sslo_capture_sizes_below_base = tuple(sorted(
             (s for s in _cap_sizes if s < self.max_num_running_reqs),
             reverse=True))
+        # SSLO: per-decode-batch-size forward latency (ms) measured at capture
+        # (set post-construction by EngineCore). Gives Δ(b) for batch sizes the
+        # scheduler isn't currently running, so adaptive batching doesn't lock
+        # into a small batch on stale wall-EMA. Sorted-keys cache for nearest
+        # lookup. Empty ⇒ _sslo_hybrid_delta falls back to wall-EMA.
+        self._sslo_decode_profile: dict[int, float] = {}
+        self._sslo_decode_profile_keys: list[int] = []
         # SSLO: wall-clock-per-step EMA keyed by (batch_size, num_prefills).
         # Used by pressure() so forward projection picks the cell matching
         # the upcoming step's expected composition. Falls back through
@@ -1108,6 +1115,53 @@ class Scheduler(SchedulerInterface):
         return None
 
     # SSLO
+    def set_cudagraph_decode_profile(self, profile: dict[int, float]) -> None:
+        """Install the capture-time per-batch-size forward-latency profile
+        (ms). Called once by EngineCore after the worker reports it."""
+        self._sslo_decode_profile = {int(k): float(v)
+                                     for k, v in profile.items() if v > 0}
+        self._sslo_decode_profile_keys = sorted(self._sslo_decode_profile)
+        logger.info("SSLO: loaded CUDA-graph decode latency profile (%d sizes)",
+                    len(self._sslo_decode_profile))
+
+    # SSLO
+    def _sslo_profile_at(self, b: int) -> float | None:
+        """profile(b), using the nearest captured size when b isn't an exact
+        captured batch size."""
+        keys = self._sslo_decode_profile_keys
+        if not keys:
+            return None
+        if b in self._sslo_decode_profile:
+            return self._sslo_decode_profile[b]
+        nearest = min(keys, key=lambda k: abs(k - b))
+        return self._sslo_decode_profile[nearest]
+
+    # SSLO
+    def _sslo_hybrid_delta(self, b: int) -> float | None:
+        """Δ(b) for adaptive batching: capture-time profile SHAPE rescaled to
+        the live scheduler-step wall-clock.
+
+        profile(b) is worker forward-only latency; the scheduler's Δ is the
+        end-to-end step time. We rescale the profile by the live wall-EMA of
+        the batch currently running (b_now) so units match and per-batch shape
+        comes from the always-available profile (no stale-EMA lock-in):
+
+            Δ(b) = profile(b) * (wall_ema(b_now) / profile(b_now))
+
+        Falls back to the plain wall-EMA when no profile is loaded or the
+        calibration anchor is missing.
+        """
+        pb = self._sslo_profile_at(b)
+        if pb is None:
+            return self._wall_ema_for_batch(b)
+        b_now = self._sslo_prev_step_batch
+        live = self._wall_ema_for_batch(b_now) if b_now else None
+        pnow = self._sslo_profile_at(b_now) if b_now else None
+        if live is not None and pnow:
+            return pb * (live / pnow)
+        return pb  # uncalibrated profile shape still beats a stale wall-EMA
+
+    # SSLO
     def _wall_ema_for_batch(self, n: int) -> float | None:
         """Wall-step EMA for batch size n (any prefill composition).
 
@@ -1526,13 +1580,15 @@ class Scheduler(SchedulerInterface):
             return free_blocks // kv_per_admit >= k
 
         # SSLO: adaptive batching — shrink the decode batch when E_viol(B) >= 1
-        # so the urgent few get faster iterations (lower Δ). Search only over
-        # captured sizes that have a wall-EMA sample; keep B otherwise.
+        # so the urgent few get faster iterations (lower Δ). Δ(b) comes from the
+        # hybrid (capture-profile shape × live wall-EMA scale) estimator so the
+        # search sees every batch size, not just the one currently running
+        # (avoids stale-EMA lock-in).
         if self.sslo_config.adaptive_batching:
             b, _ = ps.pick_adaptive_batch(
                 views_a, b, delta, list(self._sslo_capture_sizes_below_base),
-                self._wall_ema_for_batch)
-            delta = self._wall_ema_for_batch(b) or delta
+                self._sslo_hybrid_delta)
+            delta = self._sslo_hybrid_delta(b) or delta
 
         result = ps.schedule_step(views_a, waiting_views, b, delta, kv_feasible)
         self._sslo_step.e_viol = result.e_viol
