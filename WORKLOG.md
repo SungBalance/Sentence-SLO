@@ -1908,3 +1908,35 @@ Modes are now exactly `{baseline, progress_serve}`.
   and was reverted in favor of this rule.
 - Follow-up: `vllm/vllm/sslo/README.md` still documents the old policies and is
   now stale — needs a ProgressServe rewrite (docs only, non-blocking).
+
+## 2026-06-01 (adaptive batching + hybrid Δ(b))
+
+- Added content (commit 0224bad): `adaptive_batching` for ProgressServe —
+  when E_viol(B) >= 1, shrink the decode batch to a smaller CUDA-graph
+  captured size to lower per-iteration latency. `progress_serve.pick_adaptive_batch`
+  (hill-climb over captured sizes < B, floored at forced-request count),
+  shared `E_VIOL_FEASIBLE=1.0`, `progress_serve_adaptive` run_kind. A 3-way
+  sweep (baseline / progress_serve / progress_serve_adaptive, rates 8–80,
+  2 models × cap{128,256} × 3 consume) showed adaptive helps 9B (HU +10–70%)
+  and 35B/cap256 (KV-bound; baseline ~1% violation → ~0.2%), but HURT
+  KV-slack cells (9B/cap128, 35B/cap128 high rate) by locking into a small
+  batch.
+- Debugging: traced the lock-in. Objective E_viol = ΣR_run + ΣR_defer is
+  correct (recomputing with measured Δ gives E_viol(128)=194 < E_viol(64)=216),
+  but `_wall_ema_for_batch(n)` only has Δ for batch sizes actually run; once
+  shrunk, the large-batch EMA goes stale → picker never relearns the large
+  batch is better → self-fulfilling lock-in (throughput crash → backlog → more
+  shrink).
+- Added content (commit e27a00c): hybrid Δ(b). Profile per-batch forward
+  latency once at CUDA-graph capture (gpu_model_runner → CompilationTimes →
+  gpu_worker RPC → engine/core → scheduler.set_cudagraph_decode_profile), then
+  `_sslo_hybrid_delta(b) = profile(b) * (wall_ema(b_now)/profile(b_now))` —
+  profile supplies shape for every batch (no stale gap), live wall-EMA supplies
+  scheduler-unit scale. Falls back to wall-EMA when no profile.
+- Verification: pytest tests/sslo 99 passed (1 pre-existing tts failure).
+  Worst-case smokes — lock-in gone (batch 40/64 → ~120 near cap), recovered
+  metrics: 9B/cap128/r8 viol 0.11%→0, ttfc99 118s→2.5s, dec 2203→3102 tok/s;
+  35B/cap128/r80 viol 0.22%→0.075%, dec 1418→1769 tok/s.
+- Follow-up: 35B-style throughput-bound cells still lose a little from the
+  one-step (128→120) shrink vs plain progress_serve; a throughput-floor guard
+  that blocks shrinking there is a separate, unimplemented refinement.
