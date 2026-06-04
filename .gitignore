@@ -59,6 +59,9 @@ exp/sslo_test/output_smoke/
 exp/run_sslo/output*/
 exp/run_sslo/filter_prompt/output/
 
+# chunk_length_study outputs (regenerated pools / runs / stats)
+exp/chunk_length_study/output/
+
 # Paper figure artifacts (regenerated; only scripts/ is kept under version control)
 exp/plots/figures/data/
 exp/plots/figures/processed/
