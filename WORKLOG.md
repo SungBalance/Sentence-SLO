@@ -1940,3 +1940,27 @@ Modes are now exactly `{baseline, progress_serve}`.
 - Follow-up: 35B-style throughput-bound cells still lose a little from the
   one-step (128→120) shrink vs plain progress_serve; a throughput-floor guard
   that blocks shrinking there is a separate, unimplemented refinement.
+
+## 2026-06-05 (chunk_length_study: chunk vs request length variability)
+
+- Added content (commit 504982a): new standalone experiment
+  `exp/chunk_length_study/` testing whether per-chunk length is less variable
+  than per-request output length, by task (code/dialogue) and language, on
+  baseline 9B. build_category_pools.py (wildchat + lmsys-when-authed →
+  per-(lang,task) 512-prompt caches via _is_code_request + langdetect),
+  run_baseline_tracking.sh (per-category baseline run feeding caches via
+  DATASET_CACHE_DIR), analyze_chunk_length.py (CV / p99-p50 / IQR-median +
+  prompt-length correlation + plots). Reuses lm_datasets / dataset_cache /
+  jsonl_utils / metrics_utils; no existing script modified.
+- Debugging/verification: lmsys is HF-gated (no token in container) → builder
+  falls back to wildchat-only (still multilingual+code). _is_code_request is
+  English-centric so non-English code pools are ~empty → viable categories =
+  en-code, en/zh-cn/ru-dialogue. run_test.sh doesn't forward
+  --warmup/measurement-target and its defaults (1024) hang on small pools, so
+  the runner calls run_test.py directly with pool-sized targets. Verified
+  end-to-end: 4 categories, 18.5k–21k chunks each, analyzer + 3 plots produced.
+- Finding: by robust IQR/median, chunk length is far more stable than request
+  output (en-dialogue 0.35 vs 1.36; all dialogue chunk≈0.35–0.38 vs
+  request 0.86–1.36); CV agrees (chunk 0.29–0.52 vs request 0.40–0.74). Prompt
+  length barely predicts output length (Pearson ≤0.30, ~0 for non-English).
+  Nuance: chunk p99/p50 tail ratio can exceed request's (en-code 2.35 vs 1.13).
