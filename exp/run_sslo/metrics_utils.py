@@ -8,12 +8,10 @@ from typing import Any
 
 MODES_DEFAULT = (
     "baseline",
-    "sslo",
-    "sslo_offload",
-    "sslo_adaptive",
-    "sslo_adaptive_offload",
     # SSLO
-    "sslo_mlp",
+    "progress_serve",
+    # SSLO
+    "progress_serve_adaptive",
 )
 
 

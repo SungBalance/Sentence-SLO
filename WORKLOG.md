@@ -1,5 +1,59 @@
 # Work Log
 
+## 2026-06-11 (chunk_length_study: oracle vs online posterior)
+
+- Added content: `exp/chunk_length_study/replay_posterior.{py,sh}` — GPU-free
+  offline replay of each category's `chunks.jsonl` in chunk-completion-time
+  order, feeding the engine's own `ChunkLengthPredictor` (loaded straight from
+  `vllm/vllm/sslo/slo_state.py`) with the exact `length_tail_prob` gating
+  (warmup 128 / min_denom 4 / cold-start 2048). Reconstructs the continuously
+  updated online posterior ProgressServe sees; compares it against an oracle
+  (full-run empirical distribution) per category.
+- Added content: progress-fraction sharpening axis f∈{0,25,50,75%} — at each f
+  predict remaining length L−⌊f·L⌋ (conditional median), online vs oracle.
+  Outputs `output/stats/oracle_vs_posterior.{json,csv}` (long: category×progress)
+  + plots `posterior_{convergence,sharpening,calibration}.png`.
+- Finding: after the 128-sample warmup gate, online posterior error ≈ oracle to
+  the decimal at every progress level (e.g. en-code c0 4.39/4.39, c75 2.31/2.30);
+  remaining-length MAE falls with progress (~4.4→2.3 tokens at 75%) as the
+  conditional tail tightens. Online-estimation cost is essentially just the
+  warmup gate; cold-eval fraction 0.7–0.9% on these single-rate runs. Tail
+  calibration ECE: late 0.00–0.01, early ≤1024 ~0.10 (cold-start plateau).
+  Nuance: en-dialogue online > oracle at c25 (+0.32) but < oracle at c75 (−0.30)
+  — windowed history tracks the recent tail better deep in the conditioning.
+- Verification: container `py_compile` + `bash -n`; replay ran clean on all 4
+  categories (18.5k–21.4k chunks); plots inspected.
+
+## 2026-06-11 (chunk_length_study: unit distribution + request divergence)
+
+- Added content: `exp/chunk_length_study/analyze_unit_distribution.{py,sh}` —
+  per-category GLOBAL consumable-unit (chunk `num_token`) length distribution
+  (percentiles + hist), and per-request two-sample KS divergence from that
+  global pool over the integer length support. Single KS ranking across
+  categories → top-5 most-divergent requests with characteristics. Drops
+  requests with < MIN_CHUNKS=8 units. Outputs
+  `output/stats/{unit_distribution.json, unit_distribution_global.csv,
+  top_divergent_requests.csv}` + plots `unit_distribution_global.png`,
+  `top_divergent_requests.png`.
+- Added content: `--max-chunk-len` (default 100) excludes runaway un-segmented
+  chunks (no sentence boundary hit; real sentence chunks end by p99.9 ≈ 55–82,
+  >100 is ≤0.08% per category) and reports the dropped count; 0 disables.
+- Finding: global chunk-length distributions are near-identical across
+  categories (median 20–21, p99 43–47), with a hard ~14–16-token floor (min
+  sentence size) and a right skew; en-code has a sharp ~17–18-token peak
+  (code-line structure). With outliers excluded all four collapse to CV ≈
+  0.29–0.31 (ru's raw CV 0.52 was driven entirely by one max=1410-token chunk
+  = an un-segmented wall of text; 15/1/1/0 chunks dropped >100). Top-5 divergent
+  requests (KS 0.54–0.62) split into two failure modes vs the global posterior:
+  (a) uniformly short, low-variance streams — zh req442 (119 chunks, median 17,
+  CV ×0.31, a lat/long coordinate list); (b) uniformly long streams — en req510
+  / ru req505 / en req371 (median 29–30 vs global 20, +9–10 shift). These are
+  the requests a global posterior systematically mis-centres → evidence for
+  where per-request adaptation (vs pure global) would help.
+- Verification: container `py_compile` + `bash -n`; ran clean on all 4
+  categories; fixed a hist-binning artifact (bin within 99.5-pctile window so
+  ru's 1410-token outlier doesn't flatten every bin); plots inspected.
+
 ## 2026-05-28 (plots/figures updates)
 
 - Modified content: Regenerated Figure 6.7g as a request-rate grouped plot under the `<0.5%` unit-miss budget, keeping Baseline/Ours color grouping and annotating the selected batch size for each request rate.
@@ -1855,3 +1909,112 @@ DATASET_NAME=combine DATASET_SEED=42 EXCLUDE_CODE=1 \
 - Debugging/verification: Ran targeted `py_compile`, regenerated Figure 7.4,
   Figure 7.5, and Figure 7.6 PNG outputs inside `sk-sslo-vllm`, and visually
   inspected the label placement.
+
+## 2026-05-31 (ProgressServe: single posterior tail-risk SSLO policy)
+
+Replaced the multi-policy SSLO scheduler (threshold / pressure /
+multi_level_pressure + adaptive-batching + offload) with a single
+posterior tail-risk policy `progress_serve`; kept `baseline` as the control.
+Modes are now exactly `{baseline, progress_serve}`.
+
+- Added content: `vllm/vllm/sslo/progress_serve.py` — pure-Python ProgressServe
+  primitives (`ProgressView`, `horizon`, `service_share`, `n_run_defer`,
+  `request_risk`, `build_plan`, `schedule_step`); admission via FCFS-prefix
+  `k* = max{k : E_viol(A+(k),B) < 1}`, running selection by marginal benefit
+  `M = R_defer − R_run`. Fixed batch size B = `max_num_seqs`; deferred reqs
+  stay resident.
+- Added content: `ChunkLengthPredictor.tail_prob`/`sample_count_above` (cached
+  sorted snapshot + `bisect_right`) and `RequestSLOState.length_tail_prob`
+  (global-distribution empirical tail → analytic cold-start fallback) in
+  `slo_state.py`; `_apply_sslo_progress_serve` + dispatch in `scheduler.py`;
+  per-step `e_viol`/`k_star` in scheduler stats; new `progress_serve_min_denom`
+  config knob; `vllm/tests/sslo/test_progress_serve.py`.
+- Modified content: stripped the old policies/adaptive/offload/backfill from
+  `scheduler.py` (~1180 lines removed; collapsed `schedule_sslo` to a single
+  FCFS admission); removed pressure methods (`pressure`,
+  `pressure_components`, `multi_level_pressure_components`, `serve_pressure`,
+  `defer_pressure`, `_quantized_pressure`) from `slo_state.py`; rewrote
+  `SsloConfig` (dropped policy/hysteresis/adaptive/mlp knobs, renamed
+  `mlp_kv_blocks_per_new_admit`→`kv_blocks_per_new_admit`); narrowed the
+  harness (`metrics_utils`, `analyze.py`, `run_test.py`/`.sh`, `run_sweep.sh`)
+  to the two modes and removed KV-offload plumbing; rewrote the affected unit
+  tests. Net −2121 lines across the 11 touched files.
+- Debugging/verification: dev/verify agent loop per phase (no Critical/Important
+  findings); `python3 -m compileall` clean; `pytest tests/sslo/` → 91 passed,
+  1 pre-existing failure (`test_tts_consume_path` deadline-recurrence assertion,
+  fails at HEAD, untouched); 1-cell smoke (9B/read/cap128/rate8) in
+  `sk-sslo-vllm` for both modes — no crash, `e_viol`/`k_star`/`kv_blocks_*`
+  recorded, running capped at B=128 with active deferral (pending up to 260),
+  KV never overshoots.
+- Tuning (certain-defer-miss → max benefit): violation analysis on a 9B/read/
+  cap128 baseline-vs-progress_serve comparison showed misses concentrated at
+  the FIRST measured consumable unit (unit_index 1), driven by a starvation
+  pathology — a request with a far deadline has marginal benefit M≈0 (deferred
+  as "not urgent yet"), and once past deadline R_run=R_defer=1 ⇒ M=0 again
+  ("abandoned"), compounding the stall. Fix in `progress_serve.request_risk`:
+  when `R_defer == 1` (deferring is a certain miss) return `M = 1` instead of
+  `R_defer - R_run`, so certain-miss requests win a decode slot. Effect (single
+  run, rates 8/16/24): unit-deadline violations 0.32%/0.22% → **0% at all
+  rates**, mean handling-users +40–61% (315→508 @16, 354→495 @24), stall_p99
+  19.7s→0, lower TTFC — because servicing certain-miss requests drops them out
+  of the E_viol sum, which reopens admission (virtuous cycle). An earlier
+  experiment extending WARMUP through unit 1 only shifted the hotspot to unit 2
+  and was reverted in favor of this rule.
+- Follow-up: `vllm/vllm/sslo/README.md` still documents the old policies and is
+  now stale — needs a ProgressServe rewrite (docs only, non-blocking).
+
+## 2026-06-01 (adaptive batching + hybrid Δ(b))
+
+- Added content (commit 0224bad): `adaptive_batching` for ProgressServe —
+  when E_viol(B) >= 1, shrink the decode batch to a smaller CUDA-graph
+  captured size to lower per-iteration latency. `progress_serve.pick_adaptive_batch`
+  (hill-climb over captured sizes < B, floored at forced-request count),
+  shared `E_VIOL_FEASIBLE=1.0`, `progress_serve_adaptive` run_kind. A 3-way
+  sweep (baseline / progress_serve / progress_serve_adaptive, rates 8–80,
+  2 models × cap{128,256} × 3 consume) showed adaptive helps 9B (HU +10–70%)
+  and 35B/cap256 (KV-bound; baseline ~1% violation → ~0.2%), but HURT
+  KV-slack cells (9B/cap128, 35B/cap128 high rate) by locking into a small
+  batch.
+- Debugging: traced the lock-in. Objective E_viol = ΣR_run + ΣR_defer is
+  correct (recomputing with measured Δ gives E_viol(128)=194 < E_viol(64)=216),
+  but `_wall_ema_for_batch(n)` only has Δ for batch sizes actually run; once
+  shrunk, the large-batch EMA goes stale → picker never relearns the large
+  batch is better → self-fulfilling lock-in (throughput crash → backlog → more
+  shrink).
+- Added content (commit e27a00c): hybrid Δ(b). Profile per-batch forward
+  latency once at CUDA-graph capture (gpu_model_runner → CompilationTimes →
+  gpu_worker RPC → engine/core → scheduler.set_cudagraph_decode_profile), then
+  `_sslo_hybrid_delta(b) = profile(b) * (wall_ema(b_now)/profile(b_now))` —
+  profile supplies shape for every batch (no stale gap), live wall-EMA supplies
+  scheduler-unit scale. Falls back to wall-EMA when no profile.
+- Verification: pytest tests/sslo 99 passed (1 pre-existing tts failure).
+  Worst-case smokes — lock-in gone (batch 40/64 → ~120 near cap), recovered
+  metrics: 9B/cap128/r8 viol 0.11%→0, ttfc99 118s→2.5s, dec 2203→3102 tok/s;
+  35B/cap128/r80 viol 0.22%→0.075%, dec 1418→1769 tok/s.
+- Follow-up: 35B-style throughput-bound cells still lose a little from the
+  one-step (128→120) shrink vs plain progress_serve; a throughput-floor guard
+  that blocks shrinking there is a separate, unimplemented refinement.
+
+## 2026-06-05 (chunk_length_study: chunk vs request length variability)
+
+- Added content (commit 504982a): new standalone experiment
+  `exp/chunk_length_study/` testing whether per-chunk length is less variable
+  than per-request output length, by task (code/dialogue) and language, on
+  baseline 9B. build_category_pools.py (wildchat + lmsys-when-authed →
+  per-(lang,task) 512-prompt caches via _is_code_request + langdetect),
+  run_baseline_tracking.sh (per-category baseline run feeding caches via
+  DATASET_CACHE_DIR), analyze_chunk_length.py (CV / p99-p50 / IQR-median +
+  prompt-length correlation + plots). Reuses lm_datasets / dataset_cache /
+  jsonl_utils / metrics_utils; no existing script modified.
+- Debugging/verification: lmsys is HF-gated (no token in container) → builder
+  falls back to wildchat-only (still multilingual+code). _is_code_request is
+  English-centric so non-English code pools are ~empty → viable categories =
+  en-code, en/zh-cn/ru-dialogue. run_test.sh doesn't forward
+  --warmup/measurement-target and its defaults (1024) hang on small pools, so
+  the runner calls run_test.py directly with pool-sized targets. Verified
+  end-to-end: 4 categories, 18.5k–21k chunks each, analyzer + 3 plots produced.
+- Finding: by robust IQR/median, chunk length is far more stable than request
+  output (en-dialogue 0.35 vs 1.36; all dialogue chunk≈0.35–0.38 vs
+  request 0.86–1.36); CV agrees (chunk 0.29–0.52 vs request 0.40–0.74). Prompt
+  length barely predicts output length (Pearson ≤0.30, ~0 for non-English).
+  Nuance: chunk p99/p50 tail ratio can exceed request's (en-code 2.35 vs 1.13).

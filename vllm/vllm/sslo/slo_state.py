@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import csv
-import math
 import os
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import InitVar, asdict, dataclass, field
@@ -148,6 +147,12 @@ class ChunkLengthPredictor:
         # SSLO: strategy-agnostic sample counter (deque length is wrong
         # for ema strategy where _history isn't used).
         self._sample_count: int = 0
+        # SSLO: cached sorted snapshot of _history for O(log n) empirical
+        # tail queries (tail_prob / sample_count_above). Rebuilt only when
+        # _sample_count changes (i.e. on a new completed-chunk sample), so
+        # repeated queries within one scheduler step are cheap.
+        self._sorted_cache: list[int] | None = None
+        self._sorted_cache_count: int = -1
         if strategy == "ema":
             self.update = self.update_ema
         elif strategy in ("p90", "p99"):
@@ -195,6 +200,37 @@ class ChunkLengthPredictor:
         self.value_mid = None
         self.value_high = None
         self._sample_count = 0
+        self._sorted_cache = None
+        self._sorted_cache_count = -1
+
+    def _sorted_history(self) -> list[int]:
+        """Sorted snapshot of _history, cached until the next sample.
+
+        ProgressServe queries the empirical tail repeatedly within one
+        scheduler step; sorting once per new sample keeps that O(log n)."""
+        if (self._sorted_cache is None
+                or self._sorted_cache_count != self._sample_count):
+            self._sorted_cache = sorted(self._history)
+            self._sorted_cache_count = self._sample_count
+        return self._sorted_cache
+
+    def sample_count_above(self, c_q: int) -> int:
+        """|{h in history : h > c_q}|."""
+        s = self._sorted_history()
+        return len(s) - bisect_right(s, c_q)
+
+    def tail_prob(self, x: int, c_q: int) -> float | None:
+        """Empirical P(L > x | L > c_q) from history.
+
+        Returns None when the conditioning event {L > c_q} has no observed
+        mass (c_q exceeds every sample), so the caller can fall back."""
+        s = self._sorted_history()
+        n = len(s)
+        denom = n - bisect_right(s, c_q)
+        if denom <= 0:
+            return None
+        num = n - bisect_right(s, x)
+        return num / denom
 
 
 class ChunkConsumeEstimator:
@@ -548,20 +584,6 @@ class SsloRequestStats:
     terminal_outcome: str = "in_progress"
 
 
-def _quantized_pressure(remaining: float, time_budget: float,
-                        tpot_s: float) -> float:
-    """remaining tokens / floor(time_budget / tpot_s).
-    Returns +inf when fewer than one iteration fits.
-
-    Adds a tiny epsilon (1e-9) before floor to suppress floating-point
-    pathology — e.g., ``1.0 - 0.3 == 0.6999999999999999`` would otherwise
-    floor 0.6999.../0.1 to 6 instead of 7."""
-    iters = math.floor(time_budget / tpot_s + 1e-9)
-    if iters <= 0:
-        return float("inf")
-    return remaining / iters
-
-
 @dataclass
 class RequestSLOState:
     # Lifecycle.
@@ -607,6 +629,9 @@ class RequestSLOState:
     # SSLO: cold-start (global predictor < threshold) fallback knobs.
     global_warmup_predictor_samples: int = 128
     cold_start_max_remaining_tokens: int = 2048
+    # SSLO: ProgressServe — min global-history samples above c_q required to
+    # trust the empirical tail posterior (else analytic cold-start fallback).
+    progress_serve_min_denom: int = 4
     seconds_per_word: InitVar[float] = 0.28
     chunk_unit: InitVar[str] = "sentence"
     chunk_len_strategy: InitVar[str] = _DEFAULT_CHUNK_LEN_STRATEGY
@@ -674,6 +699,7 @@ class RequestSLOState:
                 config.global_warmup_predictor_samples),
             cold_start_max_remaining_tokens=(
                 config.cold_start_max_remaining_tokens),
+            progress_serve_min_denom=config.progress_serve_min_denom,
             chunk_unit=config.chunk_unit,
             chunk_len_strategy=config.chunk_len_strategy,
             min_chunk_tokens=config.min_chunk_tokens,
@@ -692,10 +718,9 @@ class RequestSLOState:
     def phase(self) -> Phase:
         if self.decoding_start_ts is None:
             return Phase.PREFILL
-        # SSLO: WARMUP only while the first chunk hasn't completed.
-        # As soon as chunks_completed >= 1 the per-req predictor has a
-        # sample and the hybrid predictor can fall through to global,
-        # so the policy treats the request as MEASURED.
+        # SSLO: WARMUP only while the first chunk (unit_index 0) hasn't
+        # completed. Unit 0's deadline is its own consumer-ready time so it
+        # cannot miss; once chunks_completed >= 1 the request is MEASURED.
         if self.chunks_completed == 0:
             return Phase.WARMUP
         return Phase.MEASURED
@@ -806,205 +831,28 @@ class RequestSLOState:
             return max(1.0, pred.value - cur)
         return max(1.0, (cur - pred.value) * pred.overshoot_safety_factor)
 
-    def pressure_components(
-        self, now: float, tpot_s: float | None
-    ) -> PressureComponents:
-        """Compute the raw pressure components for logging.
+    def length_tail_prob(self, x: int) -> float:
+        """ProgressServe posterior tail P(L_q > x | L_q > c_q).
 
-        Unlike pressure(), this never returns a scalar fallback — instead
-        it surfaces which input was missing so the analysis layer can
-        distinguish "not measurable" from "exactly at deadline".
+        Uses the shared GLOBAL chunk-length distribution (over all requests).
+        Falls back to an analytic cold-start tail when the global predictor
+        is still warming up or the conditioning event has too little mass.
+        Non-increasing in x (empirical and analytic forms both), which keeps
+        the run/defer marginal benefit M >= 0.
         """
-        if self.phase == Phase.PREFILL:
-            return PressureComponents(
-                remaining_tokens=None, estimated_step_time_s=tpot_s,
-                buffer_slack_s=None, estimated_refill_time_s=None,
-                refill_slack_s=None, depletion_pressure=None,
-                pressure_available=False, pressure_missing_reason="prefill")
-        if self.phase == Phase.WARMUP:
-            return PressureComponents(
-                remaining_tokens=None, estimated_step_time_s=tpot_s,
-                buffer_slack_s=None, estimated_refill_time_s=None,
-                refill_slack_s=None, depletion_pressure=None,
-                pressure_available=False, pressure_missing_reason="warmup")
-        if tpot_s is None:
-            return PressureComponents(
-                remaining_tokens=None, estimated_step_time_s=None,
-                buffer_slack_s=None, estimated_refill_time_s=None,
-                refill_slack_s=None, depletion_pressure=None,
-                pressure_available=False, pressure_missing_reason="no_tpot")
-        remaining = self.expected_remaining_len()
-        if remaining is None:
-            return PressureComponents(
-                remaining_tokens=None, estimated_step_time_s=tpot_s,
-                buffer_slack_s=None, estimated_refill_time_s=None,
-                refill_slack_s=None, depletion_pressure=None,
-                pressure_available=False,
-                pressure_missing_reason="no_predictor")
-
-        ttd = self.time_to_deadline(now)
-        refill = remaining * tpot_s
-        refill_slack = (None if ttd is None else ttd - refill)
-        if ttd is None:
-            depletion = None
-        elif ttd <= 0:
-            depletion = float("inf")
-        else:
-            depletion = _quantized_pressure(remaining, ttd, tpot_s)
-        return PressureComponents(
-            remaining_tokens=remaining,
-            estimated_step_time_s=tpot_s,
-            buffer_slack_s=ttd,
-            estimated_refill_time_s=refill,
-            refill_slack_s=refill_slack,
-            depletion_pressure=depletion,
-            pressure_available=True,
-            pressure_missing_reason=None)
-
-    def pressure(self, now: float, tpot_s: float | None) -> float | None:
-        """Forward-looking urgency (= remaining_work / time_to_deadline,
-        normalized so 1.0 means "exactly at deadline given current TPOT").
-
-        > 1.0 projects a deadline miss; 0 means lots of slack. Renamed
-        from `score` because the value is dimensioned like load pressure
-        (utilization-of-budget) and the semantics carry through the
-        scheduler.
-
-        Return-value contract:
-          - ``None`` — not measurable yet (PREFILL/WARMUP, missing tpot,
-            or predictor has no value).
-          - ``float('inf')`` — deadline already passed (time_to_deadline
-            <= 0). Callers MUST handle inf: it propagates through max()
-            and >= comparisons, but breaks averaging (drop inf before
-            computing aggregate pressures).
-          - finite float — normal urgency.
-        """
-        return self.pressure_components(now, tpot_s).depletion_pressure
-
-    def multi_level_pressure_components(
-        self,
-        now: float,
-        tpot_s: float | None,
-        epoch_s: float | None,
-    ) -> PressureComponents:
-        """Two-level pressure signal used by policy="multi_level_pressure".
-
-        Mirrors pressure_components phase gating (PREFILL/WARMUP/no_tpot/
-        no_predictor → pressure_available=False with reason) so the
-        decision log can distinguish unmeasurable requests from
-        at-deadline ones. When measurable, populates:
-          - serve_pressure = refill / max(ttd, ε)
-          - defer_pressure = refill / max(ttd - epoch_s, ε)
-        epoch_s=None means "treat the next step's wall-clock as 0", so
-        defer collapses onto serve — used when the caller is only
-        interested in the serve-side urgency at a given batch.
-        """
-        if self.phase == Phase.PREFILL:
-            return PressureComponents(
-                remaining_tokens=None, estimated_step_time_s=tpot_s,
-                buffer_slack_s=None, estimated_refill_time_s=None,
-                refill_slack_s=None, depletion_pressure=None,
-                pressure_available=False, pressure_missing_reason="prefill",
-                epoch_time_s=epoch_s,
-                defer_buffer_slack_s=None,
-                serve_pressure=None, defer_pressure=None)
-        if self.phase == Phase.WARMUP:
-            return PressureComponents(
-                remaining_tokens=None, estimated_step_time_s=tpot_s,
-                buffer_slack_s=None, estimated_refill_time_s=None,
-                refill_slack_s=None, depletion_pressure=None,
-                pressure_available=False, pressure_missing_reason="warmup",
-                epoch_time_s=epoch_s,
-                defer_buffer_slack_s=None,
-                serve_pressure=None, defer_pressure=None)
-        if tpot_s is None:
-            return PressureComponents(
-                remaining_tokens=None, estimated_step_time_s=None,
-                buffer_slack_s=None, estimated_refill_time_s=None,
-                refill_slack_s=None, depletion_pressure=None,
-                pressure_available=False, pressure_missing_reason="no_tpot",
-                epoch_time_s=epoch_s,
-                defer_buffer_slack_s=None,
-                serve_pressure=None, defer_pressure=None)
-        remaining = self.expected_remaining_len()
-        if remaining is None:
-            return PressureComponents(
-                remaining_tokens=None, estimated_step_time_s=tpot_s,
-                buffer_slack_s=None, estimated_refill_time_s=None,
-                refill_slack_s=None, depletion_pressure=None,
-                pressure_available=False,
-                pressure_missing_reason="no_predictor",
-                epoch_time_s=epoch_s,
-                defer_buffer_slack_s=None,
-                serve_pressure=None, defer_pressure=None)
-
-        ttd = self.time_to_deadline(now)
-        refill = remaining * tpot_s
-        refill_slack = (None if ttd is None else ttd - refill)
-        if ttd is None:
-            depletion = None
-            serve = None
-            defer = None
-            defer_buffer = None
-        elif ttd <= 0:
-            depletion = float("inf")
-            serve = float("inf")
-            defer = float("inf")
-            # Defer buffer is still defined (epoch shifts the already-past
-            # deadline further into the red); report it for logging.
-            defer_buffer = (None if epoch_s is None else ttd - epoch_s)
-        else:
-            depletion = _quantized_pressure(remaining, ttd, tpot_s)
-            serve = _quantized_pressure(remaining, ttd, tpot_s)
-            if epoch_s is None:
-                defer_buffer = None
-                defer = serve
-            else:
-                defer_buffer = ttd - epoch_s
-                if defer_buffer <= 0:
-                    defer = float("inf")
-                else:
-                    defer = _quantized_pressure(
-                        remaining, defer_buffer, tpot_s)
-        return PressureComponents(
-            remaining_tokens=remaining,
-            estimated_step_time_s=tpot_s,
-            buffer_slack_s=ttd,
-            estimated_refill_time_s=refill,
-            refill_slack_s=refill_slack,
-            depletion_pressure=depletion,
-            pressure_available=True,
-            pressure_missing_reason=None,
-            epoch_time_s=epoch_s,
-            defer_buffer_slack_s=defer_buffer,
-            serve_pressure=serve,
-            defer_pressure=defer)
-
-    def serve_pressure(
-        self, now: float, tpot_s: float | None
-    ) -> float | None:
-        """Scalar wrapper around multi_level_pressure_components.
-
-        epoch_s is fixed to None — caller only wants the serve side.
-        Returns None for unmeasurable requests (PREFILL/WARMUP/no_tpot/
-        no_predictor); finite or +inf otherwise.
-        """
-        return self.multi_level_pressure_components(
-            now, tpot_s, None).serve_pressure
-
-    def defer_pressure(
-        self,
-        now: float,
-        tpot_s: float | None,
-        epoch_s: float | None,
-    ) -> float | None:
-        """Scalar wrapper around multi_level_pressure_components.
-
-        Same None contract as serve_pressure(). When epoch_s is None the
-        defer side collapses to the serve side.
-        """
-        return self.multi_level_pressure_components(
-            now, tpot_s, epoch_s).defer_pressure
+        c_q = self.current_chunk_generated_len
+        glob = self._global_chunk_len_predictor
+        if (glob is not None
+                and glob.sample_count >= self.global_warmup_predictor_samples
+                and glob.sample_count_above(c_q)
+                >= self.progress_serve_min_denom):
+            p = glob.tail_prob(x, c_q)
+            if p is not None:
+                return p
+        # Cold-start (terminal): treat remaining length as bounded by
+        # cold_start_max_remaining_tokens. Conservative — keeps the request
+        # scheduled (tail ~1) until the global distribution warms up.
+        return 1.0 if x < c_q + self.cold_start_max_remaining_tokens else 0.0
 
     def mark_admitted(self, now: float) -> None:
         if self.admitted_ts is None:

@@ -1,0 +1,345 @@
+model,consume_profile_label,policy,policy_label,lambda_req_s,threshold_key,threshold_label,threshold_value,threshold_mode,selection_rank,mean_admitted_inflight_requests,selected_max_num_seqs,unit_deadline_miss_rate,valid_consumable_unit_count,violated_unit_count,run_count
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,8.0,conservative,Conservative (<0.5%),0.005,lt,1,127.99902875990475,128,0.00033927056827820186,23580.0,8.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,16.0,conservative,Conservative (<0.5%),0.005,lt,1,127.99850701798766,128,0.000342773897767685,23339.0,8.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,24.0,conservative,Conservative (<0.5%),0.005,lt,1,127.99903359242322,128,0.0006885866758478223,23236.0,16.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,32.0,conservative,Conservative (<0.5%),0.005,lt,1,128.0,128,0.0004720017163698777,23305.0,11.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,40.0,conservative,Conservative (<0.5%),0.005,lt,1,127.99847607655347,128,0.0003866311538791992,23278.0,9.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,48.0,conservative,Conservative (<0.5%),0.005,lt,1,128.0,128,0.0006478082487583676,23155.0,15.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,1,272.8177190742077,128,0.00025080256821829853,19936.0,5.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,2,254.34640141991733,256,0.0013582342954159593,23560.0,32.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,1,273.7399696777139,128,0.0001990247785849338,20098.0,4.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,2,255.75365428875355,256,0.0011183757742601514,23248.0,26.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,1,275.4965616379669,128,0.00030206917384080956,19863.0,6.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,2,253.30735375116777,256,0.0008981267641775725,23382.0,21.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,1,273.8141763216285,128,0.00029513034923757994,20330.0,6.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,2,253.34659759603886,256,0.0010245901639344263,23424.0,24.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,1,274.03406683512645,128,0.00045081146062913246,19964.0,9.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,2,254.95899546228512,256,0.000943881928951433,23308.0,22.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,1,272.8366456509953,128,0.0001999000499750125,20010.0,4.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,2,255.25221843813284,256,0.0010334137099552187,23224.0,24.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,8.0,relaxed,Relaxed (<1%),0.01,lt,1,127.99902875990475,128,0.00033927056827820186,23580.0,8.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,16.0,relaxed,Relaxed (<1%),0.01,lt,1,127.99850701798766,128,0.000342773897767685,23339.0,8.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99207241732387,256,0.008643079150168178,23487.0,203.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99903359242322,128,0.0006885866758478223,23236.0,16.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99833532777723,256,0.009886286490156144,23568.0,233.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,2,128.0,128,0.0004720017163698777,23305.0,11.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,40.0,relaxed,Relaxed (<1%),0.01,lt,1,127.99847607655347,128,0.0003866311538791992,23278.0,9.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99464685377984,256,0.009939937399543186,23642.0,235.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,2,128.0,128,0.0006478082487583676,23155.0,15.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,1,272.8177190742077,128,0.00025080256821829853,19936.0,5.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,2,254.34640141991733,256,0.0013582342954159593,23560.0,32.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,1,273.7399696777139,128,0.0001990247785849338,20098.0,4.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,2,255.75365428875355,256,0.0011183757742601514,23248.0,26.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,1,275.4965616379669,128,0.00030206917384080956,19863.0,6.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,2,253.30735375116777,256,0.0008981267641775725,23382.0,21.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,1,273.8141763216285,128,0.00029513034923757994,20330.0,6.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,2,253.34659759603886,256,0.0010245901639344263,23424.0,24.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,1,274.03406683512645,128,0.00045081146062913246,19964.0,9.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,2,254.95899546228512,256,0.000943881928951433,23308.0,22.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,1,272.8366456509953,128,0.0001999000499750125,20010.0,4.0,1
+Qwen/Qwen3.5-35B-A3B,Reading,sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,2,255.25221843813284,256,0.0010334137099552187,23224.0,24.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,8.0,conservative,Conservative (<0.5%),0.005,lt,1,255.97842164678752,256,0.0009791703756453624,22468.0,22.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,8.0,conservative,Conservative (<0.5%),0.005,lt,2,128.0,128,0.0,22790.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,16.0,conservative,Conservative (<0.5%),0.005,lt,1,255.98555737548313,256,0.0012610340479192938,22997.0,29.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,16.0,conservative,Conservative (<0.5%),0.005,lt,2,127.9979299466861,128,0.0,22901.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,24.0,conservative,Conservative (<0.5%),0.005,lt,1,255.9887875270723,256,0.0012091898428053204,23156.0,28.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,24.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99726829118117,128,0.0,23181.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,32.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99080261653322,256,0.0009490940465918896,23180.0,22.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,32.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99929495549593,128,8.653513326410523e-05,23112.0,2.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,40.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99161892604815,256,0.001166004491276559,23156.0,27.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,40.0,conservative,Conservative (<0.5%),0.005,lt,2,128.0,128,0.0,23061.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,48.0,conservative,Conservative (<0.5%),0.005,lt,1,255.98454191363163,256,0.0010317255610007739,23262.0,24.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,48.0,conservative,Conservative (<0.5%),0.005,lt,2,127.9981258012491,128,0.0,22813.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,1,300.83902139380126,128,0.0,15689.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,2,280.6840166764924,256,9.621397989127821e-05,20787.0,2.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,1,617.7690595747828,256,0.0,14482.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,2,508.7666526953085,128,0.0,13228.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,1,627.5815648285974,256,0.0,15147.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,2,499.13767812947725,128,0.0,13744.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,1,612.123679432871,256,0.0001297942760724252,15409.0,2.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,2,508.5595284304051,128,0.0,13764.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,1,576.9606187964635,256,0.0,16697.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,2,509.849083032414,128,0.0,13539.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,1,622.8446553327216,256,0.0,15926.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,2,499.0162583557935,128,0.0,13531.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,8.0,relaxed,Relaxed (<1%),0.01,lt,1,255.97842164678752,256,0.0009791703756453624,22468.0,22.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,8.0,relaxed,Relaxed (<1%),0.01,lt,2,128.0,128,0.0,22790.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,16.0,relaxed,Relaxed (<1%),0.01,lt,1,255.98555737548313,256,0.0012610340479192938,22997.0,29.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,16.0,relaxed,Relaxed (<1%),0.01,lt,2,127.9979299466861,128,0.0,22901.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,1,255.9887875270723,256,0.0012091898428053204,23156.0,28.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99726829118117,128,0.0,23181.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99080261653322,256,0.0009490940465918896,23180.0,22.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99929495549593,128,8.653513326410523e-05,23112.0,2.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,40.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99161892604815,256,0.001166004491276559,23156.0,27.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,40.0,relaxed,Relaxed (<1%),0.01,lt,2,128.0,128,0.0,23061.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,1,255.98454191363163,256,0.0010317255610007739,23262.0,24.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,2,127.9981258012491,128,0.0,22813.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,1,300.83902139380126,128,0.0,15689.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,2,280.6840166764924,256,9.621397989127821e-05,20787.0,2.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,1,617.7690595747828,256,0.0,14482.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,2,508.7666526953085,128,0.0,13228.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,1,627.5815648285974,256,0.0,15147.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,2,499.13767812947725,128,0.0,13744.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,1,612.123679432871,256,0.0001297942760724252,15409.0,2.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,2,508.5595284304051,128,0.0,13764.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,1,576.9606187964635,256,0.0,16697.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,2,509.849083032414,128,0.0,13539.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,1,622.8446553327216,256,0.0,15926.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,2,499.0162583557935,128,0.0,13531.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,8.0,strict,Strict (=0),0.0,eq,1,128.0,128,0.0,22790.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,16.0,strict,Strict (=0),0.0,eq,1,127.9979299466861,128,0.0,22901.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,24.0,strict,Strict (=0),0.0,eq,1,127.99726829118117,128,0.0,23181.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,40.0,strict,Strict (=0),0.0,eq,1,128.0,128,0.0,23061.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,baseline,Baseline,48.0,strict,Strict (=0),0.0,eq,1,127.9981258012491,128,0.0,22813.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,8.0,strict,Strict (=0),0.0,eq,1,300.83902139380126,128,0.0,15689.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,16.0,strict,Strict (=0),0.0,eq,1,617.7690595747828,256,0.0,14482.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,16.0,strict,Strict (=0),0.0,eq,2,508.7666526953085,128,0.0,13228.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,24.0,strict,Strict (=0),0.0,eq,1,627.5815648285974,256,0.0,15147.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,24.0,strict,Strict (=0),0.0,eq,2,499.13767812947725,128,0.0,13744.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,32.0,strict,Strict (=0),0.0,eq,1,508.5595284304051,128,0.0,13764.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,40.0,strict,Strict (=0),0.0,eq,1,576.9606187964635,256,0.0,16697.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,40.0,strict,Strict (=0),0.0,eq,2,509.849083032414,128,0.0,13539.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,48.0,strict,Strict (=0),0.0,eq,1,622.8446553327216,256,0.0,15926.0,0.0,1
+Qwen/Qwen3.5-9B,Reading,sslo,ProgressServe,48.0,strict,Strict (=0),0.0,eq,2,499.0162583557935,128,0.0,13531.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,8.0,conservative,Conservative (<0.5%),0.005,lt,1,255.98687549823507,256,0.0011969904240766074,23392.0,28.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,8.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99839002375076,128,4.3142499676431255e-05,23179.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,16.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99911668776537,256,0.0008137741990748672,23348.0,19.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,16.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99902649485422,128,0.0,23393.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,24.0,conservative,Conservative (<0.5%),0.005,lt,1,255.990953987338,256,0.0009915502672874633,23196.0,23.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,24.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99956002547391,128,0.0,22961.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,32.0,conservative,Conservative (<0.5%),0.005,lt,1,255.98920387573705,256,0.0011475688541312478,23528.0,27.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,32.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99695740501073,128,0.0,23244.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,40.0,conservative,Conservative (<0.5%),0.005,lt,1,255.9879303179033,256,0.0007722007722007722,23310.0,18.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,40.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99706582304955,128,0.0,23432.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,48.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99142515666537,256,0.0010168629777137532,23602.0,24.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,48.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99854816603558,128,0.0,23375.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,1,276.1686390897524,128,0.0,19242.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,2,262.17400579349874,256,4.324137334601747e-05,23126.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,1,275.8147525435208,128,0.0,19269.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,2,263.1162704092974,256,0.0001278772378516624,23460.0,3.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,1,276.1005297821766,128,0.0,19263.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,2,265.67034352348884,256,0.0001307531380753138,22944.0,3.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,1,276.26915726127515,128,5.1049058144877224e-05,19589.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,2,261.31820746402093,256,0.0001305028710631634,22988.0,3.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,1,275.7321522997384,128,0.0,19213.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,2,261.80931000307845,256,8.635951465952762e-05,23159.0,2.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,1,277.611071846164,128,0.0,19643.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,2,263.6185245536998,256,0.00017151187719749593,23322.0,4.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,8.0,relaxed,Relaxed (<1%),0.01,lt,1,255.98687549823507,256,0.0011969904240766074,23392.0,28.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,8.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99839002375076,128,4.3142499676431255e-05,23179.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,16.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99911668776537,256,0.0008137741990748672,23348.0,19.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,16.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99902649485422,128,0.0,23393.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,1,255.990953987338,256,0.0009915502672874633,23196.0,23.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99956002547391,128,0.0,22961.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,1,255.98920387573705,256,0.0011475688541312478,23528.0,27.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99695740501073,128,0.0,23244.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,40.0,relaxed,Relaxed (<1%),0.01,lt,1,255.9879303179033,256,0.0007722007722007722,23310.0,18.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,40.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99706582304955,128,0.0,23432.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99142515666537,256,0.0010168629777137532,23602.0,24.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99854816603558,128,0.0,23375.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,1,276.1686390897524,128,0.0,19242.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,2,262.17400579349874,256,4.324137334601747e-05,23126.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,1,275.8147525435208,128,0.0,19269.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,2,263.1162704092974,256,0.0001278772378516624,23460.0,3.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,1,276.1005297821766,128,0.0,19263.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,2,265.67034352348884,256,0.0001307531380753138,22944.0,3.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,1,276.26915726127515,128,5.1049058144877224e-05,19589.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,2,261.31820746402093,256,0.0001305028710631634,22988.0,3.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,1,275.7321522997384,128,0.0,19213.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,2,261.80931000307845,256,8.635951465952762e-05,23159.0,2.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,1,277.611071846164,128,0.0,19643.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,2,263.6185245536998,256,0.00017151187719749593,23322.0,4.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,16.0,strict,Strict (=0),0.0,eq,1,127.99902649485422,128,0.0,23393.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,24.0,strict,Strict (=0),0.0,eq,1,127.99956002547391,128,0.0,22961.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,32.0,strict,Strict (=0),0.0,eq,1,127.99695740501073,128,0.0,23244.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,40.0,strict,Strict (=0),0.0,eq,1,127.99706582304955,128,0.0,23432.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,Baseline,48.0,strict,Strict (=0),0.0,eq,1,127.99854816603558,128,0.0,23375.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,8.0,strict,Strict (=0),0.0,eq,1,276.1686390897524,128,0.0,19242.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,16.0,strict,Strict (=0),0.0,eq,1,275.8147525435208,128,0.0,19269.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,24.0,strict,Strict (=0),0.0,eq,1,276.1005297821766,128,0.0,19263.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,40.0,strict,Strict (=0),0.0,eq,1,275.7321522997384,128,0.0,19213.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,ProgressServe,48.0,strict,Strict (=0),0.0,eq,1,277.611071846164,128,0.0,19643.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,8.0,conservative,Conservative (<0.5%),0.005,lt,1,255.98676162938656,256,8.94134477825465e-05,22368.0,2.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,8.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99712797157913,128,0.0,23300.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,16.0,conservative,Conservative (<0.5%),0.005,lt,1,255.9844555834265,256,8.625150940141452e-05,23188.0,2.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,16.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99872823893143,128,0.0,23088.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,24.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99134287092315,256,0.00012949453964691157,23167.0,3.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,24.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99885433110798,128,0.0,22887.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,32.0,conservative,Conservative (<0.5%),0.005,lt,1,255.98593373773537,256,0.00021677866897897247,23065.0,5.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,32.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99951996754325,128,0.0,22735.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,40.0,conservative,Conservative (<0.5%),0.005,lt,1,255.98656911616627,256,8.650893204723387e-05,23119.0,2.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,40.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99909269935944,128,0.0,23089.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,48.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99781138782956,256,4.278257893385813e-05,23374.0,1.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,48.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99864677818921,128,0.0,22874.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,1,345.60708918820285,256,0.0,16973.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,2,328.69970280448246,128,0.0,14693.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,1,835.6244054531697,256,8.395600705230459e-05,11911.0,1.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,2,691.8913113971574,128,0.0,10147.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,1,882.3650405176376,256,0.0,11314.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,2,665.4129994701682,128,0.0,10453.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,1,857.9434216029472,256,0.0,11692.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,2,692.5805142337795,128,0.0,10499.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,1,853.380257309807,256,0.0,11953.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,2,669.3998891945846,128,0.0,10490.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,1,808.7803471717496,256,0.0,12009.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,2,651.8316765987431,128,0.0,12023.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,8.0,relaxed,Relaxed (<1%),0.01,lt,1,255.98676162938656,256,8.94134477825465e-05,22368.0,2.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,8.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99712797157913,128,0.0,23300.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,16.0,relaxed,Relaxed (<1%),0.01,lt,1,255.9844555834265,256,8.625150940141452e-05,23188.0,2.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,16.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99872823893143,128,0.0,23088.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99134287092315,256,0.00012949453964691157,23167.0,3.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99885433110798,128,0.0,22887.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,1,255.98593373773537,256,0.00021677866897897247,23065.0,5.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99951996754325,128,0.0,22735.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,40.0,relaxed,Relaxed (<1%),0.01,lt,1,255.98656911616627,256,8.650893204723387e-05,23119.0,2.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,40.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99909269935944,128,0.0,23089.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99781138782956,256,4.278257893385813e-05,23374.0,1.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99864677818921,128,0.0,22874.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,1,345.60708918820285,256,0.0,16973.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,2,328.69970280448246,128,0.0,14693.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,1,835.6244054531697,256,8.395600705230459e-05,11911.0,1.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,2,691.8913113971574,128,0.0,10147.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,1,882.3650405176376,256,0.0,11314.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,2,665.4129994701682,128,0.0,10453.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,1,857.9434216029472,256,0.0,11692.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,2,692.5805142337795,128,0.0,10499.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,1,853.380257309807,256,0.0,11953.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,2,669.3998891945846,128,0.0,10490.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,1,808.7803471717496,256,0.0,12009.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,2,651.8316765987431,128,0.0,12023.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,8.0,strict,Strict (=0),0.0,eq,1,127.99712797157913,128,0.0,23300.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,16.0,strict,Strict (=0),0.0,eq,1,127.99872823893143,128,0.0,23088.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,24.0,strict,Strict (=0),0.0,eq,1,127.99885433110798,128,0.0,22887.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,32.0,strict,Strict (=0),0.0,eq,1,127.99951996754325,128,0.0,22735.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,40.0,strict,Strict (=0),0.0,eq,1,127.99909269935944,128,0.0,23089.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,Baseline,48.0,strict,Strict (=0),0.0,eq,1,127.99864677818921,128,0.0,22874.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,8.0,strict,Strict (=0),0.0,eq,1,345.60708918820285,256,0.0,16973.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,8.0,strict,Strict (=0),0.0,eq,2,328.69970280448246,128,0.0,14693.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,16.0,strict,Strict (=0),0.0,eq,1,691.8913113971574,128,0.0,10147.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,24.0,strict,Strict (=0),0.0,eq,1,882.3650405176376,256,0.0,11314.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,24.0,strict,Strict (=0),0.0,eq,2,665.4129994701682,128,0.0,10453.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,32.0,strict,Strict (=0),0.0,eq,1,857.9434216029472,256,0.0,11692.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,32.0,strict,Strict (=0),0.0,eq,2,692.5805142337795,128,0.0,10499.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,40.0,strict,Strict (=0),0.0,eq,1,853.380257309807,256,0.0,11953.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,40.0,strict,Strict (=0),0.0,eq,2,669.3998891945846,128,0.0,10490.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,48.0,strict,Strict (=0),0.0,eq,1,808.7803471717496,256,0.0,12009.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,ProgressServe,48.0,strict,Strict (=0),0.0,eq,2,651.8316765987431,128,0.0,12023.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,8.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99325820240492,256,0.0007320644216691069,23222.0,17.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,8.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99903228881989,128,4.311459860308701e-05,23194.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,16.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99048195640512,256,0.0005608524957936063,23179.0,13.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,16.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99893207667829,128,4.236929073807304e-05,23602.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,24.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99452381727812,256,0.0004289452236949342,23313.0,10.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,24.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99749759851484,128,8.646031471554557e-05,23132.0,2.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,32.0,conservative,Conservative (<0.5%),0.005,lt,1,255.98997727620585,256,0.0008529512111907199,23448.0,20.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,32.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99946375128431,128,0.0,23419.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,40.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99056769115887,256,0.0006008841581183742,23299.0,14.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,40.0,conservative,Conservative (<0.5%),0.005,lt,2,127.9994701053032,128,4.278257893385813e-05,23374.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,48.0,conservative,Conservative (<0.5%),0.005,lt,1,255.98836245178617,256,0.0006344372541555641,23643.0,15.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,48.0,conservative,Conservative (<0.5%),0.005,lt,2,127.9984989803396,128,0.0,23485.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,1,277.10908155054784,128,5.173305742369374e-05,19330.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,2,266.0119680203266,256,8.816398501212254e-05,22685.0,2.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,1,275.2800956293129,128,5.2194790959862204e-05,19159.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,2,262.27853419104684,256,4.289084280506112e-05,23315.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,1,278.3460979538104,128,0.0,19356.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,2,265.0139495734017,256,0.00013085008941422777,22927.0,3.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,1,278.12958659094926,128,0.0,19323.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,2,263.1934484184054,256,0.0001743299193724123,22945.0,4.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,1,279.7205069830692,128,5.2012899199001353e-05,19226.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,2,263.1048787050561,256,0.0002207115741149466,22654.0,5.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,1,276.6627689115318,128,0.0,19582.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,2,265.48811640650763,256,0.0001266784899923993,23682.0,3.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,8.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99325820240492,256,0.0007320644216691069,23222.0,17.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,8.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99903228881989,128,4.311459860308701e-05,23194.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,16.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99048195640512,256,0.0005608524957936063,23179.0,13.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,16.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99893207667829,128,4.236929073807304e-05,23602.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99452381727812,256,0.0004289452236949342,23313.0,10.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99749759851484,128,8.646031471554557e-05,23132.0,2.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,1,255.98997727620585,256,0.0008529512111907199,23448.0,20.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99946375128431,128,0.0,23419.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,40.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99056769115887,256,0.0006008841581183742,23299.0,14.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,40.0,relaxed,Relaxed (<1%),0.01,lt,2,127.9994701053032,128,4.278257893385813e-05,23374.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,1,255.98836245178617,256,0.0006344372541555641,23643.0,15.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,2,127.9984989803396,128,0.0,23485.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,1,277.10908155054784,128,5.173305742369374e-05,19330.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,2,266.0119680203266,256,8.816398501212254e-05,22685.0,2.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,1,275.2800956293129,128,5.2194790959862204e-05,19159.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,2,262.27853419104684,256,4.289084280506112e-05,23315.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,1,278.3460979538104,128,0.0,19356.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,2,265.0139495734017,256,0.00013085008941422777,22927.0,3.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,1,278.12958659094926,128,0.0,19323.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,2,263.1934484184054,256,0.0001743299193724123,22945.0,4.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,1,279.7205069830692,128,5.2012899199001353e-05,19226.0,1.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,2,263.1048787050561,256,0.0002207115741149466,22654.0,5.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,1,276.6627689115318,128,0.0,19582.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,2,265.48811640650763,256,0.0001266784899923993,23682.0,3.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,32.0,strict,Strict (=0),0.0,eq,1,127.99946375128431,128,0.0,23419.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,Baseline,48.0,strict,Strict (=0),0.0,eq,1,127.9984989803396,128,0.0,23485.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,24.0,strict,Strict (=0),0.0,eq,1,278.3460979538104,128,0.0,19356.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,32.0,strict,Strict (=0),0.0,eq,1,278.12958659094926,128,0.0,19323.0,0.0,1
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,ProgressServe,48.0,strict,Strict (=0),0.0,eq,1,276.6627689115318,128,0.0,19582.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,8.0,conservative,Conservative (<0.5%),0.005,lt,1,255.9912107477844,256,8.87154009936125e-05,22544.0,2.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,8.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99911828652755,128,0.0,22843.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,16.0,conservative,Conservative (<0.5%),0.005,lt,1,255.98182586828688,256,0.0001286008230452675,23328.0,3.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,16.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99772540354303,128,0.0,22878.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,24.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99230593881484,256,4.366240230537484e-05,22903.0,1.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,24.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99886560977176,128,0.0,23000.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,32.0,conservative,Conservative (<0.5%),0.005,lt,1,255.99740429896613,256,4.3840420868040336e-05,22810.0,1.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,32.0,conservative,Conservative (<0.5%),0.005,lt,2,128.0,128,0.0,23140.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,40.0,conservative,Conservative (<0.5%),0.005,lt,1,255.9935291450918,256,8.6210612526402e-05,23199.0,2.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,40.0,conservative,Conservative (<0.5%),0.005,lt,2,127.9966698205535,128,0.0,23142.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,48.0,conservative,Conservative (<0.5%),0.005,lt,1,255.98452676850994,256,4.381928925112835e-05,22821.0,1.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,48.0,conservative,Conservative (<0.5%),0.005,lt,2,127.99890198102455,128,0.0,23298.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,1,364.6835837410303,256,0.0,16302.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,8.0,conservative,Conservative (<0.5%),0.005,lt,2,348.4790400602147,128,0.0,13415.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,1,893.9358458257883,256,0.0,11016.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,16.0,conservative,Conservative (<0.5%),0.005,lt,2,769.7489664522387,128,0.0,8965.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,1,919.0528996295851,256,0.0,11515.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,24.0,conservative,Conservative (<0.5%),0.005,lt,2,753.511670667992,128,0.0,10332.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,1,920.1391191164971,256,0.0,11406.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,32.0,conservative,Conservative (<0.5%),0.005,lt,2,762.2043422199978,128,0.0,9680.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,1,889.8310287347682,256,0.0,11513.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,40.0,conservative,Conservative (<0.5%),0.005,lt,2,765.9927777330339,128,0.0,9034.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,1,911.5955606680405,256,0.0,11403.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,48.0,conservative,Conservative (<0.5%),0.005,lt,2,733.4249811215019,128,0.0,10382.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,8.0,relaxed,Relaxed (<1%),0.01,lt,1,255.9912107477844,256,8.87154009936125e-05,22544.0,2.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,8.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99911828652755,128,0.0,22843.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,16.0,relaxed,Relaxed (<1%),0.01,lt,1,255.98182586828688,256,0.0001286008230452675,23328.0,3.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,16.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99772540354303,128,0.0,22878.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99230593881484,256,4.366240230537484e-05,22903.0,1.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,24.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99886560977176,128,0.0,23000.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,1,255.99740429896613,256,4.3840420868040336e-05,22810.0,1.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,32.0,relaxed,Relaxed (<1%),0.01,lt,2,128.0,128,0.0,23140.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,40.0,relaxed,Relaxed (<1%),0.01,lt,1,255.9935291450918,256,8.6210612526402e-05,23199.0,2.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,40.0,relaxed,Relaxed (<1%),0.01,lt,2,127.9966698205535,128,0.0,23142.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,1,255.98452676850994,256,4.381928925112835e-05,22821.0,1.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,48.0,relaxed,Relaxed (<1%),0.01,lt,2,127.99890198102455,128,0.0,23298.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,1,364.6835837410303,256,0.0,16302.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,8.0,relaxed,Relaxed (<1%),0.01,lt,2,348.4790400602147,128,0.0,13415.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,1,893.9358458257883,256,0.0,11016.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,16.0,relaxed,Relaxed (<1%),0.01,lt,2,769.7489664522387,128,0.0,8965.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,1,919.0528996295851,256,0.0,11515.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,24.0,relaxed,Relaxed (<1%),0.01,lt,2,753.511670667992,128,0.0,10332.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,1,920.1391191164971,256,0.0,11406.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,32.0,relaxed,Relaxed (<1%),0.01,lt,2,762.2043422199978,128,0.0,9680.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,1,889.8310287347682,256,0.0,11513.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,40.0,relaxed,Relaxed (<1%),0.01,lt,2,765.9927777330339,128,0.0,9034.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,1,911.5955606680405,256,0.0,11403.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,48.0,relaxed,Relaxed (<1%),0.01,lt,2,733.4249811215019,128,0.0,10382.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,8.0,strict,Strict (=0),0.0,eq,1,127.99911828652755,128,0.0,22843.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,16.0,strict,Strict (=0),0.0,eq,1,127.99772540354303,128,0.0,22878.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,24.0,strict,Strict (=0),0.0,eq,1,127.99886560977176,128,0.0,23000.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,32.0,strict,Strict (=0),0.0,eq,1,128.0,128,0.0,23140.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,40.0,strict,Strict (=0),0.0,eq,1,127.9966698205535,128,0.0,23142.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,Baseline,48.0,strict,Strict (=0),0.0,eq,1,127.99890198102455,128,0.0,23298.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,8.0,strict,Strict (=0),0.0,eq,1,364.6835837410303,256,0.0,16302.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,8.0,strict,Strict (=0),0.0,eq,2,348.4790400602147,128,0.0,13415.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,16.0,strict,Strict (=0),0.0,eq,1,893.9358458257883,256,0.0,11016.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,16.0,strict,Strict (=0),0.0,eq,2,769.7489664522387,128,0.0,8965.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,24.0,strict,Strict (=0),0.0,eq,1,919.0528996295851,256,0.0,11515.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,24.0,strict,Strict (=0),0.0,eq,2,753.511670667992,128,0.0,10332.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,32.0,strict,Strict (=0),0.0,eq,1,920.1391191164971,256,0.0,11406.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,32.0,strict,Strict (=0),0.0,eq,2,762.2043422199978,128,0.0,9680.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,40.0,strict,Strict (=0),0.0,eq,1,889.8310287347682,256,0.0,11513.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,40.0,strict,Strict (=0),0.0,eq,2,765.9927777330339,128,0.0,9034.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,48.0,strict,Strict (=0),0.0,eq,1,911.5955606680405,256,0.0,11403.0,0.0,1
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,ProgressServe,48.0,strict,Strict (=0),0.0,eq,2,733.4249811215019,128,0.0,10382.0,0.0,1

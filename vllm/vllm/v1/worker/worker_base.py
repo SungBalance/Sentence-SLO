@@ -33,6 +33,11 @@ _R = TypeVar("_R")
 class CompilationTimes(NamedTuple):
     language_model: float
     encoder: float
+    # SSLO: per-decode-batch-size forward latency (ms) from CUDA-graph
+    # capture, keyed by num_reqs. Empty when not measured (read-only use, so
+    # the shared default is safe). Consumed by the SSLO scheduler's adaptive
+    # batching to avoid stale-EMA lock-in.
+    sslo_decode_latency_profile: dict[int, float] = {}
 
 
 class WorkerBase:

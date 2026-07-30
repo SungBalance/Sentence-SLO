@@ -777,6 +777,12 @@ class GPUModelRunner(
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
 
+        # SSLO: per-decode-batch-size forward latency (ms), measured once at
+        # CUDA-graph capture. Keyed by num_reqs (decode batch size). Used by
+        # the SSLO scheduler's adaptive batching to know Δ(b) for batch sizes
+        # not currently running (avoids stale-EMA lock-in).
+        self._sslo_decode_latency_profile: dict[int, float] = {}
+
         self.mm_budget = (
             MultiModalBudget(self.vllm_config, self.mm_registry)
             if self.supports_mm_inputs
@@ -6137,6 +6143,11 @@ class GPUModelRunner(
         )
         return cuda_graph_size
 
+    # SSLO
+    def get_sslo_decode_latency_profile(self) -> dict[int, float]:
+        """Per-decode-batch-size forward latency (ms) measured at capture."""
+        return dict(self._sslo_decode_latency_profile)
+
     def _warmup_and_capture(
         self,
         desc: BatchDescriptor,
@@ -6160,6 +6171,16 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
             )
+        # SSLO: time the captured graph replay for uniform-decode graphs so
+        # the scheduler has a Δ(b) datapoint for every decode batch size, not
+        # just the ones it has actually run (warmups above leave the graph
+        # warm, so this single replay is representative).
+        sslo_measure = desc.uniform and desc.num_reqs is not None
+        if sslo_measure:
+            _sslo_ev_start = torch.cuda.Event(enable_timing=True)
+            _sslo_ev_end = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            _sslo_ev_start.record()
         self._dummy_run(
             desc.num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -6171,6 +6192,12 @@ class GPUModelRunner(
             is_graph_capturing=True,
             profile_seq_lens=profile_seq_lens,
         )
+        if sslo_measure:
+            _sslo_ev_end.record()
+            torch.cuda.synchronize()
+            # Keep the first (or smallest-prefill) measurement per batch size.
+            self._sslo_decode_latency_profile.setdefault(
+                desc.num_reqs, _sslo_ev_start.elapsed_time(_sslo_ev_end))
 
     def _capture_cudagraphs(
         self,

@@ -152,6 +152,21 @@ class EngineCore:
             hash_block_size=hash_block_size,
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
+
+        # SSLO: pull the per-decode-batch-size forward-latency profile measured
+        # during CUDA-graph capture (driver worker) into the scheduler, so
+        # adaptive batching knows Δ(b) for batch sizes it isn't currently
+        # running. Best-effort: failures leave the scheduler on its wall-EMA
+        # fallback.
+        if hasattr(self.scheduler, "set_cudagraph_decode_profile"):
+            try:
+                profiles = self.collective_rpc(
+                    "get_sslo_decode_latency_profile")
+                if profiles and profiles[0]:
+                    self.scheduler.set_cudagraph_decode_profile(profiles[0])
+            except Exception as e:
+                logger.warning("SSLO decode-latency profile unavailable: %s", e)
+
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 

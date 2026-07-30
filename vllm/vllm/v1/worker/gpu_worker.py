@@ -501,6 +501,12 @@ class Worker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
+    # SSLO
+    def get_sslo_decode_latency_profile(self) -> dict[int, float]:
+        """Per-decode-batch-size forward latency (ms) from CUDA-graph capture.
+        Read-only fetch of an already-measured dict (no re-capture)."""
+        return self.model_runner.get_sslo_decode_latency_profile()
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to GPU memory.
         This is called when max_model_len=-1 is used and the engine
@@ -694,6 +700,9 @@ class Worker(WorkerBase):
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
+            # SSLO
+            sslo_decode_latency_profile=(
+                self.model_runner.get_sslo_decode_latency_profile()),
         )
 
     def reset_mm_cache(self) -> None:

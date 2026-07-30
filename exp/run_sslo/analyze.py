@@ -18,7 +18,7 @@ from validity import validate_run
 
 MAX_NUM_SEQS = 64
 DEFAULT_OUTPUT_DIR = "exp/run_sslo/output"
-SSLO_MODES = ("sslo", "sslo_offload", "sslo_adaptive", "sslo_adaptive_offload", "sslo_mlp")
+SSLO_MODES = ("progress_serve", "progress_serve_adaptive")
 ALL_MODES = ("baseline",) + SSLO_MODES
 SIX_STAT_KEYS = ("mean", "p50", "p90", "p95", "p99", "max")
 

@@ -1,0 +1,51 @@
+model,consume_profile_label,policy,lambda_req_s,selected_max_num_seqs,ttft_p99_s,run_count,policy_label
+Qwen/Qwen3.5-9B,Reading,baseline,8.0,128,46.557346873283386,1,Baseline
+Qwen/Qwen3.5-9B,Reading,baseline,16.0,128,119.43910950660705,1,Baseline
+Qwen/Qwen3.5-9B,Reading,baseline,24.0,128,146.28228510379793,1,Baseline
+Qwen/Qwen3.5-9B,Reading,baseline,40.0,128,165.92756261825562,1,Baseline
+Qwen/Qwen3.5-9B,Reading,baseline,48.0,128,167.45169609069825,1,Baseline
+Qwen/Qwen3.5-9B,Reading,sslo,8.0,128,1.929955439567566,1,ProgressServe
+Qwen/Qwen3.5-9B,Reading,sslo,16.0,256,51.15442807197571,1,ProgressServe
+Qwen/Qwen3.5-9B,Reading,sslo,24.0,256,90.78946451187134,1,ProgressServe
+Qwen/Qwen3.5-9B,Reading,sslo,32.0,128,119.34145367622375,1,ProgressServe
+Qwen/Qwen3.5-9B,Reading,sslo,40.0,256,122.42130875587463,1,ProgressServe
+Qwen/Qwen3.5-9B,Reading,sslo,48.0,256,131.9299491596222,1,ProgressServe
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,16.0,128,280.2106341934204,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,24.0,128,300.47337650299073,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,32.0,128,314.52176951408387,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,40.0,128,326.4976646518707,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,48.0,128,332.1129023551941,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,8.0,128,177.08795231580734,1,ProgressServe
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,16.0,128,262.6928261566162,1,ProgressServe
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,24.0,128,288.4523855304718,1,ProgressServe
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,40.0,128,306.371499376297,1,ProgressServe
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,48.0,128,315.518200674057,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,8.0,128,47.48521435260773,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,16.0,128,121.50940042734146,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,24.0,128,146.02026181936264,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,32.0,128,156.75105175495148,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,40.0,128,164.73865032196045,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,48.0,128,170.0780358982086,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,8.0,256,3.658299102783203,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,16.0,128,52.62737247943879,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,24.0,256,76.54284044265746,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,32.0,256,96.98676315307617,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,40.0,256,111.83934700012207,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,48.0,256,118.98365312576294,1,ProgressServe
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,32.0,128,316.34816431999207,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,48.0,128,332.79686585426333,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,24.0,128,298.28679183006284,1,ProgressServe
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,32.0,128,309.39056277275085,1,ProgressServe
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),sslo,48.0,128,324.2285586643219,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,8.0,128,46.16053445100784,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,16.0,128,119.86576384305954,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,24.0,128,145.18657811880112,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,32.0,128,157.95998437404634,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,40.0,128,166.68402481079102,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,48.0,128,171.1809557914734,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,8.0,256,2.3208756923675535,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,16.0,256,42.92959685325623,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,24.0,256,82.69941694259643,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,32.0,256,101.05262942314148,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,40.0,256,113.40321303367615,1,ProgressServe
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,48.0,256,122.15027374267578,1,ProgressServe
