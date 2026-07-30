@@ -1,0 +1,30 @@
+model,consume_profile_label,policy,lambda_req_s,selected_max_num_seqs,ttft_p99_s,run_count,policy_label
+Qwen/Qwen3.5-9B,Reading,baseline,8.0,128,46.599275450706486,1,Baseline
+Qwen/Qwen3.5-9B,Reading,baseline,16.0,128,122.14777016878128,1,Baseline
+Qwen/Qwen3.5-9B,Reading,baseline,32.0,128,156.15475609779358,1,Baseline
+Qwen/Qwen3.5-9B,Reading,baseline,48.0,128,170.2294770050049,1,Baseline
+Qwen/Qwen3.5-9B,Reading,baseline,64.0,128,177.7786339664459,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,16.0,128,281.3480515575409,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,48.0,128,331.146385011673,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,64.0,128,337.4304067993164,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),baseline,80.0,128,340.8477757644653,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Kokoro-82M),sslo,32.0,128,325.1219877910614,1,Adaptive
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,8.0,128,44.86105658054352,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,16.0,128,120.39644708156585,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,32.0,128,156.44511020183563,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,48.0,128,169.98496096611024,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,64.0,128,174.1502544593811,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),baseline,80.0,256,229.55885327339172,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,32.0,128,103.794897377491,1,Adaptive
+Qwen/Qwen3.5-9B,TTS (Kokoro-82M),sslo,64.0,128,139.5307515525818,1,Adaptive
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,32.0,128,313.6238737487793,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,48.0,128,328.0243462657928,1,Baseline
+Qwen/Qwen3.5-35B-A3B,TTS (Supertonic-3),baseline,80.0,128,343.3839852809906,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,8.0,128,47.37343502521515,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,16.0,128,120.39230823516846,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,32.0,128,156.99551612138748,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,48.0,128,170.43069675445557,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,64.0,128,178.9459087753296,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),baseline,80.0,128,182.0184703063965,1,Baseline
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,16.0,128,66.55971737384796,1,Adaptive
+Qwen/Qwen3.5-9B,TTS (Supertonic-3),sslo,48.0,128,262.1107469081879,1,Adaptive

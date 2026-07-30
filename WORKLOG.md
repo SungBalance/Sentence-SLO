@@ -1,5 +1,59 @@
 # Work Log
 
+## 2026-06-11 (chunk_length_study: oracle vs online posterior)
+
+- Added content: `exp/chunk_length_study/replay_posterior.{py,sh}` — GPU-free
+  offline replay of each category's `chunks.jsonl` in chunk-completion-time
+  order, feeding the engine's own `ChunkLengthPredictor` (loaded straight from
+  `vllm/vllm/sslo/slo_state.py`) with the exact `length_tail_prob` gating
+  (warmup 128 / min_denom 4 / cold-start 2048). Reconstructs the continuously
+  updated online posterior ProgressServe sees; compares it against an oracle
+  (full-run empirical distribution) per category.
+- Added content: progress-fraction sharpening axis f∈{0,25,50,75%} — at each f
+  predict remaining length L−⌊f·L⌋ (conditional median), online vs oracle.
+  Outputs `output/stats/oracle_vs_posterior.{json,csv}` (long: category×progress)
+  + plots `posterior_{convergence,sharpening,calibration}.png`.
+- Finding: after the 128-sample warmup gate, online posterior error ≈ oracle to
+  the decimal at every progress level (e.g. en-code c0 4.39/4.39, c75 2.31/2.30);
+  remaining-length MAE falls with progress (~4.4→2.3 tokens at 75%) as the
+  conditional tail tightens. Online-estimation cost is essentially just the
+  warmup gate; cold-eval fraction 0.7–0.9% on these single-rate runs. Tail
+  calibration ECE: late 0.00–0.01, early ≤1024 ~0.10 (cold-start plateau).
+  Nuance: en-dialogue online > oracle at c25 (+0.32) but < oracle at c75 (−0.30)
+  — windowed history tracks the recent tail better deep in the conditioning.
+- Verification: container `py_compile` + `bash -n`; replay ran clean on all 4
+  categories (18.5k–21.4k chunks); plots inspected.
+
+## 2026-06-11 (chunk_length_study: unit distribution + request divergence)
+
+- Added content: `exp/chunk_length_study/analyze_unit_distribution.{py,sh}` —
+  per-category GLOBAL consumable-unit (chunk `num_token`) length distribution
+  (percentiles + hist), and per-request two-sample KS divergence from that
+  global pool over the integer length support. Single KS ranking across
+  categories → top-5 most-divergent requests with characteristics. Drops
+  requests with < MIN_CHUNKS=8 units. Outputs
+  `output/stats/{unit_distribution.json, unit_distribution_global.csv,
+  top_divergent_requests.csv}` + plots `unit_distribution_global.png`,
+  `top_divergent_requests.png`.
+- Added content: `--max-chunk-len` (default 100) excludes runaway un-segmented
+  chunks (no sentence boundary hit; real sentence chunks end by p99.9 ≈ 55–82,
+  >100 is ≤0.08% per category) and reports the dropped count; 0 disables.
+- Finding: global chunk-length distributions are near-identical across
+  categories (median 20–21, p99 43–47), with a hard ~14–16-token floor (min
+  sentence size) and a right skew; en-code has a sharp ~17–18-token peak
+  (code-line structure). With outliers excluded all four collapse to CV ≈
+  0.29–0.31 (ru's raw CV 0.52 was driven entirely by one max=1410-token chunk
+  = an un-segmented wall of text; 15/1/1/0 chunks dropped >100). Top-5 divergent
+  requests (KS 0.54–0.62) split into two failure modes vs the global posterior:
+  (a) uniformly short, low-variance streams — zh req442 (119 chunks, median 17,
+  CV ×0.31, a lat/long coordinate list); (b) uniformly long streams — en req510
+  / ru req505 / en req371 (median 29–30 vs global 20, +9–10 shift). These are
+  the requests a global posterior systematically mis-centres → evidence for
+  where per-request adaptation (vs pure global) would help.
+- Verification: container `py_compile` + `bash -n`; ran clean on all 4
+  categories; fixed a hist-binning artifact (bin within 99.5-pctile window so
+  ru's 1410-token outlier doesn't flatten every bin); plots inspected.
+
 ## 2026-05-28 (plots/figures updates)
 
 - Modified content: Regenerated Figure 6.7g as a request-rate grouped plot under the `<0.5%` unit-miss budget, keeping Baseline/Ours color grouping and annotating the selected batch size for each request rate.
