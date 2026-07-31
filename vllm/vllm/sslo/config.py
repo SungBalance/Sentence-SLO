@@ -75,6 +75,24 @@ class SsloConfig:
     # lower per-iteration latency so the few urgent requests meet their
     # deadlines. See vllm.sslo.progress_serve.pick_adaptive_batch.
     adaptive_batching: bool = False
+    # KV offload tier. When True, ProgressServe may vacate the KV blocks of
+    # slack-deep deferred requests to CPU (freeing GPU headroom) and prefetch
+    # them back before their deadline approaches. Only valid under
+    # method == "progress_serve".
+    kv_offload: bool = False
+    # Onload lead: restore a CPU-resident request this many decode iterations
+    # before its deadline horizon so the CPU→GPU transfer is hidden. Enters
+    # the risk math as N_defer_cpu = floor(max(H_q - 1 - lead, 0) * s).
+    kv_onload_lead_iters: int = 2
+    # Risk-penalty epsilon (in tail-posterior probability units) separating
+    # vacate-eligible from promote-eligible requests. A CPU stay is cheap
+    # (M_cpu <= eps) → vacate candidate; once the lead penalty surfaces in the
+    # risk (M_cpu > eps) → promote candidate.
+    kv_offload_risk_eps: float = 1e-3
+    # Anti-thrash guard: once onload completes, a request may not be
+    # re-vacated within this many scheduler steps. 0 disables. The step-count
+    # check itself lives in the scheduler (stage 2); this is the knob only.
+    kv_offload_min_residency_steps: int = 0
 
     def __post_init__(self) -> None:
         if self.method not in ("baseline", "progress_serve"):
@@ -148,3 +166,19 @@ class SsloConfig:
             raise ValueError(
                 "progress_serve_min_denom must be >= 1, "
                 f"got {self.progress_serve_min_denom}")
+        if self.kv_offload and self.method != "progress_serve":
+            raise ValueError(
+                "kv_offload requires method='progress_serve', "
+                f"got method={self.method!r}")
+        if self.kv_onload_lead_iters < 0:
+            raise ValueError(
+                "kv_onload_lead_iters must be >= 0, "
+                f"got {self.kv_onload_lead_iters}")
+        if self.kv_offload_risk_eps < 0:
+            raise ValueError(
+                "kv_offload_risk_eps must be >= 0, "
+                f"got {self.kv_offload_risk_eps}")
+        if self.kv_offload_min_residency_steps < 0:
+            raise ValueError(
+                "kv_offload_min_residency_steps must be >= 0 (0 disables), "
+                f"got {self.kv_offload_min_residency_steps}")

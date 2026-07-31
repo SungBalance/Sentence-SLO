@@ -5,7 +5,8 @@
 #   run_test.sh <run_kind> <max_num_seqs> <model>
 #
 # Required positional args:
-#   $1  run_kind   (baseline | progress_serve | progress_serve_adaptive)
+#   $1  run_kind   (baseline | progress_serve | progress_serve_adaptive |
+#                   progress_serve_offload)
 #   $2  max_num_seqs
 #   $3  model
 #
@@ -21,6 +22,16 @@
 #   CHUNK_UNIT=sentence
 #   SECONDS_PER_WORD=0.28
 #   CUDA_VISIBLE_DEVICES=1
+#
+# KV offload tier (progress_serve_offload run_kind only; read by run_test.py):
+#   CPU_OFFLOAD_GB=16                       CPU KV-offload capacity (GB)
+#   SSLO_KV_ONLOAD_LEAD_ITERS               onload lead (iters)
+#   SSLO_KV_OFFLOAD_RISK_EPS                vacate/promote risk epsilon
+#   SSLO_KV_OFFLOAD_MIN_RESIDENCY_STEPS     anti-thrash guard (steps; 0 = off)
+# progress_serve_offload wires the SimpleCPUOffloadConnector and forces
+# enable_prefix_caching in run_test.py — no extra env needed. Offload events
+# are recorded per-step in scheduler_stats.jsonl / decisions.jsonl (no
+# separate offload log file).
 #
 # Run inside the sk-sslo container from /workspace/mlsys.
 set -euo pipefail

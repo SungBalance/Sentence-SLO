@@ -129,6 +129,49 @@ def test_on_step_tracks_total_and_prefill_counts():
     assert stats.prefill_step_count == 2
 
 
+def test_offload_enter_exit_accumulates_time_and_intervals():
+    state = RequestSLOState(num_warmup_chunks=1)
+    state.on_offload_enter(1.0)
+    state.on_offload_enter(1.2)  # idempotent while already offloaded
+    assert state.num_offload_intervals == 1
+    state.on_offload_exit(1.5)
+    assert state.total_offloaded_time_s == pytest.approx(0.5)
+    assert state.num_onloads == 1
+    assert state.offload_enter_ts is None
+    # exit without a matching enter is a no-op.
+    state.on_offload_exit(2.0)
+    assert state.num_onloads == 1
+    # a second cycle accumulates onto the running totals.
+    state.on_offload_enter(2.0)
+    state.on_offload_exit(2.3)
+    assert state.num_offload_intervals == 2
+    assert state.num_onloads == 2
+    assert state.total_offloaded_time_s == pytest.approx(0.8)
+
+
+def test_chunk_record_num_offloaded_iters():
+    state = RequestSLOState(num_warmup_chunks=1)
+    state.on_token(0.0)
+    state.chunk_stats.accumulate_offloaded_step()
+    state.chunk_stats.accumulate_offloaded_step()
+    state.on_chunk_boundary(0.1, word_count=2, consume_duration=1.0)
+    assert state.chunk_records[0].num_offloaded_iters == 2
+    # Counter resets for the next chunk window.
+    state.on_token(0.2)
+    state.on_chunk_boundary(0.3, word_count=1, consume_duration=1.0)
+    assert state.chunk_records[1].num_offloaded_iters == 0
+
+
+def test_compute_stats_reflects_offload_counters():
+    state = RequestSLOState(num_warmup_chunks=1)
+    state.on_offload_enter(1.0)
+    state.on_offload_exit(1.4)
+    stats = state.compute_stats()
+    assert stats.total_offloaded_time_s == pytest.approx(0.4)
+    assert stats.num_offload_intervals == 1
+    assert stats.num_onloads == 1
+
+
 def test_chunk1_records_real_deadline_miss():
     # Chunk 1+ uses the real deadline miss computation. Stall-aware deadline
     # propagation: after chunk 0 finishes at t=0.5 with consume_time=1.0,

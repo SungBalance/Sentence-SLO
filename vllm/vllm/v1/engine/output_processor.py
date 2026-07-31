@@ -722,6 +722,9 @@ class OutputProcessor:
                 s.total_pending_time_s = snap.total_pending_time_s
                 s.total_step_count = snap.total_step_count
                 s.prefill_step_count = snap.prefill_step_count
+                s.total_offloaded_time_s = snap.total_offloaded_time_s
+                s.num_offload_intervals = snap.num_offload_intervals
+                s.num_onloads = snap.num_onloads
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(

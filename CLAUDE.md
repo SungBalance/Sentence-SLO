@@ -4,73 +4,58 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 @AGENTS.md
 
-## Experiment Pipeline Architecture
+## Project Architecture
 
-The project measures *sentence-level output (SSLO) slack* — whether an LLM produces text fast enough for a human reader or a TTS engine to consume it chunk-by-chunk without waiting. It runs as a three-stage pipeline entirely inside Docker containers.
-
-### Stage overview
-
-| Stage | Script | Container | What it does |
-|-------|--------|-----------|--------------|
-| 1 | `exp/benchmark.py` | `sk-sslo` | Runs vLLM async inference; records request metrics and per-chunk timestamps from the streamed output |
-| 2 | `exp/audio_duration.py` | `sk-sslo-omni` | Calls Qwen3-TTS on each text chunk and records audio duration |
-| 3 | `exp/analyze_results.py` | `sk-sslo` | Joins chunk timelines with audio durations, computes slack for one mode, writes result rows and plot |
-
-The launcher `exp/run_experiment.sh` drives all three stages in sequence, iterating over `MODELS` and `SLACK_MODES` arrays defined near the top of the file. There is no make/pytest build system — the `.sh` files are self-contained.
-
-For human-reading-only runs (skips TTS), use `exp/run_experiment_read.sh` instead; it attaches both `sentence` and `paragraph` chunk collectors to the same inference pass.
-
-### Running the full experiment (from the host)
-
-```bash
-bash exp/run_experiment.sh
-```
-
-Both containers (`sk-sslo`, `sk-sslo-omni`) must be running before executing the launcher. The launcher calls `docker exec` internally.
-
-### Running a single pipeline stage manually
-
-```bash
-# Stage 1 — LLM inference (inside sk-sslo)
-docker exec sk-sslo bash -lc '
-  cd /workspace/mlsys
-  export HF_HOME=/cache HF_HUB_CACHE=/cache/hub
-  python3 exp/benchmark.py \
-    --model Qwen/Qwen3.5-35B-A3B \
-    --dataset-name hf --dataset-path Aeala/ShareGPT_Vicuna_unfiltered \
-    --num-prompts 48 --output-dir exp/output/test/sentence/text_outputs
-'
-```
-
-### Key source files
-
-- `exp/benchmark.py` — Stage 1; defines `StreamingChunkCollector` (sentence/paragraph boundary detection from the stream receive path), request arrival pacing, and timeline record schema.
-- `exp/audio_duration.py` — Stage 2; runs vLLM-Omni TTS with a per-chunk cache (`duration_cache.jsonl`) so re-runs are incremental.
-- `exp/analyze_results.py` — Stage 3; reads text + audio paths, applies slack math via `add_deadline_slack_columns`, plots `slack_distribution.png`.
-- `exp/common/slack_utils.py` — Shared helpers: output path constructors (`text_output_paths`, `audio_duration_paths`, `result_output_paths`), slack math (`add_deadline_slack_columns`, `build_slack_rows`, `attach_audio_timeline`), and I/O utilities.
-- `exp/configs/qwen3_tts_omni_batch.yaml` — Template TTS stage config rendered at runtime into `exp/output/_runtime/qwen3_tts_omni.yaml`.
+The project measures and enforces *sentence-level output SLOs (SSLO)*: each LLM request is modeled as a stream of sentence/paragraph chunks ("consumable units"), each chunk gets a wall-clock deadline derived from consumer speed (human reading rate or a measured TTS profile), and a modified vLLM scheduler (the **ProgressServe** policy) spends the resulting slack on extra admissions to raise GPU occupancy without breaking per-chunk deadlines.
 
 ### SSLO vLLM package (`vllm/vllm/sslo/`)
 
-- `config.py` — `SsloConfig` dataclass: scheduling-mode (`enabled`, `method ∈ {"baseline","sslo"}`, `enable_v2`), hysteresis thresholds, adaptive-batching ratios, offload knobs, chunk-unit / words-per-second.
-- `slo_state.py` — `RequestSLOState` per-request state: pressure / deadline math, chunk records (with predicted vs actual length), pending/offload lifecycle counters, chunk-length predictor (`p90` / `ema`).
+- `config.py` — `SsloConfig` dataclass: `method ∈ {"baseline","progress_serve"}` (`baseline` records metrics but skips SSLO placement), chunk unit (`sentence`/`paragraph`), chunk-length predictor strategy (`ema`/`p90`/`p99`), consume mode (`read` fixed seconds-per-word / `tts` profile CSV), KV-aware admission cap (`kv_blocks_per_new_admit`), `adaptive_batching`, KV offload tier (`kv_offload` + `kv_onload_lead_iters` / `kv_offload_risk_eps` / `kv_offload_min_residency_steps`), decision-log knobs.
+- `progress_serve.py` — pure-function ProgressServe math (no engine imports, unit-testable): per-request run/defer violation risks from posterior length-tail probabilities, admission search for the largest `k*` with expected violations `E_viol < 1` (`schedule_step`), and deadline-driven decode-batch shrink (`pick_adaptive_batch`).
+- `slo_state.py` — `RequestSLOState` lifecycle (`PREFILL → WARMUP → MEASURED`), deadline recurrence, `ChunkSeparator` (streaming sentence/paragraph boundary detection with `min_chunk_tokens` merging), `ChunkLengthPredictor` (per-request + shared-global hybrid, empirical tail for ProgressServe), `ChunkConsumeEstimator`/`TtsProfileConsumeEstimator`, `ChunkRecord` diagnostics.
+
+Integration points outside `vllm/vllm/sslo/` are marked with `# SSLO` line comments (`grep -rn "# SSLO" vllm/vllm/`); the densest is `vllm/v1/core/sched/scheduler.py` (`schedule_sslo()` replaces vanilla `schedule()` when SSLO is enabled). Tests live in `vllm/tests/sslo/`.
+
+### Experiment map (`exp/`)
+
+Each experiment folder has its own `README.md` — consult it before running. There is no make/pytest build system; the `.sh` launchers are self-contained with options as constants at the top.
+
+| Folder | Purpose |
+|--------|---------|
+| `run_sslo/` | **Main end-to-end sweep**: `baseline` vs `progress_serve` vs `progress_serve_adaptive` vs `progress_serve_offload` (KV offload tier) over `max_num_seqs × request_rate × chunk_unit × consume_mode`. `run_test.py` (single-config runner; sweeps rates in one engine via `reset_sslo_state`), `run_test.sh` (env wrapper), `run_sweep.sh` (multi-GPU orchestration + `summary.csv`), `analyze.py` (per-cell `summary.json`), `analysis/` (aggregators, diagnostics, plots), `profiles/` (canonical TTS consume profile CSV). |
+| `measure_batch/` | Baseline vLLM batch-size knee (where throughput gain per doubling drops below 10%). |
+| `measure_internal_slack/` | Cumulative slack distribution vs human reading speed (model size × chunk index × sentence/paragraph). |
+| `measure_KV_overhead/` | KV block GPU↔CPU offload/onload transfer time and bandwidth profile. |
+| `measure_tts_duration/` | word_count → TTS audio duration regression; source of the TTS consume profile. |
+| `chunk_length_study/` | Chunk-length vs request-length variability; oracle vs online posterior predictor replay. |
+| `plots/` | Paper Figures 5/6/7 (`figures/` = script tree + data contract README; `figures_adaptive/`, `figures_progress_serve/` = per-policy renders). |
+| `tools/` | Shared dataset loaders (wildchat/lmsys, code-request classifier) and dataset cache. |
+
+### Running the main sweep
+
+Inside the `sk-sslo` container, from `/workspace/mlsys`:
+
+```bash
+# Single mode / single config
+OUTPUT_DIR=exp/run_sslo/output/test \
+bash exp/run_sslo/run_test.sh progress_serve 64 Qwen/Qwen3-8B
+
+# Full sweep, 3 repeats, 4-GPU parallel
+PARALLEL=4 bash exp/run_sslo/run_sweep.sh 3
+```
+
+Consume mode is selected via env: `CONSUME_MODE=read` (default) or `CONSUME_MODE=tts` (requires `TTS_PROFILE_PATH` and `TTS_MODEL`).
 
 ### Output layout
 
 ```
-exp/output/{model_slug}/{dataset_slug}/{slack_mode}/
-  text_outputs/         ← Stage 1 writes here
-  audio_durations/      ← Stage 2 writes here
-  results/              ← Stage 3 writes here
+exp/run_sslo/output_sweep/{chunk_unit}/seqs_{N}/rate_{r}/run_{i}/
+  requests.jsonl          ← per-request latency rows (mode column prepended)
+  chunks.jsonl            ← per-chunk records (deadline, slack, predictor)
+  scheduler_stats.jsonl   ← per-step scheduler stats (sslo modes)
+  summary.json            ← analyze.py aggregate for the cell
+  run_status.json
 ```
-
-Slugs are produced by `slugify()` in the launcher: `/` → `__`, unsafe chars → `_`.
-
-### Slack modes
-
-Two modes select different columns from `add_deadline_slack_columns`:
-- `previous_chunk` — deadline for chunk N is set by the end of chunk N-1 plus its consumption time.
-- `cumulative` — deadline is the sum of all prior chunk consumption times from decoding start.
 
 
 # Work Guideline

@@ -312,6 +312,7 @@ async def collect_one(
     measurement_counter: list[int],
     measurement_target: int,
     window_ts_holder: dict[str, float | None],
+    kv_offload: bool = False,
 ) -> dict[str, Any]:
     """Stream one request. Tracks two completion gates:
       - warmup_event fires when `warmup_target` completions reached
@@ -381,6 +382,18 @@ async def collect_one(
     num_pending_iters_per_request = (
         getattr(sslo_metrics, "num_pending_intervals", 0) if sslo_metrics else 0
     )
+    # KV offload tier lifecycle counters. SsloRequestStats always carries
+    # these (default 0.0/0/0) regardless of mode, so gate on the offload
+    # run kind — non-offload rows emit None so analyze.py omits the offload
+    # aggregate (the "silently omit" contract).
+    if kv_offload and sslo_metrics:
+        total_offloaded_time_s = getattr(sslo_metrics, "total_offloaded_time_s", None)
+        num_offload_intervals = getattr(sslo_metrics, "num_offload_intervals", None)
+        num_onloads = getattr(sslo_metrics, "num_onloads", None)
+    else:
+        total_offloaded_time_s = None
+        num_offload_intervals = None
+        num_onloads = None
 
     admitted_ts_val = (
         getattr(sslo_metrics, "admitted_ts", None) if sslo_metrics else None
@@ -469,6 +482,10 @@ async def collect_one(
         "slo_chunk_records": slo_chunk_records,
         "total_pending_time_s": total_pending_time_s,
         "num_pending_iters_per_request": num_pending_iters_per_request,
+        # KV offload tier lifecycle (progress_serve_offload mode).
+        "total_offloaded_time_s": total_offloaded_time_s,
+        "num_offload_intervals": num_offload_intervals,
+        "num_onloads": num_onloads,
         # CP-SLO lifecycle fields.
         "admitted_ts": admitted_ts_val,
         "consume_start_time": consume_start_time_val,
@@ -613,6 +630,21 @@ async def run_one(args: argparse.Namespace) -> None:
         sslo_params["adaptive_batching"] = (
             args.run_kind == "progress_serve_adaptive"
             or os.environ.get("SSLO_ADAPTIVE_BATCHING", "0") != "0")
+    # SSLO: KV offload tier — vacate deep-slack deferred requests' KV to CPU
+    # to reclaim admission headroom under KV pressure, prefetch back before
+    # their deadline. Only for progress_serve_offload. Numeric knobs default
+    # to SsloConfig; env overrides mirror the SSLO_ADAPTIVE_BATCHING pattern.
+    if args.run_kind == "progress_serve_offload":
+        sslo_params["kv_offload"] = True
+        for env_name, key, cast in (
+            ("SSLO_KV_ONLOAD_LEAD_ITERS", "kv_onload_lead_iters", int),
+            ("SSLO_KV_OFFLOAD_RISK_EPS", "kv_offload_risk_eps", float),
+            ("SSLO_KV_OFFLOAD_MIN_RESIDENCY_STEPS",
+             "kv_offload_min_residency_steps", int),
+        ):
+            v = os.environ.get(env_name)
+            if v is not None:
+                sslo_params[key] = cast(v)
     # SSLO
     if args.consume_mode == "tts":
         # SSLO
@@ -637,6 +669,25 @@ async def run_one(args: argparse.Namespace) -> None:
     if args.max_model_len > 0:
         engine_kwargs["max_model_len"] = args.max_model_len
     # else: omit so vLLM picks the model's config max.
+    # SSLO: the KV offload tier needs the CPU-offload connector. Eager
+    # mirroring (lazy_offload=False) keeps a CPU copy of every block so a
+    # vacate is ~free; SimpleCPUOffloadConnector self-disables unless
+    # enable_prefix_caching is True, so force it on here (offload mode only —
+    # other modes keep the engine default). CPU capacity from CPU_OFFLOAD_GB
+    # (default 16). Non-offload modes carry no kv_transfer plumbing.
+    if args.run_kind == "progress_serve_offload":
+        from vllm.config import KVTransferConfig
+        cpu_offload_gb = float(os.environ.get("CPU_OFFLOAD_GB", "16"))
+        engine_kwargs["kv_transfer_config"] = KVTransferConfig(
+            kv_connector="SimpleCPUOffloadConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "cpu_bytes_to_use": int(cpu_offload_gb * (1024**3)),
+                "lazy_offload": False,
+            },
+        )
+        engine_kwargs["disable_hybrid_kv_cache_manager"] = False
+        engine_kwargs["enable_prefix_caching"] = True
     if args.enable_thinking:
         engine_kwargs["reasoning_parser"] = "qwen3"
     engine_args = AsyncEngineArgs(**engine_kwargs)
@@ -1091,7 +1142,8 @@ async def _run_one_rate(
                 _per_req_sampling_params(global_idx),
                 inj_ts, warmup_event, warmup_counter, warmup_target,
                 measurement_done_event, measurement_counter,
-                measurement_target, window_ts_holder))
+                measurement_target, window_ts_holder,
+                kv_offload=bool(sslo_params.get("kv_offload", False))))
             injected.append((global_idx, task, inj_ts))
             await asyncio.sleep(rng.expovariate(rate))
 
@@ -1165,6 +1217,10 @@ async def _run_one_rate(
             "request_cu_slo_violated_tau_1",
             "request_cu_slo_violated_tau_2",
             "request_cu_slo_violated_tau_5",
+            # KV offload tier lifecycle (progress_serve_offload mode).
+            "total_offloaded_time_s",
+            "num_offload_intervals",
+            "num_onloads",
         )
         request_rows = [
             {field: row.get(field) for field in request_fields}

@@ -1,5 +1,45 @@
 # Work Log
 
+## 2026-07-31 (KV offload tier: stage 3 — harness + docs)
+
+- Modified content: `exp/run_sslo/run_test.py` — new run kind
+  `progress_serve_offload` wires `kv_offload=True` into `sslo_params` (env
+  overrides `SSLO_KV_ONLOAD_LEAD_ITERS` / `SSLO_KV_OFFLOAD_RISK_EPS` /
+  `SSLO_KV_OFFLOAD_MIN_RESIDENCY_STEPS`, mirroring `SSLO_ADAPTIVE_BATCHING`)
+  and attaches `KVTransferConfig(kv_connector="SimpleCPUOffloadConnector",
+  kv_role="kv_both", ...)` in eager mode with `enable_prefix_caching=True` and
+  CPU capacity from `CPU_OFFLOAD_GB` (default 16) — offload mode only. `collect_one`
+  surfaces `total_offloaded_time_s` / `num_offload_intervals` / `num_onloads`
+  from `sslo_metrics` into `requests.jsonl`, gated on `kv_offload`: since
+  `SsloRequestStats` always carries these fields (default 0.0/0/0) regardless of
+  mode, non-offload rows emit `None` so analyze.py's None-gate omits them.
+- Modified content: `exp/run_sslo/metrics_utils.py` — `MODES_DEFAULT` gains
+  `progress_serve_offload`; new `KV offload` DISPLAY_GROUP (offloaded time +
+  onloads/req). `exp/run_sslo/analyze.py` — `SSLO_MODES` gains the mode;
+  `offload_request_stats()` emits `metrics.offload.<mode>` (omitted when rows
+  carry no offload fields → backward-compatible).
+- Modified content: `exp/run_sslo/run_test.sh` (usage + KV-offload env doc),
+  `run_sweep.sh` (mode list note — offload selectable via `MODES`),
+  `README.md` (4 modes, offload requirements/metrics, dropped stale
+  `SSLO_OFFLOAD_LOG_PATH` / `offload_log.jsonl` references).
+- Modified content: docs — `vllm/vllm/sslo/README.md` (§9 KV Offload Tier:
+  motivation, 3-state math N_defer_cpu/R_defer_cpu/M_cpu, eager-mirror
+  mechanism, config table; §10 Related legacy sentence corrected),
+  `CLAUDE.md` (kv_offload knobs + run_sslo mode list).
+- Verification: isolated `sk-specllm` container (this repo is not mounted, so
+  files copied in). Modified `exp/run_sslo/*.py` pass `python3 -m py_compile`;
+  `.sh` pass `bash -n`; `analyze.offload_request_stats` exercised on
+  pipeline-shaped rows — non-offload rows (`collect_one` emits `None` when
+  `kv_offload` is off) → `None` (omitted); offload rows carrying real floats
+  incl `0.0` → distribution dict. Pure-layer pytest (100 passed) unchanged —
+  no vLLM code touched. e2e / manager tests need `sk-sslo` (absent here), not run.
+- Open risk: the scheduler-side offload counters reach `requests.jsonl` only
+  once vLLM propagates them via `SsloSchedulerSnapshot` (stage 1/2). Today the
+  snapshot + output_processor merge carry pending/step scalars but NOT the
+  offload fields, so `total_offloaded_time_s` / `num_onloads` read as their
+  `SsloRequestStats` defaults (0) until that wiring lands. Not touched here
+  (vLLM code out of scope); flagged for the scheduler tier.
+
 ## 2026-06-11 (chunk_length_study: oracle vs online posterior)
 
 - Added content: `exp/chunk_length_study/replay_posterior.{py,sh}` — GPU-free

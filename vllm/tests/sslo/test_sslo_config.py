@@ -119,3 +119,31 @@ def test_adaptive_batching_default_and_settable():
     assert SsloConfig().adaptive_batching is False
     assert SsloConfig(method="progress_serve",
                       adaptive_batching=True).adaptive_batching is True
+
+
+def test_kv_offload_defaults():
+    cfg = SsloConfig()
+    assert cfg.kv_offload is False
+    assert cfg.kv_onload_lead_iters == 2
+    assert cfg.kv_offload_risk_eps == 1e-3
+    assert cfg.kv_offload_min_residency_steps == 0
+
+
+def test_kv_offload_requires_progress_serve():
+    with pytest.raises(ValueError, match="kv_offload"):
+        SsloConfig(kv_offload=True)  # method defaults to baseline
+    cfg = SsloConfig(method="progress_serve", kv_offload=True)
+    assert cfg.kv_offload is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("kv_onload_lead_iters", -1),
+        ("kv_offload_risk_eps", -0.1),
+        ("kv_offload_min_residency_steps", -1),
+    ],
+)
+def test_kv_offload_validation_rejects_negative(field, value):
+    with pytest.raises(ValueError, match=field):
+        SsloConfig(**{field: value})

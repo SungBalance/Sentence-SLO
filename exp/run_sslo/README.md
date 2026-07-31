@@ -9,9 +9,10 @@ sweeps `max_num_seqs`, `request_rate`, and `chunk_unit` (sentence / paragraph).
 - `run_test.py`: inference-only runner. Runs ONE mode for ONE config and writes
   its JSONLs. No subprocess spawning, no GPU memory polling.
 - `run_test.sh <run_kind> <max_num_seqs> <model>`: thin shell wrapper around
-  `run_test.py`. Sets HF cache env vars, `SSLO_STATS_LOG_PATH` (for sslo*
-  modes), and `SSLO_OFFLOAD_LOG_PATH` (for offload modes). All other settings
-  come from env vars (see script header for defaults).
+  `run_test.py`. Sets HF cache env vars and `SSLO_STATS_LOG_PATH` (for sslo*
+  modes). All other settings come from env vars (see script header for
+  defaults). For `progress_serve_offload`, KV-offload knobs (`CPU_OFFLOAD_GB`,
+  `SSLO_KV_ONLOAD_LEAD_ITERS`, ...) are read directly by `run_test.py`.
 - `run_sweep.sh [num_runs=3]`: unified full-sweep launcher over
   `CHUNK_UNITS × MAX_NUM_SEQS_VALUES × REQUEST_RATES × N runs × modes`.
   Handles per-mode subprocess invocation, GPU memory drain polling between
@@ -35,10 +36,19 @@ sweeps `max_num_seqs`, `request_rate`, and `chunk_unit` (sentence / paragraph).
 
 ## Modes
 
-Five scheduling modes are supported:
-`baseline`, `sslo`, `sslo_offload`, `sslo_adaptive`, `sslo_adaptive_offload`.
+Four scheduling modes are supported (see `MODES_DEFAULT` in `metrics_utils.py`):
+`baseline`, `progress_serve`, `progress_serve_adaptive`, `progress_serve_offload`.
 
-All aggregators default to all 5 modes. Pass `--modes baseline,sslo` to restrict.
+`progress_serve_offload` runs `progress_serve` with the KV offload tier
+(`kv_offload=True`). It requires the CPU-offload connector — `run_test.py`
+wires `KVTransferConfig(kv_connector="SimpleCPUOffloadConnector", ...)` in eager
+mode and forces `enable_prefix_caching=True` (the connector self-disables
+without it). CPU capacity comes from `CPU_OFFLOAD_GB` (default 16). Offload
+events are recorded per-step in `scheduler_stats.jsonl` / `decisions.jsonl`
+(`num_offloaded`, `kv_capped`, `k_star_unconstrained`); there is no separate
+offload log file.
+
+All aggregators default to all modes. Pass `--modes baseline,progress_serve` to restrict.
 
 ## Chunk Units
 
@@ -57,10 +67,10 @@ Single mode run:
 
 ```bash
 OUTPUT_DIR=exp/run_sslo/output/test \
-bash exp/run_sslo/run_test.sh sslo 64 Qwen/Qwen3-8B
+bash exp/run_sslo/run_test.sh progress_serve 64 Qwen/Qwen3-8B
 ```
 
-Full sweep, sequential (both chunk units, 5 modes, N=3 runs):
+Full sweep, sequential (2 default modes `baseline,progress_serve`, N=3 runs):
 
 ```bash
 bash exp/run_sslo/run_sweep.sh 3
@@ -88,8 +98,7 @@ seqs_${seqs}/
     run_{i}/
       requests.jsonl          (all modes, mode column prepended)
       chunks.jsonl            (all modes, mode column prepended)
-      scheduler_stats.jsonl   (sslo* modes only)
-      offload_log.jsonl       (offload modes only)
+      scheduler_stats.jsonl   (sslo* modes only; carries per-step offload counters)
       summary.json
       run_status.json
 ```
@@ -108,6 +117,7 @@ Six files per cell (down from ~22). Per-mode tmp files (`requests_${mode}.jsonl`
 - `metrics.slo_compliance.<mode>`: Compliance
 - `metrics.scheduler.<sslo_mode>.{running, combined}`: Distribution
 - `metrics.pending.<sslo_mode>.{time, intervals}`: Distribution
+- `metrics.offload.<offload_mode>.{total_offloaded_time_s, num_onloads}`: Distribution (only when the requests carry KV-offload fields; omitted otherwise)
 - `metrics.inter_chunk_delay.<mode>`: Distribution
 - `queue_stall_available`: bool
 - `scheduler_saturation.<sslo_mode>`: {max_combined, iterations_above_cap, max_pending}

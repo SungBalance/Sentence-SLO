@@ -12,6 +12,8 @@ MODES_DEFAULT = (
     "progress_serve",
     # SSLO
     "progress_serve_adaptive",
+    # SSLO
+    "progress_serve_offload",
 )
 
 
@@ -98,6 +100,10 @@ DISPLAY_GROUPS: tuple[tuple[str, tuple[MetricSpec, ...]], ...] = (
         MetricSpec(("handling_users",), "p95",      1.0, "{:.2f}", "handling users p95"),
         MetricSpec(("handling_users",), "p99",      1.0, "{:.2f}", "handling users p99"),
         MetricSpec(("handling_users",), "max",      1.0, "{:.2f}", "handling users max"),
+    )),
+    ("KV offload", (
+        *_dist_specs(("offload", "total_offloaded_time_s"), 1.0, "{:.3f}", "offloaded time (s)"),
+        *_dist_specs(("offload", "num_onloads"),            1.0, "{:.2f}", "onloads/req"),
     )),
     ("CP-SLO violation", (
         MetricSpec(("cp_slo_violation", "tau_0.5"), "rate", 100, "{:.2f}", "CP-SLO viol @ tau=0.5s (%)"),

@@ -4,13 +4,19 @@ from __future__ import annotations
 
 from vllm.sslo.progress_serve import (
     E_VIOL_FEASIBLE,
+    LOC_CPU,
+    LOC_ONLOADING,
     ProgressView,
     build_plan,
     horizon,
+    n_defer_cpu,
     n_run_defer,
     pick_adaptive_batch,
     request_risk,
+    request_risk_cpu,
     schedule_step,
+    select_promote,
+    select_vacate,
     service_share,
 )
 
@@ -28,6 +34,10 @@ def _forced(rid: str) -> ProgressView:
 
 def _new_admit(rid: str) -> ProgressView:
     return ProgressView(rid, 0, None, PHASE_PREFILL, True, lambda x: 1.0)
+
+
+def _cpu(rid: str, c_q: int, t_q: float, tail) -> ProgressView:
+    return ProgressView(rid, c_q, t_q, PHASE_MEASURED, False, tail, LOC_CPU)
 
 
 # ---- horizon ----------------------------------------------------------
@@ -256,3 +266,188 @@ def test_pick_adaptive_batch_skips_missing_ema():
     got, _ = pick_adaptive_batch(views, 128, deltas[128], cands, delta_of)
     # 64 (no EMA) is skipped; descent still reaches 32 and stops at 16.
     assert got == 32
+
+
+# ---- n_defer_cpu / request_risk_cpu -----------------------------------
+
+def test_n_defer_cpu_equals_n_defer_at_zero_lead():
+    for h in (0, 1, 5, 10):
+        for s in (0.5, 1.0):
+            assert n_defer_cpu(h, s, 0) == n_run_defer(h, s)[1]
+
+
+def test_n_defer_cpu_lead_reduces_and_clamps():
+    assert n_defer_cpu(10, 1.0, 2) == 7  # floor(max(10-1-2,0)*1)
+    assert n_defer_cpu(2, 1.0, 5) == 0  # max(...,0) clamp
+
+
+def test_request_risk_cpu_monotone():
+    # R_run <= R_defer <= R_defer_cpu (tail non-increasing, fewer usable
+    # iters on CPU), M_cpu >= 0.
+    tail = lambda x: max(0.0, 1.0 - x / 1000.0)
+    v = _measurable("q", c_q=10, t_q=10.0, tail=tail)
+    r_run, r_defer, _m = request_risk(v, delta=0.1, s=1.0)
+    r_defer2, r_defer_cpu, m_cpu = request_risk_cpu(
+        v, delta=0.1, s=1.0, lead=2)
+    assert abs(r_defer - r_defer2) < 1e-9
+    assert r_run <= r_defer <= r_defer_cpu
+    assert abs(m_cpu - (r_defer_cpu - r_defer)) < 1e-9
+    assert m_cpu >= 0.0
+
+
+# ---- build_plan: KV-offload locations ---------------------------------
+
+def test_build_plan_cpu_no_slot_contributes_rdefer_cpu():
+    cpu = _cpu("c", 0, 11.0, _T2)
+    v1 = _measurable("v1", 0, 11.0, _T1)
+    plan = build_plan([v1, cpu], [], b=1, delta=1.0, lead=0)
+    # CPU req holds no slot: absent from scheduled/deferred/risks, present
+    # in offloaded_A + cpu_risks.
+    assert plan.offloaded_A == ["c"]
+    assert "c" in plan.cpu_risks
+    assert "c" not in plan.scheduled_A
+    assert "c" not in plan.deferred_A
+    assert "c" not in plan.risks
+    # E_viol = R_run(v1) + R_defer_cpu(c).
+    r_defer_cpu = plan.cpu_risks["c"][1]
+    r_run_v1 = plan.risks["v1"][0]
+    assert abs(plan.e_viol - (r_run_v1 + r_defer_cpu)) < 1e-9
+
+
+def test_build_plan_service_share_excludes_cpu():
+    # A lone GPU measurable with one CPU sibling: |A+| must be 1 (CPU out),
+    # so s = min(1, B/1). If CPU were counted, s would halve and change R_run.
+    v1 = _measurable("v1", 0, 11.0, _T1)
+    cpu = _cpu("c", 0, 11.0, _T2)
+    plan = build_plan([v1, cpu], [], b=1, delta=1.0)
+    s = service_share(1, 1)  # n_aplus == 1
+    nr, _nd = n_run_defer(horizon(11.0, 1.0), s)
+    assert abs(plan.risks["v1"][0] - _T1(nr)) < 1e-9
+
+
+def test_build_plan_onloading_takes_slot_excluded_from_eviol():
+    # ONLOADING measurable with saturated tail: if mistreated as a GPU
+    # measurable it would add 1.0 to E_viol. As ONLOADING it takes a slot
+    # and is excluded from the sum (forced-like) but stays in |A+|.
+    on = ProgressView(
+        "on", 0, 10.0, PHASE_MEASURED, False, lambda x: 1.0, LOC_ONLOADING)
+    v1 = _measurable("v1", 0, 11.0, _T1)
+    plan = build_plan([on, v1], [], b=2, delta=1.0)
+    assert "on" in plan.scheduled_A
+    assert "on" not in plan.risks
+    # decode_cap = 2 - 0(forced) - 1(onloading) - 0 = 1 → v1 scheduled.
+    assert "v1" in plan.scheduled_A
+    assert abs(plan.e_viol - plan.risks["v1"][0]) < 1e-9
+
+
+# ---- schedule_step: kv_capped -----------------------------------------
+
+def test_schedule_step_kv_capped_reports_unconstrained():
+    # E_viol always 0 (zero risk), KV caps at 2 but 5 could be admitted.
+    waiting = [_new_admit(f"w{i}") for i in range(5)]
+    res = schedule_step([], waiting, b=8, delta=1.0,
+                        kv_feasible=lambda k: k <= 2)
+    assert res.k_star == 2
+    assert res.k_star_unconstrained == 5
+    assert res.kv_capped is True
+
+
+def test_schedule_step_not_capped_when_eviol_bounds():
+    # Decreasing tail → E_viol stops the scan before KV ever bites.
+    tail = lambda x: max(0.0, 1.0 - x / 6.0)
+    a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(3)]
+    waiting = [_new_admit(f"w{i}") for i in range(5)]
+    res = schedule_step(a, waiting, b=3, delta=1.0,
+                        kv_feasible=lambda k: True)
+    assert res.kv_capped is False
+    assert res.k_star_unconstrained == res.k_star
+
+
+# ---- select_vacate ----------------------------------------------------
+
+# Gentle vs steep tails → different M_cpu at (delta=1, s=1, lead=2, h=10):
+#   N_defer=9, N_defer_cpu=7.
+#   gentle 1-x/100: M_cpu = tail(7)-tail(9) = 0.93-0.91 = 0.02
+#   steep  1-x/20 : M_cpu = tail(7)-tail(9) = 0.65-0.55 = 0.10
+_GENTLE = lambda x: max(0.0, 1.0 - x / 100.0)
+_STEEP = lambda x: max(0.0, 1.0 - x / 20.0)
+
+
+def test_select_vacate_zero_blocks_needed_is_empty():
+    a = _measurable("a", 0, 10.0, _GENTLE)
+    assert select_vacate([a], 1.0, 1.0, 2, eps=1.0, blocks_needed=0,
+                          blocks_of=lambda r: 5) == []
+
+
+def test_select_vacate_filters_by_eps():
+    a = _measurable("a", 0, 10.0, _GENTLE)  # M_cpu ~0.02
+    b = _measurable("b", 0, 10.0, _STEEP)  # M_cpu ~0.10
+    # eps excludes the steep one; only 'a' is vacate-eligible.
+    got = select_vacate([a, b], 1.0, 1.0, 2, eps=0.05, blocks_needed=100,
+                        blocks_of=lambda r: 1)
+    assert got == ["a"]
+
+
+def test_select_vacate_sorts_by_mcpu_then_meets_blocks():
+    a = _measurable("a", 0, 10.0, _GENTLE)  # M_cpu ~0.02 (smaller)
+    b = _measurable("b", 0, 10.0, _STEEP)  # M_cpu ~0.10 (larger)
+    blocks = {"a": 3, "b": 5}
+    # Ascending M_cpu → a first. blocks_needed=2 met by a alone.
+    got1 = select_vacate([b, a], 1.0, 1.0, 2, eps=1.0, blocks_needed=2,
+                         blocks_of=lambda r: blocks[r])
+    assert got1 == ["a"]
+    # blocks_needed=4 → a(3) then b(8) to cross the threshold.
+    got2 = select_vacate([b, a], 1.0, 1.0, 2, eps=1.0, blocks_needed=4,
+                         blocks_of=lambda r: blocks[r])
+    assert got2 == ["a", "b"]
+
+
+def test_select_vacate_tiebreak_prefers_larger_block_count():
+    # Equal M_cpu (same tail) → larger block count first.
+    a = _measurable("a", 0, 10.0, _GENTLE)
+    b = _measurable("b", 0, 10.0, _GENTLE)
+    blocks = {"a": 2, "b": 9}
+    got = select_vacate([a, b], 1.0, 1.0, 2, eps=1.0, blocks_needed=5,
+                        blocks_of=lambda r: blocks[r])
+    assert got == ["b"]  # b's 9 blocks alone meets the need
+
+
+# ---- select_promote ---------------------------------------------------
+
+def test_select_promote_boundary_by_eps():
+    cheap = _cpu("cheap", 0, 10.0, _GENTLE)  # M_cpu ~0.02 → stay
+    costly = _cpu("costly", 0, 10.0, _STEEP)  # M_cpu ~0.10 → promote
+    got = select_promote([cheap, costly], 1.0, 1.0, 2, eps=0.05)
+    assert got == ["costly"]
+
+
+def test_select_promote_certain_miss_safety_net():
+    # Saturated tail → M_cpu = 0 (<= eps) but R_defer_cpu = 1 forces promote.
+    miss = _cpu("miss", 0, 10.0, lambda x: 1.0)
+    assert select_promote([miss], 1.0, 1.0, 2, eps=0.05) == ["miss"]
+
+
+def test_select_promote_skips_non_measurable_cpu():
+    prefill = ProgressView(
+        "p", 0, None, PHASE_PREFILL, False, lambda x: 1.0, LOC_CPU)
+    assert select_promote([prefill], 1.0, 1.0, 2, eps=0.05) == []
+
+
+def test_pick_adaptive_batch_threads_lead_to_cpu_risk():
+    # A CPU-resident (LOC_CPU) request's R_defer_cpu depends on `lead` (it
+    # loses `lead` future iterations before its horizon). pick_adaptive_batch
+    # must thread lead into build_plan so its E_viol matches
+    # schedule_step(lead=...). Step tail: P(L>x)=0.5 for x<7, else 0.
+    def tail(x):
+        return 0.5 if x < 7 else 0.0
+
+    views = [_cpu("c0", c_q=0, t_q=10.0, tail=tail)]
+    # delta=1 → H_q=10, s=1. N_defer_cpu(lead=0)=9 → tail(9)=0 → e_viol=0.
+    _b0, plan0 = pick_adaptive_batch(views, 4, 1.0, [], lambda b: None, lead=0)
+    # N_defer_cpu(lead=5)=4 → tail(4)=0.5 → e_viol=0.5.
+    _b5, plan5 = pick_adaptive_batch(views, 4, 1.0, [], lambda b: None, lead=5)
+    assert plan0.e_viol == 0.0
+    assert plan5.e_viol == 0.5
+    # Default lead=0 keeps back-compat with existing call sites.
+    _bd, plan_default = pick_adaptive_batch(views, 4, 1.0, [], lambda b: None)
+    assert plan_default.e_viol == plan0.e_viol

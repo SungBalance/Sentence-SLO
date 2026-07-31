@@ -457,6 +457,8 @@ class ChunkRecord:
     num_iters: int
     num_running_iters: int
     num_pending_iters: int
+    # Steps this chunk window spent KV-vacated to CPU (offload tier).
+    num_offloaded_iters: int
     # Predictor's estimate (in tokens) at chunk start — i.e. value used by
     # pressure() during this chunk's generation. None for chunk 0 (no
     # history yet) and any time before the predictor has a value. Compare
@@ -496,6 +498,7 @@ class ChunkStatCollector:
         # Per-chunk scheduler-step tallies, reset at each record().
         self._current_running_iters: int = 0
         self._current_pending_iters: int = 0
+        self._current_offloaded_iters: int = 0
 
     def record(
         self,
@@ -519,6 +522,7 @@ class ChunkStatCollector:
     ) -> None:
         running_iters = self._current_running_iters
         pending_iters = self._current_pending_iters
+        offloaded_iters = self._current_offloaded_iters
         self.records.append(
             ChunkRecord(
                 unit_index=unit_index,
@@ -533,6 +537,7 @@ class ChunkStatCollector:
                 num_iters=running_iters + pending_iters,
                 num_running_iters=running_iters,
                 num_pending_iters=pending_iters,
+                num_offloaded_iters=offloaded_iters,
                 expected_len=expected_len,
                 token_start=token_start,
                 token_end=token_end,
@@ -547,6 +552,7 @@ class ChunkStatCollector:
         self._current_pending_s = 0.0
         self._current_running_iters = 0
         self._current_pending_iters = 0
+        self._current_offloaded_iters = 0
 
     def accumulate_pending(self, interval_s: float) -> None:
         self._current_pending_s += interval_s
@@ -556,6 +562,9 @@ class ChunkStatCollector:
 
     def accumulate_pending_step(self) -> None:
         self._current_pending_iters += 1
+
+    def accumulate_offloaded_step(self) -> None:
+        self._current_offloaded_iters += 1
 
     def asdict(self) -> list[dict]:
         return [asdict(record) for record in self.records]
@@ -568,6 +577,12 @@ class SsloRequestStats:
     num_pending_intervals: int
     chunks_completed: int
     final_chunk_expected_len: float | None
+    # KV offload tier lifecycle. total_offloaded_time_s = wall-clock spent
+    # KV-vacated to CPU; num_offload_intervals = vacate events; num_onloads =
+    # completed CPU→GPU restores.
+    total_offloaded_time_s: float = 0.0
+    num_offload_intervals: int = 0
+    num_onloads: int = 0
     # Scheduler-side step accounting. total_step_count = scheduler steps in
     # which this request received any tokens. prefill_step_count = subset
     # that mixed prefill (NOT decoding-only). Ratio reveals how often this
@@ -616,6 +631,11 @@ class RequestSLOState:
     total_pending_time_s: float = 0.0
     num_pending_intervals: int = 0
     pending_enter_ts: float | None = None
+    # KV offload tier lifecycle, mirrored on the pending accounting above.
+    total_offloaded_time_s: float = 0.0
+    num_offload_intervals: int = 0
+    num_onloads: int = 0
+    offload_enter_ts: float | None = None
     # Scheduler step accounting (incremented by Scheduler each step).
     total_step_count: int = 0
     prefill_step_count: int = 0
@@ -969,6 +989,19 @@ class RequestSLOState:
         self.chunk_stats.accumulate_pending(interval)
         self.pending_enter_ts = None
 
+    def on_offload_enter(self, now: float) -> None:
+        if self.offload_enter_ts is None:
+            self.offload_enter_ts = now
+            self.num_offload_intervals += 1
+
+    def on_offload_exit(self, now: float) -> None:
+        if self.offload_enter_ts is None:
+            return
+        interval = now - self.offload_enter_ts
+        self.total_offloaded_time_s += interval
+        self.offload_enter_ts = None
+        self.num_onloads += 1
+
     def on_step(self, decoding_only: bool) -> None:
         """Increment per-request scheduler step counters.
 
@@ -1041,6 +1074,9 @@ class RequestSLOState:
             num_pending_intervals=self.num_pending_intervals,
             chunks_completed=self.chunks_completed,
             final_chunk_expected_len=self._chunk_len_predictor.value,
+            total_offloaded_time_s=self.total_offloaded_time_s,
+            num_offload_intervals=self.num_offload_intervals,
+            num_onloads=self.num_onloads,
             total_step_count=self.total_step_count,
             prefill_step_count=self.prefill_step_count,
             consume_start_time=self.consume_start_time,

@@ -88,6 +88,11 @@ class SsloStepState:
     # admission count chosen this step.
     e_viol: float = 0.0
     k_star: int = 0
+    # SSLO: KV-offload tier per-step diagnostics.
+    kv_capped: bool = False
+    k_star_unconstrained: int = 0
+    num_vacated: int = 0
+    num_promoted: int = 0
 
 
 logger = init_logger(__name__)
@@ -277,6 +282,35 @@ class Scheduler(SchedulerInterface):
         self._sslo_decision_buffer_max: int = 256
         self._sslo_decision_log_path: str | None = None
         self._sslo_decision_log_dir_created: bool = False
+        # SSLO: KV-offload tier state. All only populated when
+        # sslo_config.kv_offload; every access is guarded by that flag so a
+        # disabled offload tier is byte-identical to plain ProgressServe.
+        #   _sslo_offloaded : req_id -> Request whose KV is vacated to CPU
+        #                     (not in running / sslo_pending / waiting).
+        #   _sslo_promoting : req_id -> Request re-queued for CPU->GPU onload
+        #                     (allocated + WAITING_FOR_REMOTE_KVS, or waiting).
+        #   _sslo_last_onload_step : req_id -> step index of last onload
+        #                     completion, for the anti-thrash residency guard.
+        #   _sslo_vacated_req_ids : ids vacated this step, folded into the
+        #                     SchedulerOutput.preempted_req_ids so the worker
+        #                     drops them exactly like a preemption.
+        self._sslo_offloaded: dict[str, Request] = {}
+        self._sslo_promoting: dict[str, Request] = {}
+        self._sslo_last_onload_step: dict[str, int] = {}
+        self._sslo_vacated_req_ids: set[str] = set()
+        self._sslo_offload_conn = None
+        if sslo_cfg.kv_offload:
+            from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
+                SimpleCPUOffloadConnector,
+            )
+            if (not isinstance(self.connector, SimpleCPUOffloadConnector)
+                    or self.connector.scheduler_manager is None):
+                raise ValueError(
+                    "sslo_config.kv_offload=True requires a configured "
+                    "SimpleCPUOffloadConnector (eager mode, prefix caching "
+                    "enabled), but the scheduler connector is "
+                    f"{type(self.connector).__name__}.")
+            self._sslo_offload_conn = self.connector
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -1515,6 +1549,9 @@ class Scheduler(SchedulerInterface):
         resident — the waiting-admission loop then admits k* in FCFS order.
         """
         prev_pending_ids, admitted, base_tpot = self._sslo_step_setup(now)
+        # SSLO: KV-offload tier — close finished onloads, account CPU steps.
+        if self._sslo_offload_conn is not None:
+            self._sslo_offload_prologue(now)
         b = self.max_num_running_reqs
         waiting_count = len(self.waiting) + len(self.skipped_waiting)
         tiers = {req.request_id: 0 for req in admitted}
@@ -1558,6 +1595,22 @@ class Scheduler(SchedulerInterface):
             views_a.append(view)
             by_id[req.request_id] = req
 
+        # SSLO: KV-offload tier — add CPU-resident (LOC_CPU) and mid-onload
+        # (LOC_ONLOADING) requests to the in-flight set. CPU reqs hold no slot
+        # but contribute R_defer_cpu to E_viol; onload reqs reserve a slot and
+        # are excluded from E_viol (forced). lead shifts the CPU risk horizon.
+        lead = 0
+        if self._sslo_offload_conn is not None:
+            lead = self.sslo_config.kv_onload_lead_iters
+            for req in self._sslo_offloaded.values():
+                if req.slo_state is not None:
+                    views_a.append(
+                        self._sslo_offload_view(req, ps.LOC_CPU, now))
+            for req in self._sslo_promoting.values():
+                if req.slo_state is not None:
+                    views_a.append(
+                        self._sslo_offload_view(req, ps.LOC_ONLOADING, now))
+
         # Waiting candidate views, FCFS prefix capped at B (can't admit more
         # than the batch holds). Only the count matters to build_plan — new
         # admits are excluded from E_viol and admitted by the wait loop.
@@ -1565,6 +1618,13 @@ class Scheduler(SchedulerInterface):
         for req in self.waiting:
             if len(waiting_views) >= b:
                 break
+            # SSLO: a promoted onload req may still be sitting in self.waiting
+            # before its CPU->GPU load starts; it is already represented by its
+            # LOC_ONLOADING view, so skip it here to avoid double-counting the
+            # same request as a new admit (inflates the slot / |A+| budget).
+            if (self._sslo_offload_conn is not None
+                    and req.request_id in self._sslo_promoting):
+                continue
             waiting_views.append(ps.ProgressView(
                 request_id=req.request_id, c_q=0, T_q=None,
                 phase=int(Phase.PREFILL), is_new_admit=True,
@@ -1587,21 +1647,33 @@ class Scheduler(SchedulerInterface):
         if self.sslo_config.adaptive_batching:
             b, _ = ps.pick_adaptive_batch(
                 views_a, b, delta, list(self._sslo_capture_sizes_below_base),
-                self._sslo_hybrid_delta)
+                self._sslo_hybrid_delta, lead)
             delta = self._sslo_hybrid_delta(b) or delta
 
-        result = ps.schedule_step(views_a, waiting_views, b, delta, kv_feasible)
+        result = ps.schedule_step(
+            views_a, waiting_views, b, delta, kv_feasible, lead)
         self._sslo_step.e_viol = result.e_viol
         self._sslo_step.k_star = result.k_star
-        new_running = [by_id[rid] for rid in result.scheduled_A]
-        new_pending = [by_id[rid] for rid in result.deferred_A]
+        # SSLO: onload / offloaded ids appear in result but are not in the
+        # running/pending population (by_id); filter them out here. When
+        # kv_offload is disabled every scheduled/deferred id is in by_id, so
+        # the guard is a no-op.
+        new_running = [by_id[rid] for rid in result.scheduled_A if rid in by_id]
+        new_pending = [by_id[rid] for rid in result.deferred_A if rid in by_id]
         self._sslo_step.waiting_admission_budget = result.k_star
         self._sslo_step.cur_max_num_requests = b
         self._sslo_step.has_critical = False
 
+        # SSLO: KV-offload tier — promote (CPU->GPU) then vacate (GPU->CPU).
+        # Runs before commit so vacated reqs never enter self.sslo_pending and
+        # promoted reqs are already queued for the waiting-admission loop.
+        if self._sslo_offload_conn is not None:
+            self._sslo_apply_offload(now, result, b, delta, admitted,
+                                     new_pending)
+
         # Decision-log score: R_run for measurable, 1.0 for forced.
         plan = ps.build_plan(
-            views_a, waiting_views[:result.k_star], b, delta)
+            views_a, waiting_views[:result.k_star], b, delta, lead)
         for req in admitted:
             r = plan.risks.get(req.request_id)
             pressures[req.request_id] = 1.0 if r is None else r[0]
@@ -1611,6 +1683,192 @@ class Scheduler(SchedulerInterface):
             pressures=pressures, tiers=tiers, admitted=admitted,
             base_tpot=base_tpot, pressure_components={})
         return pressures
+
+    # SSLO
+    def _sslo_offload_view(
+        self, req: Request, location: int, now: float
+    ) -> "ps.ProgressView":
+        """ProgressView for a CPU-resident / mid-onload / vacate-candidate
+        request. Caller guarantees req.slo_state is not None."""
+        state = req.slo_state
+        assert state is not None
+        return ps.ProgressView(
+            request_id=req.request_id,
+            c_q=state.current_chunk_generated_len,
+            T_q=state.time_to_deadline(now),
+            phase=int(state.phase), is_new_admit=False,
+            tail_prob=state.length_tail_prob, location=location)
+
+    # SSLO
+    def _sslo_num_gpu_blocks(self, request_id: str) -> int:
+        """Current GPU KV block count of a request (all groups)."""
+        blocks = self.kv_cache_manager.get_blocks(request_id)
+        return sum(len(g) for g in blocks.get_block_ids())
+
+    # SSLO
+    def _sslo_offload_prologue(self, now: float) -> None:
+        """Per-step KV-offload bookkeeping run before placement.
+
+        (1) A promoted request that has re-entered RUNNING has finished its
+        CPU->GPU onload: close its offload interval, record the residency
+        step, and unpin the CPU mirror. (2) Charge one offloaded step to every
+        request still CPU-resident or mid-onload.
+        """
+        running_ids = {req.request_id for req in self.running}
+        for rid in list(self._sslo_promoting):
+            if rid in running_ids:
+                req = self._sslo_promoting.pop(rid)
+                if req.slo_state is not None:
+                    req.slo_state.on_offload_exit(now)
+                self._sslo_last_onload_step[rid] = self._sslo_step_idx
+                self._sslo_offload_conn.unpin_request_cpu_blocks(req)
+        for req in self._sslo_offloaded.values():
+            if req.slo_state is not None:
+                req.slo_state.chunk_stats.accumulate_offloaded_step()
+        for req in self._sslo_promoting.values():
+            if req.slo_state is not None:
+                req.slo_state.chunk_stats.accumulate_offloaded_step()
+
+    # SSLO
+    def _sslo_apply_offload(
+        self,
+        now: float,
+        result: "ps.ScheduleResult",
+        b: int,
+        delta: float,
+        admitted: list[Request],
+        new_pending: list[Request],
+    ) -> None:
+        """Promote CPU-resident requests nearing their deadline, then (only
+        under KV admission pressure) vacate slack-deep fully-mirrored deferred
+        requests to CPU. Mutates ``new_pending`` in place (vacated reqs are
+        removed before commit)."""
+        cfg = self.sslo_config
+        lead = cfg.kv_onload_lead_iters
+        eps = cfg.kv_offload_risk_eps
+        n_aplus = len(admitted) + len(self._sslo_promoting) + result.k_star
+        s = ps.service_share(b, n_aplus)
+
+        # --- Promote (before vacate). ---
+        cpu_views = [
+            self._sslo_offload_view(req, ps.LOC_CPU, now)
+            for req in self._sslo_offloaded.values()
+            if req.slo_state is not None
+        ]
+        num_promoted = 0
+        for rid in ps.select_promote(cpu_views, delta, s, lead, eps):
+            req = self._sslo_offloaded.pop(rid, None)
+            if req is None:
+                continue
+            # Forced front-of-queue insert: the waiting-admission loop restarts
+            # the CPU->GPU onload via the connector, off the k* budget.
+            self.waiting.prepend_request(req)
+            self._sslo_promoting[rid] = req
+            num_promoted += 1
+            self._sslo_log_offload_event("promote", rid, now)
+
+        # --- Vacate: only when KV admission (not E_viol) capped k*. ---
+        num_vacated = 0
+        if result.kv_capped:
+            per_admit = cfg.kv_blocks_per_new_admit
+            blocks_needed = (
+                result.k_star_unconstrained - result.k_star) * per_admit
+            # Promoted reqs still awaiting GPU allocation need blocks too.
+            pending_promote = sum(
+                1 for r in self._sslo_promoting.values()
+                if r.status == RequestStatus.PREEMPTED)
+            blocks_needed += pending_promote * per_admit
+
+            min_res = cfg.kv_offload_min_residency_steps
+            cand_views: list[ps.ProgressView] = []
+            cand_by_id: dict[str, Request] = {}
+            for req in new_pending:
+                if req.slo_state is None:
+                    continue
+                rid = req.request_id
+                if min_res > 0:
+                    last = self._sslo_last_onload_step.get(rid)
+                    if last is not None and self._sslo_step_idx - last < min_res:
+                        continue
+                if not self._sslo_offload_conn.is_fully_mirrored(req):
+                    continue
+                view = self._sslo_offload_view(req, ps.LOC_GPU, now)
+                if not view.is_measurable():
+                    continue
+                cand_views.append(view)
+                cand_by_id[rid] = req
+
+            for rid in ps.select_vacate(
+                    cand_views, delta, s, lead, eps, blocks_needed,
+                    self._sslo_num_gpu_blocks):
+                req = cand_by_id[rid]
+                if not self._sslo_offload_conn.pin_request_cpu_blocks(req):
+                    continue
+                new_pending.remove(req)
+                self._sslo_vacate_request(req, now)
+                num_vacated += 1
+                self._sslo_log_offload_event("vacate", rid, now)
+
+        self._sslo_step.num_promoted = num_promoted
+        self._sslo_step.num_vacated = num_vacated
+        self._sslo_step.kv_capped = result.kv_capped
+        self._sslo_step.k_star_unconstrained = result.k_star_unconstrained
+
+    # SSLO
+    def _sslo_vacate_request(self, request: Request, now: float) -> None:
+        """Vacate a fully-mirrored deferred request's KV to CPU.
+
+        Reuses ``_preempt_request`` for the exact preemption bookkeeping (free
+        GPU blocks, reset computed tokens, status PREEMPTED, count preemption)
+        so the worker and connector treat it identically to a preemption, then
+        moves it off the waiting queue into ``_sslo_offloaded`` (CPU mirror
+        pinned). ``is_fully_mirrored`` guarantees no in-flight store on this
+        request, so the vacated GPU blocks carry no in-progress copy — the
+        SchedulerOutput's need_flush (from preempted_req_ids) is a harmless
+        superset and no dedicated worker flush is required.
+        """
+        self._preempt_request(request, now)
+        # _preempt_request enqueues to the waiting queue; redirect to CPU.
+        self.waiting.remove_requests([request])
+        self._sslo_offloaded[request.request_id] = request
+        self._sslo_vacated_req_ids.add(request.request_id)
+        if request.slo_state is not None:
+            request.slo_state.on_offload_enter(now)
+            # Count this step for the request: it left running/pending for CPU
+            # mid-step, so neither _account_per_chunk_step nor the next
+            # prologue would otherwise charge it (avoids a 1-iter undercount).
+            request.slo_state.chunk_stats.accumulate_offloaded_step()
+
+    # SSLO
+    def _sslo_offload_cleanup(self, request: Request) -> None:
+        """Drop a finishing/aborting request from all KV-offload state and
+        release any pinned CPU mirror. Idempotent."""
+        if self._sslo_offload_conn is None:
+            return
+        rid = request.request_id
+        self._sslo_offloaded.pop(rid, None)
+        self._sslo_promoting.pop(rid, None)
+        self._sslo_last_onload_step.pop(rid, None)
+        self._sslo_vacated_req_ids.discard(rid)
+        self._sslo_offload_conn.unpin_request_cpu_blocks(request)
+
+    # SSLO
+    def _sslo_log_offload_event(
+        self, kind: str, rid: str, now: float
+    ) -> None:
+        """Append a vacate / promote event row to the decision buffer."""
+        if self.sslo_config.decision_log_mode == "off":
+            return
+        if self._sslo_decision_log_resolve() is None:
+            return
+        self._sslo_decision_buffer.append(json.dumps({
+            "kind": kind,
+            "ts": now,
+            "step_idx": self._sslo_step_idx,
+            "request_id": rid,
+        }))
+        if len(self._sslo_decision_buffer) >= self._sslo_decision_buffer_max:
+            self._sslo_decision_flush()
 
     # SSLO
     def _resolve_sslo_policy_dispatch(self):
@@ -1705,6 +1963,12 @@ class Scheduler(SchedulerInterface):
             # SSLO: ProgressServe per-step diagnostics
             "e_viol": self._sslo_step.e_viol,
             "k_star": self._sslo_step.k_star,
+            # SSLO: KV-offload tier per-step diagnostics
+            "num_offloaded": len(self._sslo_offloaded),
+            "kv_capped": self._sslo_step.kv_capped,
+            "k_star_unconstrained": self._sslo_step.k_star_unconstrained,
+            "num_vacated": self._sslo_step.num_vacated,
+            "num_promoted": self._sslo_step.num_promoted,
             # SSLO: per-step KV cache block usage
             "kv_blocks_used": (
                 self.kv_cache_manager.block_pool.num_gpu_blocks
@@ -1746,6 +2010,8 @@ class Scheduler(SchedulerInterface):
             req for req in self.sslo_pending
             if req.request_id != request.request_id
         ]
+        # SSLO: KV-offload — drop from offload state and unpin the CPU mirror.
+        self._sslo_offload_cleanup(request)
         if request.slo_state is not None:
             request.slo_state.on_pending_exit(now)
             self._sslo_log_request_done(request, now)
@@ -1822,6 +2088,9 @@ class Scheduler(SchedulerInterface):
             for req in self.running + self.sslo_pending
         }
 
+        # SSLO: reset this step's KV-offload vacate set; the policy repopulates
+        # it and it is folded into SchedulerOutput.preempted_req_ids below.
+        self._sslo_vacated_req_ids = set()
         # SSLO: dispatcher patched in __init__ based on (method, policy).
         sslo_scores = self._apply_sslo_policy(scheduled_timestamp)
 
@@ -2015,6 +2284,12 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
             # SSLO: budget-driven admission (computed in _apply_sslo_policy).
             sslo_admit_remaining = self._sslo_step.waiting_admission_budget
+            # SSLO: KV-offload promoted reqs traverse the loop to (re)start
+            # their CPU->GPU onload without spending the k* admission budget;
+            # reserve one traversal slot per in-flight onload.
+            sslo_onload_remaining = (
+                len(self._sslo_promoting)
+                if self._sslo_offload_conn is not None else 0)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # SSLO: critical-mode gating is now via waiting_admission_budget
@@ -2025,8 +2300,9 @@ class Scheduler(SchedulerInterface):
                 # batching's shrunk batch actually limits admission.
                 if len(self.running) >= self._sslo_step.cur_max_num_requests:
                     break
-                # SSLO: stop when this step's admission budget is exhausted.
-                if sslo_admit_remaining <= 0:
+                # SSLO: stop when the admission budget is exhausted AND no
+                # promoted onloads remain to be traversed.
+                if sslo_admit_remaining <= 0 and sslo_onload_remaining <= 0:
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -2034,6 +2310,23 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                # SSLO: KV-offload promoted onload reqs spend the onload
+                # reservation (not the k* budget); each is peeked once per step,
+                # so decrement here. A normal req past the budget is skipped so
+                # the loop can still reach the (front-queued) onloads. The whole
+                # block is gated on the offload connector, so a disabled offload
+                # tier keeps the original control flow untouched (when disabled
+                # the top-of-loop guard already broke on sslo_admit_remaining).
+                sslo_is_onload = False
+                if self._sslo_offload_conn is not None:
+                    sslo_is_onload = request_id in self._sslo_promoting
+                    if sslo_is_onload:
+                        sslo_onload_remaining -= 1
+                    elif sslo_admit_remaining <= 0:
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -2275,8 +2568,11 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
-                # SSLO: count successful admission against this step's budget.
-                sslo_admit_remaining -= 1
+                # SSLO: count successful admission against this step's budget,
+                # except a promoted onload completing synchronously (no CPU hit
+                # to load) — its slot was reserved via the onload accounting.
+                if not sslo_is_onload:
+                    sslo_admit_remaining -= 1
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -2399,7 +2695,11 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
-            preempted_req_ids={req.request_id for req in preempted_reqs},
+            # SSLO: KV-offload vacated reqs are treated as preemptions by the
+            # worker (drop request state) and connector (need_flush); fold them
+            # into preempted_req_ids alongside genuine preemptions.
+            preempted_req_ids=({req.request_id for req in preempted_reqs}
+                               | self._sslo_vacated_req_ids),
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
             # It contains the request IDs that are finished in between
@@ -2954,6 +3254,9 @@ class Scheduler(SchedulerInterface):
                         total_pending_time_s=s.total_pending_time_s,
                         total_step_count=s.total_step_count,
                         prefill_step_count=s.prefill_step_count,
+                        total_offloaded_time_s=s.total_offloaded_time_s,
+                        num_offload_intervals=s.num_offload_intervals,
+                        num_onloads=s.num_onloads,
                     )
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
@@ -3404,6 +3707,18 @@ class Scheduler(SchedulerInterface):
         self._sslo_prev_selected.clear()
         self._sslo_step_idx = 0
         self._sslo_decision_buffer.clear()
+        # SSLO: KV-offload tier — unpin any lingering CPU mirrors and clear
+        # offload maps. Normal sweep boundaries have already drained requests,
+        # so these are typically empty.
+        if self._sslo_offload_conn is not None:
+            for req in list(self._sslo_offloaded.values()):
+                self._sslo_offload_conn.unpin_request_cpu_blocks(req)
+            for req in list(self._sslo_promoting.values()):
+                self._sslo_offload_conn.unpin_request_cpu_blocks(req)
+        self._sslo_offloaded.clear()
+        self._sslo_promoting.clear()
+        self._sslo_last_onload_step.clear()
+        self._sslo_vacated_req_ids.clear()
         # SSLO: per-step transient state — recomputed at top of
         # _apply_sslo_policy each step, but reset here for cleanliness
         # so any pre-first-step read sees the fresh initial value.

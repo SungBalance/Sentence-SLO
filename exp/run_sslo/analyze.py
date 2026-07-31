@@ -18,7 +18,7 @@ from validity import validate_run
 
 MAX_NUM_SEQS = 64
 DEFAULT_OUTPUT_DIR = "exp/run_sslo/output"
-SSLO_MODES = ("progress_serve", "progress_serve_adaptive")
+SSLO_MODES = ("progress_serve", "progress_serve_adaptive", "progress_serve_offload")
 ALL_MODES = ("baseline",) + SSLO_MODES
 SIX_STAT_KEYS = ("mean", "p50", "p90", "p95", "p99", "max")
 
@@ -301,6 +301,27 @@ def pending_request_stats(rows: list[dict[str, Any]]) -> dict[str, dict[str, flo
     }
 
 
+def offload_request_stats(
+    rows: list[dict[str, Any]],
+) -> dict[str, dict[str, float | int | None]] | None:
+    """KV-offload lifecycle distributions (offloaded time + onloads/req).
+
+    Present only for progress_serve_offload runs. Returns None when no row
+    carries the offload fields so non-offload modes stay backward-compatible
+    (the caller then omits the offload aggregate for that mode)."""
+    has_offload = any(
+        row.get("total_offloaded_time_s") is not None
+        or row.get("num_onloads") is not None
+        for row in rows
+    )
+    if not has_offload:
+        return None
+    return {
+        "total_offloaded_time_s": dist_for_key(rows, "total_offloaded_time_s"),
+        "num_onloads": dist_for_key(rows, "num_onloads"),
+    }
+
+
 def inter_chunk_delay_stats(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
     by_request: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -538,6 +559,7 @@ def analyze(
     metrics: dict[str, Any] = {
         "ttft": {}, "ttfc": {}, "tpot": {}, "queue_stall": {}, "slack": {},
         "slo_compliance": {}, "scheduler": {}, "pending": {}, "inter_chunk_delay": {},
+        "offload": {},
         "prediction_ratio": {}, "stall_time": {},
         "workload": {}, "throughput": {},
         "request_cu_slo_violation": {}, "measurement_window": {}, "handling_users": {},
@@ -566,6 +588,9 @@ def analyze(
         metrics["slo_compliance"][mode] = request_compliance_stats(ch_rows)
         metrics["inter_chunk_delay"][mode] = inter_chunk_delay_stats(ch_rows)
         metrics["pending"][mode] = pending_request_stats(req_rows)
+        offload_stats = offload_request_stats(req_rows)
+        if offload_stats is not None:
+            metrics["offload"][mode] = offload_stats
         metrics["prediction_ratio"][mode] = prediction_ratio_stats(ch_rows)
 
     # Scheduler stats (running / num_handling_users) emit for ALL modes,

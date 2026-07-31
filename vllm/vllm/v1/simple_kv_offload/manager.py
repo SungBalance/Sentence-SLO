@@ -147,6 +147,10 @@ class SimpleCPUOffloadScheduler:
         self._reqs_to_store: dict[str, StoreRequestState] = {}
         self._store_event_to_reqs: dict[int, list[str]] = {}
 
+        # SSLO KV-offload tier: request_id -> pinned CPU blocks (kept touched
+        # so the CPU mirror survives eviction while the request is GPU-vacated).
+        self._pinned_cpu_blocks: dict[str, list] = {}
+
         # Event counters
         self._load_event_counter: int = 0
         self._store_event_counter: int = 0
@@ -653,6 +657,74 @@ class SimpleCPUOffloadScheduler:
     def has_pending_stores(self) -> bool:
         """Return True if there are in-flight store transfers."""
         return bool(self._store_event_to_blocks)
+
+    # SSLO KV-offload tier scheduler-side API (eager mode only).
+    # SSLO
+    def is_fully_mirrored(self, request: "Request") -> bool:
+        """True iff every confirmed full block of ``request`` is already
+        mirrored on CPU with no in-flight store.
+
+        Lets the SSLO offload tier vacate a request to CPU by returning its
+        GPU refs without a bulk transfer. Uses the same confirmed-block
+        accounting as ``_prepare_eager_store_specs`` on the full-attention
+        group (``fa_gidx``). Returns False in lazy mode or for an unregistered
+        request.
+        """
+        if self._lazy_mode:
+            return False
+        state = self._reqs_to_store.get(request.request_id)
+        if state is None or state.store_events:
+            return False
+        req = state.request
+        confirmed_tokens = req.num_computed_tokens - req.num_output_placeholders
+        g_block_size = self.cpu_kv_cache_config.kv_cache_groups[
+            self.fa_gidx
+        ].kv_cache_spec.block_size
+        ready_blocks = confirmed_tokens // g_block_size
+        if ready_blocks <= 0:
+            return False
+        return state.num_stored_blocks[self.fa_gidx] >= ready_blocks
+
+    # SSLO
+    def pin_request_cpu_blocks(self, request: "Request") -> bool:
+        """Pin every confirmed full CPU block of ``request`` (all-or-nothing).
+
+        Touches the blocks so eviction can't reclaim the CPU mirror while the
+        request is GPU-vacated, records them, and returns True. If any full
+        block is missing from the CPU cache, pins nothing and returns False.
+        Idempotent: a request already pinned returns True.
+        """
+        req_id = request.request_id
+        if req_id in self._pinned_cpu_blocks:
+            return True
+        g_block_size = self.cpu_kv_cache_config.kv_cache_groups[
+            self.fa_gidx
+        ].kv_cache_spec.block_size
+        confirmed_tokens = (
+            request.num_computed_tokens - request.num_output_placeholders
+        )
+        num_full_blocks = confirmed_tokens // g_block_size
+        if num_full_blocks <= 0:
+            return False
+        to_pin = []
+        for bhash in request.block_hashes[:num_full_blocks]:
+            cached = self.cpu_block_pool.get_cached_block(bhash, [self.fa_gidx])
+            if cached is None:
+                return False
+            to_pin.extend(cached)
+        self.cpu_block_pool.touch(to_pin)
+        self._pinned_cpu_blocks[req_id] = to_pin
+        return True
+
+    # SSLO
+    def unpin_request_cpu_blocks(self, request: "Request") -> None:
+        """Release CPU blocks pinned by ``pin_request_cpu_blocks``.
+
+        No-op for an unpinned request. Idempotent.
+        """
+        blocks = self._pinned_cpu_blocks.pop(request.request_id, None)
+        if blocks:
+            self.cpu_block_pool.free_blocks(blocks)
 
     def request_finished(
         self,

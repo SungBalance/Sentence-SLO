@@ -169,6 +169,9 @@ class SsloSchedulerSnapshot(
     total_pending_time_s: float = 0.0
     total_step_count: int = 0
     prefill_step_count: int = 0
+    total_offloaded_time_s: float = 0.0
+    num_offload_intervals: int = 0
+    num_onloads: int = 0
 
 
 class EngineCoreOutput(

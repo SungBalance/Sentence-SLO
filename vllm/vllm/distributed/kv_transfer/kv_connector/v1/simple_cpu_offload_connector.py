@@ -227,6 +227,26 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return False, None
 
+    # SSLO
+    # NOTE: New API only for SimpleCPUOffloadConnector.
+    def is_fully_mirrored(self, request: "Request") -> bool:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.is_fully_mirrored(request)
+        return False
+
+    # SSLO
+    # NOTE: New API only for SimpleCPUOffloadConnector.
+    def pin_request_cpu_blocks(self, request: "Request") -> bool:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.pin_request_cpu_blocks(request)
+        return False
+
+    # SSLO
+    # NOTE: New API only for SimpleCPUOffloadConnector.
+    def unpin_request_cpu_blocks(self, request: "Request") -> None:
+        if self.scheduler_manager is not None:
+            self.scheduler_manager.unpin_request_cpu_blocks(request)
+
     # NOTE: New API only for SimpleCPUOffloadConnector.
     def has_pending_transfers(self) -> bool:
         if self.scheduler_manager is not None:
