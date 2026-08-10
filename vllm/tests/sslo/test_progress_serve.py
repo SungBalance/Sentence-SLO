@@ -12,13 +12,14 @@ from vllm.sslo.progress_serve import (
     n_defer_cpu,
     n_run_defer,
     pick_adaptive_batch,
-    prefill_budget,
     request_risk,
     request_risk_cpu,
     schedule_step,
+    select_decode_defer,
     select_onload,
     select_offload,
     service_share,
+    token_budget_prefill,
 )
 
 PHASE_PREFILL = 0
@@ -582,7 +583,103 @@ def test_pick_adaptive_batch_threads_share_includes_parked():
 
 
 # ---------------------------------------------------------------------------
-# Deadline-aware prefill token budget
+# Token Budget — D axis (select_decode_defer)
+# ---------------------------------------------------------------------------
+
+# Δ_dec cells for decode sets of 5..2 requests (seconds). No cell below 2.
+_DDEC = {5: 0.30, 4: 0.24, 3: 0.18, 2: 0.12}.get
+_SAFE = lambda x: 0.0  # deep slack → R_defer = 0
+_ATRISK = lambda x: 1.0  # certain miss → R_defer = 1
+
+
+def test_select_decode_defer_shrinks_until_budget_fits():
+    # γ·t_min = 0.5 * 0.4 = 0.2 s. Δ_dec(5) = 0.30 and Δ_dec(4) = 0.24 break
+    # it, Δ_dec(3) = 0.18 fits → exactly two defers, deepest slack first.
+    views = [_measurable(f"v{i}", 0, float(10 + i), _SAFE) for i in range(5)]
+    got = select_decode_defer(views, 1.0, 1.0, t_min=0.4, gamma=0.5, eps=1e-3,
+                              delta_decode_of=_DDEC)
+    assert got == ["v4", "v3"]
+
+
+def test_select_decode_defer_never_drops_forced_or_at_risk():
+    # D_floor = forced + at-risk. γ·t_min = 0.5*0.3 = 0.15 s; the floor size
+    # D'=2 (Δ_dec=0.12) fits, so shrinking is worthwhile and runs all the way
+    # down — yet only the three defer-safe reqs may go: the PREFILL one is not
+    # measurable and the R_defer = 1 one fails the eps test.
+    views = [_forced("f0"), _measurable("hot", 0, 10.0, _ATRISK)] + [
+        _measurable(f"safe{i}", 0, float(11 + i), _SAFE) for i in range(3)]
+    got = select_decode_defer(views, 1.0, 1.0, t_min=0.3, gamma=0.5, eps=1e-3,
+                              delta_decode_of=_DDEC)
+    assert got == ["safe2", "safe1", "safe0"]
+    assert len(views) - len(got) == 2  # D' = D_floor
+
+
+def test_select_decode_defer_no_op_with_deadline_slack():
+    # Deadlines far away (the read workload, H_q >> 1) → the axis never fires.
+    views = [_measurable(f"v{i}", 0, 100.0, _SAFE) for i in range(5)]
+    assert select_decode_defer(views, 1.0, 1.0, t_min=100.0, gamma=0.5,
+                               eps=1e-3, delta_decode_of=_DDEC) == []
+    # Nothing measurable in the decode set → no deadline to protect.
+    assert select_decode_defer(views, 1.0, 1.0, t_min=None, gamma=0.5,
+                               eps=1e-3, delta_decode_of=_DDEC) == []
+
+
+def test_select_decode_defer_no_op_when_overdue():
+    # The tightest deadline is already missed (t_min <= 0): the current unit is
+    # sunk and no shrink can save it, so the axis must not fire (else an
+    # oversaturated trace would defer for unreachable deadlines every step).
+    views = [_measurable(f"v{i}", 0, float(10 + i), _SAFE) for i in range(5)]
+    assert select_decode_defer(views, 1.0, 1.0, t_min=0.0, gamma=0.5,
+                               eps=1e-3, delta_decode_of=_DDEC) == []
+    assert select_decode_defer(views, 1.0, 1.0, t_min=-1.0, gamma=0.5,
+                               eps=1e-3, delta_decode_of=_DDEC) == []
+
+
+def test_select_decode_defer_reverts_when_unsatisfiable():
+    # γ·t_min = 0.1 s is below every reachable Δ_dec — the floor D'=2 (0.12) is
+    # still over budget and D'=1 has no cell. Shrinking cannot meet the budget,
+    # so paying the throughput cost buys nothing → revert to no defers.
+    views = [_measurable(f"v{i}", 0, float(10 + i), _SAFE) for i in range(5)]
+    assert select_decode_defer(views, 1.0, 1.0, t_min=0.2, gamma=0.5,
+                               eps=1e-3, delta_decode_of=_DDEC) == []
+
+
+def test_select_decode_defer_stops_without_batch_matched_cell():
+    views = [_measurable(f"v{i}", 0, float(10 + i), _SAFE) for i in range(5)]
+    # γ·t_min = 0.2 s. Cell for 4 (0.24) is over budget and cell for 3 is
+    # missing, so the search cannot verify that shrinking further reaches the
+    # budget — no fallback average (R5) → revert to no defers.
+    assert select_decode_defer(views, 1.0, 1.0, t_min=0.4, gamma=0.5, eps=1e-3,
+                               delta_decode_of={5: 0.30, 4: 0.24}.get) == []
+    # A reached size that already fits is kept even if the deeper cell is gone.
+    got = select_decode_defer(views, 1.0, 1.0, t_min=0.4, gamma=0.5, eps=1e-3,
+                              delta_decode_of={5: 0.30, 4: 0.18}.get)
+    assert got == ["v4"]
+    # No cell for the current size either → the axis stays off.
+    assert select_decode_defer(views, 1.0, 1.0, t_min=0.4, gamma=0.5,
+                               eps=1e-3, delta_decode_of=lambda n: None) == []
+
+
+def test_select_decode_defer_eligibility_is_self_limiting():
+    # Sitting out steps burns the deferred request's deadline, so its R_defer
+    # rises until it crosses eps and the request stops being defer-safe —
+    # which is why the axis needs no starvation counter.
+    tail = lambda x: max(0.0, 1.0 - x / 10.0)
+    forced = [_forced(f"f{i}") for i in range(4)]
+    # γ·t_min = 0.25 s; deferring the one measurable req reaches D'=4
+    # (Δ_dec=0.24 <= 0.25), so the shrink is satisfiable and runs.
+    kw = dict(t_min=0.5, gamma=0.5, eps=1e-3, delta_decode_of=_DDEC)
+    # T_q = 20 → N_defer = 19 → R_defer = tail(19) = 0 → defer-safe.
+    fresh = [_measurable("v", 0, 20.0, tail)] + forced
+    assert select_decode_defer(fresh, 1.0, 1.0, **kw) == ["v"]
+    # Same request several defers later: T_q = 5 → N_defer = 4 →
+    # R_defer = 0.6 > eps → it keeps its slot.
+    stale = [_measurable("v", 0, 5.0, tail)] + forced
+    assert select_decode_defer(stale, 1.0, 1.0, **kw) == []
+
+
+# ---------------------------------------------------------------------------
+# Token Budget — P axis (TB*_pre)
 # ---------------------------------------------------------------------------
 
 # Δ_decode 80 ms, κ 1 ms/prefill-token, base 8192 tokens, floor 512, γ = 0.5.
@@ -590,48 +687,49 @@ _PB = dict(delta_decode=0.08, kappa=0.001, base_budget=8192, floor=512,
            gamma=0.5)
 
 
-def test_prefill_budget_grows_with_slack_and_saturates():
+def test_token_budget_prefill_grows_with_slack_and_saturates():
     # t_min = 2 s → (0.5*2 - 0.08)/0.001 = 920 tokens.
-    assert prefill_budget(t_min=2.0, **_PB) == 920
+    assert token_budget_prefill(t_min=2.0, **_PB) == 920
     # More slack → strictly more prefill allowed.
-    assert prefill_budget(t_min=4.0, **_PB) > prefill_budget(t_min=2.0, **_PB)
+    assert (token_budget_prefill(t_min=4.0, **_PB)
+            > token_budget_prefill(t_min=2.0, **_PB))
     # Enough slack → saturates at the engine's base budget.
-    assert prefill_budget(t_min=1000.0, **_PB) == _PB["base_budget"]
+    assert token_budget_prefill(t_min=1000.0, **_PB) == _PB["base_budget"]
 
 
-def test_prefill_budget_monotone_non_decreasing_in_t_min():
+def test_token_budget_prefill_monotone_non_decreasing_in_t_min():
     prev = 0
     for t_min in (0.1, 0.5, 1.0, 2.0, 5.0, 20.0, 100.0):
-        cur = prefill_budget(t_min=t_min, **_PB)
+        cur = token_budget_prefill(t_min=t_min, **_PB)
         assert cur >= prev
         prev = cur
 
 
-def test_prefill_budget_overdue_clamps_to_floor():
+def test_token_budget_prefill_overdue_clamps_to_floor():
     # Already past the deadline → smallest budget that still makes progress.
-    assert prefill_budget(t_min=0.0, **_PB) == _PB["floor"]
-    assert prefill_budget(t_min=-3.0, **_PB) == _PB["floor"]
+    assert token_budget_prefill(t_min=0.0, **_PB) == _PB["floor"]
+    assert token_budget_prefill(t_min=-3.0, **_PB) == _PB["floor"]
     # Positive but tighter than the decode cost alone → also floor.
-    assert prefill_budget(t_min=0.01, **_PB) == _PB["floor"]
+    assert token_budget_prefill(t_min=0.01, **_PB) == _PB["floor"]
 
 
-def test_prefill_budget_disabled_returns_base():
+def test_token_budget_prefill_disabled_returns_base():
     # No κ estimate yet / degenerate κ → control off.
-    assert prefill_budget(t_min=1.0, **{**_PB, "kappa": 0.0}) == 8192
-    assert prefill_budget(t_min=1.0, **{**_PB, "kappa": -1.0}) == 8192
+    assert token_budget_prefill(t_min=1.0, **{**_PB, "kappa": 0.0}) == 8192
+    assert token_budget_prefill(t_min=1.0, **{**_PB, "kappa": -1.0}) == 8192
     # Nothing measurable in flight → nothing to protect → control off.
-    assert prefill_budget(t_min=None, **_PB) == 8192
+    assert token_budget_prefill(t_min=None, **_PB) == 8192
 
 
-def test_prefill_budget_stays_within_floor_and_base():
+def test_token_budget_prefill_stays_within_floor_and_base():
     for t_min in (None, -10.0, 0.0, 0.05, 0.3, 1.0, 7.5, 1e6):
-        p = prefill_budget(t_min=t_min, **_PB)
+        p = token_budget_prefill(t_min=t_min, **_PB)
         assert _PB["floor"] <= p <= _PB["base_budget"]
 
 
-def test_prefill_budget_floor_above_base_never_exceeds_base():
+def test_token_budget_prefill_floor_above_base_never_exceeds_base():
     # Misconfiguration guard: a floor above the engine's base budget must not
     # push the result past base_budget (the control degrades to a no-op).
     over = {**_PB, "floor": 20000}
     for t_min in (None, -1.0, 0.0, 0.5, 3.0, 1e6):
-        assert prefill_budget(t_min=t_min, **over) == over["base_budget"]
+        assert token_budget_prefill(t_min=t_min, **over) == over["base_budget"]

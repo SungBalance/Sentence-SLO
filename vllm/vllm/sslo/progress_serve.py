@@ -404,7 +404,88 @@ def pick_adaptive_batch(
     return best_b, best_plan
 
 
-def prefill_budget(
+def select_decode_defer(
+    run_views: list[ProgressView],
+    delta: float,
+    s: float,
+    t_min: float | None,
+    gamma: float,
+    eps: float,
+    delta_decode_of: Callable[[int], float | None],
+) -> list[str]:
+    """D axis of the Token Budget: shrink the decode set until the decode step
+    time alone fits the deadline budget.
+
+    The unified constraint is Δ_dec(D) + κ_p·P <= γ·t_min. When Δ_dec(D_policy)
+    breaks it on its own (P = 0 would already miss), no prefill budget can
+    save the step — the decode set itself has to give. Requests are dropped
+    from D one at a time, deepest slack first, until Δ_dec(D') fits.
+
+    Eligibility ("defer-safe"): GPU-resident, MEASURED, and R_defer <= eps.
+    Forced (PREFILL / WARMUP) and onloading requests are structurally absent
+    from the candidate list and at-risk ones fail the eps test, so the search
+    cannot go below the natural floor D_floor = forced + at-risk. The rule is
+    self-limiting and needs no starvation counter: a deferred request keeps
+    consuming its deadline, so its R_defer rises with every step it sits out
+    until it exceeds eps and the request stops being defer-safe. This holds
+    only because R_defer is recomputed from the live T_q every step.
+
+    ``delta_decode_of(n)`` is the batch-keyed decode-only Δ cell for a decode
+    set of size n. A missing cell stops the search (conservative: no fallback
+    average, R5) — with no measurement for the smaller batch there is no
+    evidence that shrinking helps. A missing cell for the CURRENT size leaves
+    the axis off, as does ``t_min is None``.
+
+    Returns the request_ids to defer, in the order they were dropped.
+    """
+    # t_min <= 0 means the tightest deadline is already being missed — a sunk
+    # unit no shrink can save. Deferring for it would trade throughput for
+    # nothing (oversaturated read traces spend ~60% of wall time with some
+    # request overdue), so the axis must not fire. Callers additionally
+    # exclude overdue requests from the t_min candidates for the same reason.
+    if t_min is None or t_min <= 0:
+        return []
+    budget = gamma * t_min
+    candidates = []
+    for v in run_views:
+        if v.location != LOC_GPU or not v.is_measurable():
+            continue
+        _r_run, r_defer, _m = request_risk(v, delta, s)
+        if r_defer <= eps:
+            assert v.T_q is not None
+            candidates.append((v.T_q, v.request_id))
+    # Deepest slack (largest time-to-deadline) first: eps already gated on
+    # risk, so what remains to order by is how much room each request has.
+    candidates.sort(key=lambda t: -t[0])
+
+    selected: list[str] = []
+    n = len(run_views)
+    satisfied = False
+    for _t_q, rid in candidates:
+        cur = delta_decode_of(n)
+        if cur is None:
+            break
+        if cur <= budget:
+            satisfied = True
+            break
+        if delta_decode_of(n - 1) is None:
+            break
+        selected.append(rid)
+        n -= 1
+    else:
+        cur = delta_decode_of(n)
+        satisfied = cur is not None and cur <= budget
+    # Satisfiability guard: shrinking is only worth paying for if some
+    # reachable D' actually meets the budget. If the search exhausted its
+    # candidates (or hit a missing cell) while still over budget, the misses
+    # are not preventable by this axis — revert to no defers rather than
+    # paying the throughput cost for nothing.
+    if not satisfied:
+        return []
+    return selected
+
+
+def token_budget_prefill(
     t_min: float | None,
     delta_decode: float,
     kappa: float,
@@ -412,7 +493,7 @@ def prefill_budget(
     floor: int,
     gamma: float,
 ) -> int:
-    """Deadline-aware per-step prefill token budget P*.
+    """Deadline-aware per-step prefill token budget TB*_pre (P axis).
 
     Rationale (measured, cap128 / rate 2 baseline): decode-only steps are
     extremely stable (Δ p50 74 ms / p90 78 ms), while the 6% of steps that
@@ -420,8 +501,8 @@ def prefill_budget(
     deadlines are broken by the prefill spike, not by decode concurrency, so
     the spike — not the request concurrency — is what to bound.
 
-        P* = clamp(int((gamma * t_min - delta_decode) / kappa),
-                   floor, base_budget)
+        TB*_pre = clamp(int((gamma * t_min - delta_decode) / kappa),
+                        floor, base_budget)
 
     i.e. spend at most a ``gamma`` fraction of the most urgent in-flight
     request's remaining time on this step, minus the decode cost that step
@@ -429,7 +510,8 @@ def prefill_budget(
 
     Units: ``t_min`` seconds to the nearest in-flight chunk deadline (None ⇒
     no measurable request in flight), ``delta_decode`` seconds per decode-only
-    step, ``kappa`` seconds of extra step time per prefill token,
+    step at the D axis' chosen decode set size D' (see ``select_decode_defer``),
+    ``kappa`` seconds of extra step time per prefill token,
     ``base_budget`` / ``floor`` tokens, ``gamma`` dimensionless in (0, 1].
 
     ``floor`` is itself clamped to ``base_budget`` so the result never exceeds

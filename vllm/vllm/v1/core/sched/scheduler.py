@@ -93,9 +93,13 @@ class SsloStepState:
     k_star_unconstrained: int = 0
     num_offloads: int = 0
     num_onloads: int = 0
-    # SSLO: deadline-aware prefill token budget applied this step
-    # (None ⇒ the control is off / not yet armed).
-    prefill_budget: int | None = None
+    # SSLO: deadline-aware Token Budget applied this step (None ⇒ the control
+    # is off / not yet armed). `token_budget_prefill` is TB*_pre (P axis);
+    # `token_budget_decode` is D' — the decode set size the D axis settled on
+    # — and `token_budget_d_defers` the requests it deferred this step.
+    token_budget_prefill: int | None = None
+    token_budget_decode: int | None = None
+    token_budget_d_defers: int = 0
 
 
 # SSLO: starvation release for the deadline-aware prefill budget. After this
@@ -1149,7 +1153,7 @@ class Scheduler(SchedulerInterface):
         # the excess time and of the token count (ratio taken in _sslo_kappa).
         # Only prefill-carrying steps with a batch-matched decode baseline
         # inform them; the excess is stored unclipped.
-        if self.sslo_config.prefill_budget_control:
+        if self.sslo_config.token_budget_control:
             prefill_tokens = self._sslo_prev_step_prefill_tokens
             delta_decode = self._sslo_decode_wall_ema(prev_batch)
             if prefill_tokens > 0 and delta_decode is not None:
@@ -1172,9 +1176,10 @@ class Scheduler(SchedulerInterface):
         noise by a small denominator on low-prefill steps — replaying phaseP
         traces, P≤128 samples came out 20-100x the true κ — and clipping each
         sample at 0 discards only the negative noise, so the EMA drifts up.
-        Both effects close a loop through P* (κ↑ → P*↓ → smaller P per step →
-        κ↑). Summing numerator and denominator separately weights each step by
-        its own token count and lets negative excess cancel positive.
+        Both effects close a loop through TB*_pre (κ↑ → TB*_pre↓ → smaller P
+        per step → κ↑). Summing numerator and denominator separately weights
+        each step by its own token count and lets negative excess cancel
+        positive.
 
         None when no sample has landed yet, or when the ratio is ≤ 0 (the
         prefill steps were no slower than the decode-only baseline, so there
@@ -1311,17 +1316,18 @@ class Scheduler(SchedulerInterface):
 
     # SSLO
     def _sslo_prefill_token_budget(self, now: float) -> int | None:
-        """Per-step prefill token cap P*, or None when the control is off.
+        """Per-step prefill token cap TB*_pre, or None when the control is off.
 
-        Off unless `prefill_budget_control` is set and chunked prefill is
+        Off unless `token_budget_control` is set and chunked prefill is
         enabled (the cap only smooths the prefill spike if the remainder can
         carry over to the next step), and until both κ and a decode-only Δ
-        reference exist. After _SSLO_PREFILL_FLOOR_STARVE_STEPS consecutive
-        floor-clamped steps with no prefill progress, one step gets the full
-        base budget.
+        reference exist. The Δ reference is read at the CURRENT decode set
+        size, i.e. D' after the D axis already shrank it. After
+        _SSLO_PREFILL_FLOOR_STARVE_STEPS consecutive floor-clamped steps with
+        no prefill progress, one step gets the full base budget.
         """
         cfg = self.sslo_config
-        if not cfg.prefill_budget_control:
+        if not cfg.token_budget_control:
             return None
         if not self.scheduler_config.enable_chunked_prefill:
             return None
@@ -1331,15 +1337,15 @@ class Scheduler(SchedulerInterface):
         delta_decode = self._sslo_decode_wall_ema(len(self.running))
         if delta_decode is None:
             return None
-        budget = ps.prefill_budget(
+        budget = ps.token_budget_prefill(
             t_min=self._sslo_min_time_to_deadline(now),
             delta_decode=delta_decode,
             kappa=kappa,
             base_budget=self.max_num_scheduled_tokens,
-            floor=cfg.prefill_budget_floor,
-            gamma=cfg.prefill_budget_gamma,
+            floor=cfg.token_budget_prefill_floor,
+            gamma=cfg.token_budget_gamma,
         )
-        if (budget <= cfg.prefill_budget_floor
+        if (budget <= cfg.token_budget_prefill_floor
                 and self._sslo_prev_step_prefill_tokens == 0):
             self._sslo_prefill_floor_streak += 1
         else:
@@ -1834,6 +1840,14 @@ class Scheduler(SchedulerInterface):
             self._sslo_apply_offload(now, result, b, delta, admitted,
                                      new_pending)
 
+        # SSLO: Token Budget D axis — shrink the decode set to D' when the
+        # decode step time alone breaks γ·t_min. Runs before the budget's P
+        # axis (computed in schedule_sslo) so TB*_pre is derived from Δ_dec(D').
+        if self.sslo_config.token_budget_control:
+            self._sslo_apply_decode_budget(
+                views_a, new_running, new_pending, b, delta, admitted,
+                result.k_star)
+
         # Decision-log score: R_run for measurable, 1.0 for forced.
         plan = ps.build_plan(
             views_a, waiting_views[:result.k_star], b, delta, lead,
@@ -1847,6 +1861,54 @@ class Scheduler(SchedulerInterface):
             pressures=pressures, tiers=tiers, admitted=admitted,
             base_tpot=base_tpot, pressure_components={})
         return pressures
+
+    # SSLO
+    def _sslo_apply_decode_budget(
+        self,
+        views_a: list["ps.ProgressView"],
+        new_running: list[Request],
+        new_pending: list[Request],
+        b: int,
+        delta: float,
+        admitted: list[Request],
+        k_star: int,
+    ) -> None:
+        """Token Budget D axis: defer slack-deep defer-safe requests until the
+        decode-only step time Δ_dec(D') fits γ·t_min.
+
+        Mutates ``new_running`` / ``new_pending`` in place (the deferred
+        requests move from one to the other) so the P axis, which reads
+        Δ_dec(len(self.running)) after commit, prices prefill against D'.
+        """
+        cfg = self.sslo_config
+        run_ids = {req.request_id for req in new_running}
+        run_views = [v for v in views_a if v.request_id in run_ids]
+        # SSLO: t_min over the decode set itself — the deadlines this step's
+        # decode time actually has to fit inside. Overdue requests (T_q <= 0)
+        # are excluded: their current unit is already missed and no shrink can
+        # save it, so only *preventable* deadlines may drive the D axis
+        # (oversaturated traces are otherwise overdue ~60% of wall time).
+        t_qs = [
+            v.T_q for v in run_views
+            if v.is_measurable() and v.T_q is not None and v.T_q > 0
+        ]
+        # Mirror build_plan's |A+| so the R_defer gating the defer decision is
+        # the same number the plan computed.
+        n_aplus = len(admitted) + len(self._sslo_onloading) + k_star
+        if cfg.kv_offload_share_includes_parked:
+            n_aplus += len(self._sslo_offloaded)
+        deferred = ps.select_decode_defer(
+            run_views, delta, ps.service_share(b, n_aplus),
+            min(t_qs) if t_qs else None, cfg.token_budget_gamma,
+            cfg.token_budget_decode_risk_eps, self._sslo_decode_wall_ema)
+        if deferred:
+            defer_ids = set(deferred)
+            new_pending.extend(
+                req for req in new_running if req.request_id in defer_ids)
+            new_running[:] = [
+                req for req in new_running if req.request_id not in defer_ids]
+        self._sslo_step.token_budget_decode = len(new_running)
+        self._sslo_step.token_budget_d_defers = len(deferred)
 
     # SSLO
     def _sslo_offload_view(
@@ -2148,9 +2210,12 @@ class Scheduler(SchedulerInterface):
             "k_star_unconstrained": self._sslo_step.k_star_unconstrained,
             "num_offloads": self._sslo_step.num_offloads,
             "num_onloads": self._sslo_step.num_onloads,
-            # SSLO: deadline-aware prefill budget diagnostics. Both are None
-            # while the control is off / not yet armed.
-            "prefill_budget": self._sslo_step.prefill_budget,
+            # SSLO: deadline-aware Token Budget diagnostics. TB*_pre (P axis),
+            # D' and this step's D-axis defers, and κ_p. All are None while
+            # the control is off / not yet armed.
+            "token_budget_prefill": self._sslo_step.token_budget_prefill,
+            "token_budget_decode": self._sslo_step.token_budget_decode,
+            "token_budget_d_defers": self._sslo_step.token_budget_d_defers,
             "prefill_kappa_ms_per_tok": (
                 None if kappa is None else kappa * 1000.0),
             # SSLO: per-step KV cache block usage
@@ -2278,15 +2343,15 @@ class Scheduler(SchedulerInterface):
         # SSLO: dispatcher patched in __init__ based on (method, policy).
         sslo_scores = self._apply_sslo_policy(scheduled_timestamp)
 
-        # SSLO: deadline-aware prefill token budget for this step (None ⇒
-        # control off). One shared counter bounds the TOTAL prefill tokens of
-        # the step: the running loop's chunked-prefill carry-over drains it
-        # first, then the waiting loop's new admits. Decode tokens are never
-        # charged and never capped.
-        sslo_prefill_budget = self._sslo_prefill_token_budget(
+        # SSLO: Token Budget P axis — TB*_pre for this step (None ⇒ control
+        # off). One shared counter bounds the TOTAL prefill tokens of the
+        # step: the running loop's chunked-prefill carry-over drains it first,
+        # then the waiting loop's new admits. Decode tokens are never charged
+        # and never capped.
+        sslo_token_budget_prefill = self._sslo_prefill_token_budget(
             scheduled_timestamp)
-        self._sslo_step.prefill_budget = sslo_prefill_budget
-        sslo_prefill_remaining = sslo_prefill_budget or 0
+        self._sslo_step.token_budget_prefill = sslo_token_budget_prefill
+        sslo_prefill_remaining = sslo_token_budget_prefill or 0
 
         self.kv_cache_manager.new_step_starts()
 
@@ -2336,7 +2401,7 @@ class Scheduler(SchedulerInterface):
             # granted so a carry-over can never stall permanently.
             sslo_is_carryover_prefill = (
                 request.num_computed_tokens < request.num_prompt_tokens)
-            if (sslo_prefill_budget is not None
+            if (sslo_token_budget_prefill is not None
                     and sslo_is_carryover_prefill
                     and num_new_tokens > 0):
                 num_new_tokens = max(
@@ -2411,7 +2476,7 @@ class Scheduler(SchedulerInterface):
                             # prefill carry-over that gets un-scheduled stays charged, so
                             # the rest of this step's budget is conservative, never
                             # permissive. Unreachable under FCFS; revisit if PRIORITY is
-                            # ever combined with prefill_budget_control.
+                            # ever combined with token_budget_control.
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
@@ -2527,7 +2592,7 @@ class Scheduler(SchedulerInterface):
                 # the waiting prefix carries over to the next step (chunked
                 # prefill), which is the intended smoothing. Onloads are
                 # deadline-forced, so they keep their traversal.
-                sslo_prefill_exhausted = (sslo_prefill_budget is not None
+                sslo_prefill_exhausted = (sslo_token_budget_prefill is not None
                                           and sslo_prefill_remaining <= 0)
                 if sslo_prefill_exhausted and sslo_onload_remaining <= 0:
                     break
@@ -2674,7 +2739,7 @@ class Scheduler(SchedulerInterface):
                     # guards above skipped/broke on exhaustion). An onload is
                     # deadline-forced and is not clamped; it is
                     # still charged below so the budget stays honest.
-                    if sslo_prefill_budget is not None and not sslo_is_onload:
+                    if sslo_token_budget_prefill is not None and not sslo_is_onload:
                         num_new_tokens = min(
                             num_new_tokens, sslo_prefill_remaining)
                     assert num_new_tokens > 0
