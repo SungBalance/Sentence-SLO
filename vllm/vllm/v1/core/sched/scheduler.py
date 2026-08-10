@@ -265,10 +265,13 @@ class Scheduler(SchedulerInterface):
         # for the κ estimate below and the "no prefill progress" signal of the
         # prefill-budget starvation guard.
         self._sslo_prev_step_prefill_tokens: int = 0
-        # SSLO: EMA of κ (seconds of extra step time per prefill token),
-        # measured as (Δ_observed - Δ_decode) / prefill_tokens on steps that
-        # carried prefill. None until such a step has been observed.
-        self._sslo_prefill_kappa: float | None = None
+        # SSLO: κ (seconds of extra step time per prefill token) as a
+        # ratio of EMAs — numerator EMA[Δ_observed - Δ_decode] (seconds,
+        # unclipped) and denominator EMA[prefill_tokens], both updated only on
+        # steps that carried prefill and had a batch-matched decode baseline.
+        # None until such a step has been observed. See _sslo_kappa().
+        self._sslo_kappa_excess_ema: float | None = None
+        self._sslo_kappa_tokens_ema: float | None = None
         # SSLO: consecutive floor-clamped prefill-budget steps with zero
         # prefill progress; released at _SSLO_PREFILL_FLOOR_STARVE_STEPS.
         self._sslo_prefill_floor_streak: int = 0
@@ -1141,17 +1144,48 @@ class Scheduler(SchedulerInterface):
         bucket[prev_prefills] = (
             delta if prev_val is None else alpha * delta + (1 - alpha) * prev_val)
 
-        # SSLO: κ EMA — the marginal step time a prefill token costs on top of
-        # the decode-only baseline. Only prefill-carrying steps inform it.
+        # SSLO: κ accumulators — the marginal step time a prefill token costs
+        # on top of the decode-only baseline, accumulated as separate EMAs of
+        # the excess time and of the token count (ratio taken in _sslo_kappa).
+        # Only prefill-carrying steps with a batch-matched decode baseline
+        # inform them; the excess is stored unclipped.
         if self.sslo_config.prefill_budget_control:
             prefill_tokens = self._sslo_prev_step_prefill_tokens
             delta_decode = self._sslo_decode_wall_ema(prev_batch)
             if prefill_tokens > 0 and delta_decode is not None:
-                sample = max(0.0, (delta - delta_decode) / prefill_tokens)
-                prev_kappa = self._sslo_prefill_kappa
-                self._sslo_prefill_kappa = (
-                    sample if prev_kappa is None
-                    else alpha * sample + (1 - alpha) * prev_kappa)
+                excess = delta - delta_decode
+                prev_excess = self._sslo_kappa_excess_ema
+                self._sslo_kappa_excess_ema = (
+                    excess if prev_excess is None
+                    else alpha * excess + (1 - alpha) * prev_excess)
+                prev_tokens = self._sslo_kappa_tokens_ema
+                self._sslo_kappa_tokens_ema = (
+                    float(prefill_tokens) if prev_tokens is None
+                    else alpha * prefill_tokens + (1 - alpha) * prev_tokens)
+
+    # SSLO
+    def _sslo_kappa(self) -> float | None:
+        """κ in seconds of extra step time per prefill token, read as a
+        ratio of sums: EMA[Δ_observed - Δ_decode] / EMA[prefill_tokens].
+
+        Estimating κ per sample as (Δ_obs - Δ_dec)/P instead divides step
+        noise by a small denominator on low-prefill steps — replaying phaseP
+        traces, P≤128 samples came out 20-100x the true κ — and clipping each
+        sample at 0 discards only the negative noise, so the EMA drifts up.
+        Both effects close a loop through P* (κ↑ → P*↓ → smaller P per step →
+        κ↑). Summing numerator and denominator separately weights each step by
+        its own token count and lets negative excess cancel positive.
+
+        None when no sample has landed yet, or when the ratio is ≤ 0 (the
+        prefill steps were no slower than the decode-only baseline, so there
+        is nothing to budget against) — callers treat both as "no estimate".
+        """
+        excess = self._sslo_kappa_excess_ema
+        tokens = self._sslo_kappa_tokens_ema
+        if excess is None or tokens is None or tokens <= 0:
+            return None
+        kappa = excess / tokens
+        return kappa if kappa > 0 else None
 
     # SSLO
     def _sslo_decode_wall_ema(self, n: int) -> float | None:
@@ -1291,7 +1325,7 @@ class Scheduler(SchedulerInterface):
             return None
         if not self.scheduler_config.enable_chunked_prefill:
             return None
-        kappa = self._sslo_prefill_kappa
+        kappa = self._sslo_kappa()
         if kappa is None:
             return None
         delta_decode = self._sslo_decode_wall_ema(len(self.running))
@@ -2076,6 +2110,8 @@ class Scheduler(SchedulerInterface):
                 else:
                     prefill_reqs += 1
                     scheduled_prefill_tokens += n
+        # SSLO
+        kappa = self._sslo_kappa()
         stats_row = {
             "kind": "step",
             "ts": now,
@@ -2116,8 +2152,7 @@ class Scheduler(SchedulerInterface):
             # while the control is off / not yet armed.
             "prefill_budget": self._sslo_step.prefill_budget,
             "prefill_kappa_ms_per_tok": (
-                None if self._sslo_prefill_kappa is None
-                else self._sslo_prefill_kappa * 1000.0),
+                None if kappa is None else kappa * 1000.0),
             # SSLO: per-step KV cache block usage
             "kv_blocks_used": (
                 self.kv_cache_manager.block_pool.num_gpu_blocks
@@ -3905,7 +3940,8 @@ class Scheduler(SchedulerInterface):
         self._sslo_prev_step_num_prefills = 0
         # SSLO: deadline-aware prefill budget accumulators.
         self._sslo_prev_step_prefill_tokens = 0
-        self._sslo_prefill_kappa = None
+        self._sslo_kappa_excess_ema = None
+        self._sslo_kappa_tokens_ema = None
         self._sslo_prefill_floor_streak = 0
         self._sslo_prev_step_batch = None
         self._sslo_prev_step_decoding_only = False

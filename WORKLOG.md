@@ -2529,3 +2529,42 @@ Modes are now exactly `{baseline, progress_serve}`.
   `test_tts_consume_path.py::test_tts_path_uses_audio_ready_time_for_slack_and_deadline`).
   Against pre-fix `scheduler.py` the two new regression tests fail as intended.
   `python3 -m py_compile` clean. No GPU runs (effect re-run awaits user approval).
+
+## Session: κ ratio-of-sums 추정기 (per-sample EMA 소분모 발산 제거)
+
+**Modified**
+- `vllm/vllm/v1/core/sched/scheduler.py` — κ 상태를 스칼라 EMA
+  `_sslo_prefill_kappa` 에서 두 누적기 `_sslo_kappa_excess_ema`(초과 시간 초,
+  **클리핑 없음**) / `_sslo_kappa_tokens_ema`(prefill 토큰 수)로 교체.
+  `_update_tpot_ema` 는 배치 매칭된 Δ_dec 가 있는 prefill 스텝에서만 두 누적기를
+  같은 α(`tpot_ema_alpha`)로 갱신(기존 skip 가드 유지). 새 읽기 헬퍼
+  `_sslo_kappa()` 가 `excess_ema / tokens_ema` 를 반환하고, 샘플 없음 또는 비율
+  ≤ 0 이면 None(= 추정 없음 → P* 제어 비활성, base budget). 하한은 per-sample
+  이 아니라 최종 비율에만 적용. `_sslo_prefill_token_budget`(P*),
+  step stats 의 `prefill_kappa_ms_per_tok`, `reset_sslo_state` 를 새 상태로 전환.
+  `progress_serve.prefill_budget()` 는 κ 를 인자로 받으므로 무변경(확인만).
+  동기: per-sample `(Δ_obs−Δ_dec)/P` 는 P 가 작은 스텝에서 스텝 노이즈를 소분모로
+  나눠 참값의 20~100배 샘플을 만들고, `max(0,·)` 가 음수 노이즈만 버려 상향 편향 →
+  κ↑ → P*↓ → 스텝당 P 축소 → κ↑ 의 폐루프.
+
+**Added**
+- `vllm/tests/sslo/test_scheduler_sslo.py` — 헬퍼 `_kappa_sample()` 및 2 테스트:
+  `test_kappa_ratio_of_sums_survives_small_denominator_samples`
+  (P=2000/excess 320 ms 정상 샘플 1개 뒤 P=8/excess 5 ms 쓰레기 샘플 10개 →
+  κ 가 참값 0.16 ms/tok 의 ±20% 내 유지; 구 추정기는 0.463 ms/tok = 2.89배),
+  `test_kappa_keeps_negative_excess_unclipped`(음수 excess 가 κ 를 끌어내림;
+  클리핑 구현이면 0.000144, 새 구현은 0.000141).
+
+**Debugging / verification**
+- 기존 κ 테스트 갱신: `test_kappa_ema_updates_from_prefill_step`,
+  `test_kappa_ema_skips_decode_only_steps`(구 `..._and_clamps_negative` 에서
+  clamp 파트 분리), `test_kappa_sample_uses_batch_matched_decode_cell`,
+  `test_kappa_sample_dropped_without_batch_matched_decode_cell`(두 누적기 불변
+  검증), `test_prefill_budget_requires_kappa_and_decode_reference`(κ ≤ 0 케이스
+  추가), `_prep_prefill_budget` / `make_scheduler` 시드.
+- `python -m pytest tests/sslo/ -q` in `sk-sslo` (/workspace/mlsys/vllm):
+  186 passed, 1 skipped, 1 failed (기존
+  `test_tts_consume_path.py::test_tts_path_uses_audio_ready_time_for_slack_and_deadline`).
+  `python -m py_compile` clean. GPU 실행 없음.
+- 구 추정기 재현 시뮬레이션(컨테이너)으로 새 소분모 테스트가 구 코드에서
+  실패함을 확인(2.89배).

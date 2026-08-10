@@ -138,7 +138,8 @@ def make_scheduler(
     scheduler._sslo_prev_step_start_ts = None
     # SSLO: deadline-aware prefill budget state normally seeded by __init__.
     scheduler._sslo_prev_step_prefill_tokens = 0
-    scheduler._sslo_prefill_kappa = None
+    scheduler._sslo_kappa_excess_ema = None
+    scheduler._sslo_kappa_tokens_ema = None
     scheduler._sslo_prefill_floor_streak = 0
     scheduler._sslo_step = SsloStepState(
         cur_max_num_requests=max_num_running_reqs)
@@ -866,7 +867,9 @@ def _prep_prefill_budget(scheduler, *, kappa=0.001, delta_decode=0.08):
     scheduler.scheduler_config = SimpleNamespace(
         async_scheduling=False, long_prefill_token_threshold=0,
         enable_chunked_prefill=True)
-    scheduler._sslo_prefill_kappa = kappa
+    # κ is read as the ratio of the two accumulators.
+    scheduler._sslo_kappa_excess_ema = kappa * 1000.0
+    scheduler._sslo_kappa_tokens_ema = 1000.0
     scheduler._sslo_step_wall_ema = {len(scheduler.running): {0: delta_decode}}
 
 
@@ -892,10 +895,16 @@ def test_prefill_budget_requires_kappa_and_decode_reference():
     _prep_prefill_budget(scheduler)
 
     # No κ sample yet → control stays off.
-    scheduler._sslo_prefill_kappa = None
+    scheduler._sslo_kappa_excess_ema = None
+    scheduler._sslo_kappa_tokens_ema = None
+    assert scheduler._sslo_prefill_token_budget(0.0) is None
+    # Non-positive κ (prefill steps no slower than the decode-only baseline)
+    # is not a usable estimate either → control stays off.
+    _prep_prefill_budget(scheduler)
+    scheduler._sslo_kappa_excess_ema = -1.0
     assert scheduler._sslo_prefill_token_budget(0.0) is None
     # No decode-only wall-EMA cell → control stays off.
-    scheduler._sslo_prefill_kappa = 0.001
+    _prep_prefill_budget(scheduler)
     scheduler._sslo_step_wall_ema = {1: {2: 0.4}}
     assert scheduler._sslo_prefill_token_budget(0.0) is None
 
@@ -980,13 +989,24 @@ def test_step_stats_records_prefill_budget(monkeypatch, tmp_path):
     scheduler = make_scheduler(running=[])
     scheduler.kv_cache_manager.block_pool.num_gpu_blocks = 1_000_000
     scheduler._sslo_step.prefill_budget = 920
-    scheduler._sslo_prefill_kappa = 0.001
+    scheduler._sslo_kappa_excess_ema = 1.0
+    scheduler._sslo_kappa_tokens_ema = 1000.0
 
     scheduler._sslo_dump_step_stats(0.0)
 
     row = json.loads(stats_path.read_text().splitlines()[0])
     assert row["prefill_budget"] == 920
     assert row["prefill_kappa_ms_per_tok"] == 1.0
+
+
+def _kappa_sample(scheduler, *, prefill_tokens, delta, batch=4):
+    """Feed one prefill-carrying step of wall time `delta` into the κ
+    accumulators (batch-matched decode cell must already exist)."""
+    scheduler._sslo_prev_step_batch = batch
+    scheduler._sslo_prev_step_num_prefills = 1
+    scheduler._sslo_prev_step_prefill_tokens = prefill_tokens
+    scheduler._sslo_prev_step_start_ts = 0.0
+    scheduler._update_tpot_ema(delta)
 
 
 def test_kappa_ema_updates_from_prefill_step():
@@ -1004,10 +1024,10 @@ def test_kappa_ema_updates_from_prefill_step():
     scheduler._update_tpot_ema(0.18)
 
     # κ = (0.18 - 0.08) / 100 = 1 ms/token (alpha=1 → the sample itself).
-    assert scheduler._sslo_prefill_kappa == pytest.approx(0.001)
+    assert scheduler._sslo_kappa() == pytest.approx(0.001)
 
 
-def test_kappa_ema_skips_decode_only_steps_and_clamps_negative():
+def test_kappa_ema_skips_decode_only_steps():
     cfg = SsloConfig(method="progress_serve", prefill_budget_control=True,
                      tpot_ema_alpha=1.0)
     scheduler = make_scheduler(running=[], cfg=cfg)
@@ -1018,13 +1038,47 @@ def test_kappa_ema_skips_decode_only_steps_and_clamps_negative():
     # No prefill tokens → no κ sample.
     scheduler._sslo_prev_step_prefill_tokens = 0
     scheduler._update_tpot_ema(0.09)
-    assert scheduler._sslo_prefill_kappa is None
+    assert scheduler._sslo_kappa_excess_ema is None
+    assert scheduler._sslo_kappa_tokens_ema is None
+    assert scheduler._sslo_kappa() is None
 
-    # Faster than the decode-only reference → κ sample clamps to 0.
-    scheduler._sslo_prev_step_num_prefills = 1
-    scheduler._sslo_prev_step_prefill_tokens = 50
-    scheduler._update_tpot_ema(0.05)
-    assert scheduler._sslo_prefill_kappa == 0.0
+
+def test_kappa_keeps_negative_excess_unclipped():
+    # A step that beat the decode-only baseline is noise like any other; the
+    # old per-sample max(0, ·) clip dropped exactly these, so only positive
+    # noise survived and κ drifted upward. Unclipped, it pulls κ back down.
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
+    scheduler = make_scheduler(running=[], cfg=cfg)
+    scheduler._sslo_step_wall_ema = {4: {0: 0.08}}
+
+    _kappa_sample(scheduler, prefill_tokens=1000, delta=0.24)
+    assert scheduler._sslo_kappa() == pytest.approx(0.00016)
+
+    # 30 ms under the 0.08 s decode-only baseline.
+    _kappa_sample(scheduler, prefill_tokens=1000, delta=0.05)
+
+    # alpha=0.1: excess EMA 0.1*(-0.03) + 0.9*0.16 = 0.141 over 1000 tokens.
+    # Clipping the sample at 0 would leave κ at 0.9*0.00016 = 0.000144.
+    assert scheduler._sslo_kappa() == pytest.approx(0.000141)
+
+
+def test_kappa_ratio_of_sums_survives_small_denominator_samples():
+    # The small-denominator failure mode of a per-sample κ EMA: one honest
+    # large-P step (320 ms of excess over 2000 tokens = 0.16 ms/tok) followed
+    # by ten 8-token steps that each ran 5 ms long. As per-sample estimates
+    # those are 0.625 ms/tok each and a κ EMA settles at ~0.46 ms/tok (~3x the
+    # truth); weighting each step by its own token count keeps κ near 0.16.
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
+    scheduler = make_scheduler(running=[], cfg=cfg)
+    scheduler._sslo_step_wall_ema = {4: {0: 0.08}}
+
+    _kappa_sample(scheduler, prefill_tokens=2000, delta=0.40)
+    assert scheduler._sslo_kappa() == pytest.approx(0.00016)
+
+    for _ in range(10):
+        _kappa_sample(scheduler, prefill_tokens=8, delta=0.085)
+
+    assert scheduler._sslo_kappa() == pytest.approx(0.00016, rel=0.2)
 
 
 def test_kappa_sample_uses_batch_matched_decode_cell():
@@ -1046,7 +1100,7 @@ def test_kappa_sample_uses_batch_matched_decode_cell():
     scheduler._update_tpot_ema(0.172)
 
     # (0.172 - 0.072) / 100, not (0.172 - 0.006) / 100.
-    assert scheduler._sslo_prefill_kappa == pytest.approx(0.001)
+    assert scheduler._sslo_kappa() == pytest.approx(0.001)
 
 
 def test_kappa_sample_dropped_without_batch_matched_decode_cell():
@@ -1056,7 +1110,8 @@ def test_kappa_sample_dropped_without_batch_matched_decode_cell():
                      tpot_ema_alpha=1.0)
     scheduler = make_scheduler(running=[], cfg=cfg)
     scheduler._sslo_step_wall_ema = {8: {0: 0.006}, 40: {2: 0.15}}
-    scheduler._sslo_prefill_kappa = 0.0005
+    scheduler._sslo_kappa_excess_ema = 0.5
+    scheduler._sslo_kappa_tokens_ema = 1000.0
     scheduler._sslo_prev_step_batch = 40
     scheduler._sslo_prev_step_num_prefills = 2
     scheduler._sslo_prev_step_prefill_tokens = 100
@@ -1064,7 +1119,8 @@ def test_kappa_sample_dropped_without_batch_matched_decode_cell():
 
     scheduler._update_tpot_ema(0.172)
 
-    assert scheduler._sslo_prefill_kappa == 0.0005
+    assert scheduler._sslo_kappa_excess_ema == 0.5
+    assert scheduler._sslo_kappa_tokens_ema == 1000.0
 
 
 def test_prefill_budget_off_without_batch_matched_decode_cell():
