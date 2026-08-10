@@ -1,5 +1,27 @@
 # Work Log
 
+## 2026-08-10 (push 차단 시크릿 제거 + nocode 필터 unfenced 코드 감지)
+
+**Modified**
+- `exp/tools/lm_datasets.py` — `_is_code_request` 에 `_CODE_LINE_PATTERN`
+  추가: ``` 펜스 없이 붙여넣은 원시 코드 감지 (import/#include,
+  public/private/protected 선언, statement 형태의 `;` 종결 라인,
+  `});` 류 구두점-단독 라인). 코드형 라인 ≥3 (`_MIN_CODE_LINES`) 일 때만
+  코드로 판정해 산문 오탐 방지.
+- `exp/tools/dataset_cache/dialogues_wildchat_conv-en-nocode.jsonl` —
+  수정된 필터로 재생성 (4000 dialogues, build seed 42).
+
+**Debugging / verification**
+- GitHub Push Protection 이 구 캐시 3234행의 Mapbox 토큰(WildChat 원문
+  유래)으로 push 차단 → `b192ae46a` amend + cherry-pick 으로 히스토리에서
+  redact (재작성 전후 트리 차이는 해당 1줄뿐임을 diff 로 확인).
+- 구 캐시 4000개 재현 검사: 새 필터가 코드 대화 100건(2.5%) 드롭, 확인된
+  코드 유출건(javadoc/Java, Dart/Mapbox, "code:"+Python, JS 덤프) 전부
+  검출, 산문 유지 확인(콘랭 음운 목록·트위터 핸들 덤프·EXIF 덤프 등).
+  sslo-verifier 루프 이슈 없음.
+- 재생성 캐시 검증: 새 필터 기준 코드 대화 0건, ``` 펜스 0건, 시크릿 패턴
+  8종(mapbox/github/aws/openai/slack/google/private-key/jwt) 클린.
+
 ## 2026-08-05 (sweep v2 Phase N 중간 결과 + ProgressServe admission 자기잠금 진단)
 
 - 실행: sweep v2 Phase N (Qwen3-32B, GEN 8192, wildchat dialogue, 구 rate

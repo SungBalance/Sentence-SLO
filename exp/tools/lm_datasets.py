@@ -60,15 +60,40 @@ _CODE_PROMPT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Unfenced pasted code: prompts that paste raw source without ``` fences
+# (imports, class/member declarations, `;`-terminated statements,
+# closing-punctuation lines). Each line form alone can occur in prose,
+# so a text is only treated as code when several lines match
+# (_MIN_CODE_LINES).
+_CODE_LINE_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"import\s+[\w.'\"]"
+    r"|from\s+[\w.]+\s+import\b"
+    r"|#include\s*[<\"]"
+    r"|(?:public|private|protected)\s+\w+"
+    # `;`-terminated line that starts statement-shaped (call,
+    # assignment, or declaration) — prose lists also end lines with
+    # ";" but don't start like statements.
+    r"|(?:[\w$.]+\(|[\w$.]+\s*=[^=\n]|\w+\s+[\w$]+\s*[=;(])[^\n]*;[ \t]*$"
+    # line of only closing/punctuation chars, e.g. "});"
+    r"|[(){}\[\];]+\s*$"
+    r")",
+    re.MULTILINE,
+)
+_MIN_CODE_LINES = 3
+
 
 def _is_code_request(prompt: str, response: str | None = None) -> bool:
     """Return True if the prompt (or its first response) signals code-gen.
 
-    - Prompt-side: regex on common code-request phrasing / fenced blocks.
+    - Prompt-side: regex on common code-request phrasing / fenced blocks,
+      plus a multi-line check for raw source pasted without fences.
     - Response-side (when available): triple-backtick fenced code block
       is a near-certain signal the model interpreted it as code-gen.
     """
     if _CODE_PROMPT_PATTERN.search(prompt):
+        return True
+    if len(_CODE_LINE_PATTERN.findall(prompt)) >= _MIN_CODE_LINES:
         return True
     if response and "```" in response:
         return True
