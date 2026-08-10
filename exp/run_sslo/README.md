@@ -36,19 +36,59 @@ sweeps `max_num_seqs`, `request_rate`, and `chunk_unit` (sentence / paragraph).
 
 ## Modes
 
-Four scheduling modes are supported (see `MODES_DEFAULT` in `metrics_utils.py`):
-`baseline`, `progress_serve`, `progress_serve_adaptive`, `progress_serve_offload`.
+Seven scheduling modes are supported (see `MODES_DEFAULT` in
+`metrics_utils.py`): `baseline`, `progress_serve`, `progress_serve_adaptive`,
+`progress_serve_offload`, `progress_serve_offload_adaptive`,
+`progress_serve_prefill_budget`, `progress_serve_offload_prefill_budget`.
 
 `progress_serve_offload` runs `progress_serve` with the KV offload tier
 (`kv_offload=True`). It requires the CPU-offload connector — `run_test.py`
 wires `KVTransferConfig(kv_connector="SimpleCPUOffloadConnector", ...)` in eager
 mode and forces `enable_prefix_caching=True` (the connector self-disables
 without it). CPU capacity comes from `CPU_OFFLOAD_GB` (default 16). Offload
-events are recorded per-step in `scheduler_stats.jsonl` / `decisions.jsonl`
-(`num_offloaded`, `kv_capped`, `k_star_unconstrained`); there is no separate
-offload log file.
+events are recorded per-step in `scheduler_stats.jsonl` (`num_offloads` /
+`num_onloads` = ops this step, `num_offloaded` = current CPU-resident
+population, `kv_capped`, `k_star_unconstrained`) and per-event in
+`decisions.jsonl` (`kind="offload"` / `kind="onload"`); there is no separate
+offload log file. The tier counts CPU-parked requests in the service share
+(`kv_offload_share_includes_parked=True`, the adopted default since ablation A1
+— WORKLOG 2026-08-07); `SSLO_KV_OFFLOAD_SHARE_INCLUDES_PARKED=0` only reproduces
+the pre-A1 semantics. `progress_serve_offload_adaptive` is the same mode with
+adaptive batching also enabled.
+
+`progress_serve_prefill_budget` runs `progress_serve` with the deadline-aware
+prefill token budget (`prefill_budget_control=True`): the **total** prefill
+tokens of a step — chunked-prefill carry-over in the running loop plus new
+admits in the waiting loop, sharing one counter — are capped at
+`P* = clamp((γ·t_min − Δ_decode)/κ, floor, max_num_batched_tokens)`, where
+`t_min` is the nearest in-flight chunk deadline and κ the online per-prefill-
+token step-time cost. Decode tokens are never capped. Request concurrency is
+untouched (no adaptive batching),
+so it is throughput-neutral and composes with the offload tier —
+`progress_serve_offload_prefill_budget` is both. `SSLO_PREFILL_BUDGET_FLOOR`
+(default 512 tokens) and `SSLO_PREFILL_BUDGET_GAMMA` (default 0.5) override the
+knobs. The applied budget and κ are logged per step in
+`scheduler_stats.jsonl` as `prefill_budget` / `prefill_kappa_ms_per_tok`.
 
 All aggregators default to all modes. Pass `--modes baseline,progress_serve` to restrict.
+
+## Dialogue (multi-turn) Workload
+
+`DIALOGUE_PROMPTS=1` switches the prompt pool from single-turn prompts to
+multi-turn dialogue prefixes: each conversation is truncated to its last user
+turn and rendered with the model's chat template, so prefill sees the whole
+history. It requires `DATASET_NAME=wildchat|lmsys|combine` — the default
+`koala` is a single-turn instruction set and raises immediately.
+`MAX_PROMPT_TOKENS=N` drops prompts longer than N tokens (0 = off). Both env
+vars are honored by `run_test.sh` and passed through by `run_sweep.sh`.
+
+Filtered dialogues are cached raw (before chat-template application, so the
+file is reusable across models) at
+`exp/tools/dataset_cache/dialogues_{dataset}_{filters}.jsonl`, keyed by source
+dataset and the `CONVERSATION_ONLY` / `ENGLISH_ONLY` / `EXCLUDE_CODE` filter
+combination; only the first cold run pays the HF streaming cost. If the cache
+holds fewer dialogues than `NUM_PROMPTS`, the run logs the shortfall and uses
+what is there — delete the file to rebuild it larger.
 
 ## Chunk Units
 

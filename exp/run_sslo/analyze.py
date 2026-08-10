@@ -18,7 +18,10 @@ from validity import validate_run
 
 MAX_NUM_SEQS = 64
 DEFAULT_OUTPUT_DIR = "exp/run_sslo/output"
-SSLO_MODES = ("progress_serve", "progress_serve_adaptive", "progress_serve_offload")
+SSLO_MODES = ("progress_serve", "progress_serve_adaptive",
+              "progress_serve_offload", "progress_serve_offload_adaptive",
+              "progress_serve_prefill_budget",
+              "progress_serve_offload_prefill_budget")
 ALL_MODES = ("baseline",) + SSLO_MODES
 SIX_STAT_KEYS = ("mean", "p50", "p90", "p95", "p99", "max")
 
@@ -70,6 +73,11 @@ def finalize_round2_metrics(
     ):
         if key in metrics:
             final[key] = metrics[key]
+
+    # KV-offload lifecycle aggregate (progress_serve_offload runs only;
+    # offload_request_stats() omits modes without the offload fields).
+    if metrics.get("offload"):
+        final["offload"] = metrics["offload"]
 
     if "workload" in metrics:
         final["workload"] = {}
@@ -634,6 +642,10 @@ def analyze(
         pending_tw = _time_weighted_mean(sched_rows, "pending", sched_mw0, sched_mw1)
         waiting_tw = _time_weighted_mean(sched_rows, "waiting", sched_mw0, sched_mw1)
         hu_tw = _time_weighted_mean(sched_rows, "num_handling_users", sched_mw0, sched_mw1)
+        # SSLO: same mean over the GPU-resident-only count (excludes
+        # KV-offloaded requests); None on runs logged before the split.
+        hu_online_tw = _time_weighted_mean(
+            sched_rows, "num_handling_users_online", sched_mw0, sched_mw1)
         # has_critical is bool; coerce to 0/1 then time-weight.
         crit_rows = [{**r, "_crit": (1.0 if r.get("has_critical") else 0.0)}
                      for r in sched_rows]
@@ -670,6 +682,7 @@ def analyze(
             "mean_pending_time_weighted": pending_tw,
             "mean_waiting_time_weighted": waiting_tw,
             "mean_handling_users_time_weighted": hu_tw,
+            "mean_handling_users_online_time_weighted": hu_online_tw,
             "urgent_mode_fraction": crit_frac,
             # Unbiased token throughputs from scheduler-side counters.
             "decode_tokens_per_second": (

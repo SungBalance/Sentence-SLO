@@ -16,13 +16,17 @@
 #   Phase 2: MODEL_SPECS[1] (default 35B) run_1
 #   Phase 3: MODEL_SPECS[0]               run_2..REPEATS
 #   Phase 4: MODEL_SPECS[1]               run_2..REPEATS
+# With a single MODEL_SPECS entry, phases 2 and 4 are skipped.
 #
 # Env overrides:
-#   MODEL_SPECS      space-sep "<slug>:<HF_id>" pairs (default 9B + 35B-A3B; must be 2)
+#   MODEL_SPECS      space-sep "<slug>:<HF_id>" pairs (default 9B + 35B-A3B; 1 or 2 entries)
 #   CAPS             max_num_seqs values (space-sep)  (default "32 64 128 256")
 #   MODES            modes (comma-sep)            (default baseline,progress_serve)
 #                    selectable: baseline, progress_serve,
-#                    progress_serve_adaptive, progress_serve_offload
+#                    progress_serve_adaptive, progress_serve_offload,
+#                    progress_serve_offload_adaptive,
+#                    progress_serve_prefill_budget,
+#                    progress_serve_offload_prefill_budget
 #                    (e.g. MODES=baseline,progress_serve_offload)
 #   REPEATS          number of repeats                (default 3)
 #   RATES            rate ladder (space-sep)          (default "8 12 16 20 24")
@@ -60,6 +64,8 @@ CONVERSATION_ONLY="${CONVERSATION_ONLY:-1}"
 ENGLISH_ONLY="${ENGLISH_ONLY:-1}"
 MAX_RESPONSE_CHUNK_CHARS="${MAX_RESPONSE_CHUNK_CHARS:-1000}"
 SECONDS_PER_WORD="${SECONDS_PER_WORD:-0.28}"
+DIALOGUE_PROMPTS="${DIALOGUE_PROMPTS:-0}"
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-0}"
 
 # Parse "read" or "tts:<HF_id>" → echoes "<consume_mode> <tts_slug> <tts_model>"
 # Uses "-" placeholder for empty tts_model (read mode) to keep token count fixed.
@@ -119,6 +125,8 @@ launch_job() {
     ENGLISH_ONLY="$ENGLISH_ONLY" \
     MAX_RESPONSE_CHUNK_CHARS="$MAX_RESPONSE_CHUNK_CHARS" \
     SECONDS_PER_WORD="$SECONDS_PER_WORD" \
+    DIALOGUE_PROMPTS="$DIALOGUE_PROMPTS" \
+    MAX_PROMPT_TOKENS="$MAX_PROMPT_TOKENS" \
     bash exp/run_sslo/run_test.sh "$mode" "$cap" "$model" \
     > "$outdir/run.log" 2>&1
 }
@@ -199,23 +207,32 @@ run_phase() {
 }
 
 # ----- 4-phase plan ----------------------------------------------------
-if (( ${#MODEL_SPECS[@]} != 2 )); then
-  echo "ERROR: Phase plan requires exactly 2 entries in MODEL_SPECS; got ${#MODEL_SPECS[@]}." >&2
+if (( ${#MODEL_SPECS[@]} < 1 || ${#MODEL_SPECS[@]} > 2 )); then
+  echo "ERROR: Phase plan requires 1 or 2 entries in MODEL_SPECS; got ${#MODEL_SPECS[@]}." >&2
   exit 1
 fi
 m0_slug="${MODEL_SPECS[0]%%:*}"; m0_hf="${MODEL_SPECS[0]#*:}"
-m1_slug="${MODEL_SPECS[1]%%:*}"; m1_hf="${MODEL_SPECS[1]#*:}"
+has_m1=0
+if (( ${#MODEL_SPECS[@]} == 2 )); then
+  m1_slug="${MODEL_SPECS[1]%%:*}"; m1_hf="${MODEL_SPECS[1]#*:}"
+  has_m1=1
+fi
 
 later_repeats=()
 for r in $(seq 2 "$REPEATS"); do later_repeats+=("$r"); done
 
 mapfile -t p1 < <(build_phase_jobs "$m0_slug" "$m0_hf" 1)
-mapfile -t p2 < <(build_phase_jobs "$m1_slug" "$m1_hf" 1)
+p2=()
 p3=()
 p4=()
+if (( has_m1 )); then
+  mapfile -t p2 < <(build_phase_jobs "$m1_slug" "$m1_hf" 1)
+fi
 if (( ${#later_repeats[@]} > 0 )); then
   mapfile -t p3 < <(build_phase_jobs "$m0_slug" "$m0_hf" "${later_repeats[@]}")
-  mapfile -t p4 < <(build_phase_jobs "$m1_slug" "$m1_hf" "${later_repeats[@]}")
+  if (( has_m1 )); then
+    mapfile -t p4 < <(build_phase_jobs "$m1_slug" "$m1_hf" "${later_repeats[@]}")
+  fi
 fi
 
 phase3_label="2..${REPEATS}"
@@ -225,9 +242,9 @@ phase3_label="2..${REPEATS}"
 # to run only run_2..REPEATS (preserving existing run_1 outputs).
 START_PHASE="${START_PHASE:-1}"
 (( START_PHASE <= 1 )) && run_phase "1 (${m0_slug} run_1)" "${p1[@]}"
-(( START_PHASE <= 2 )) && run_phase "2 (${m1_slug} run_1)" "${p2[@]}"
+(( has_m1 && START_PHASE <= 2 )) && run_phase "2 (${m1_slug} run_1)" "${p2[@]}"
 (( START_PHASE <= 3 )) && run_phase "3 (${m0_slug} run_${phase3_label})" "${p3[@]}"
-(( START_PHASE <= 4 )) && run_phase "4 (${m1_slug} run_${phase3_label})" "${p4[@]}"
+(( has_m1 && START_PHASE <= 4 )) && run_phase "4 (${m1_slug} run_${phase3_label})" "${p4[@]}"
 
 echo
 echo "===== sweep complete ====="

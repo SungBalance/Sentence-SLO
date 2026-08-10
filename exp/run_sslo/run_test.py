@@ -16,7 +16,8 @@ import random as _random
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
-from lm_datasets import load_prompts, _load_wildchat, _load_lmsys
+from lm_datasets import (
+    load_prompts, load_dialogues, _load_wildchat, _load_lmsys)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from metrics_utils import MODES_DEFAULT
@@ -24,6 +25,15 @@ from analysis.cpslo_names import classify_request
 
 
 DEFAULT_OUTPUT_DIR = "exp/run_sslo/output"
+# Fixed seed for the dialogue cache build so cached content is seed-agnostic.
+DIALOGUE_BUILD_SEED = 42
+# SSLO: run kinds that enable the KV offload tier.
+OFFLOAD_RUN_KINDS = ("progress_serve_offload",
+                     "progress_serve_offload_adaptive",
+                     "progress_serve_offload_prefill_budget")
+# SSLO: run kinds that enable the deadline-aware prefill token budget.
+PREFILL_BUDGET_RUN_KINDS = ("progress_serve_prefill_budget",
+                            "progress_serve_offload_prefill_budget")
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +77,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-seed", type=int, default=42,
         help="Seed used by the pool builder shuffle.",
+    )
+    parser.add_argument(
+        "--dialogue-prompts", action="store_true",
+        help="Inject multi-turn dialogue prefixes instead of single-turn "
+             "prompts: each conversation is truncated to its last user "
+             "turn and rendered with the model's chat template. Requires "
+             "--dataset-name wildchat / lmsys / combine — the default "
+             "koala has no dialogue rows and raises.",
+    )
+    parser.add_argument(
+        "--max-prompt-tokens", type=int, default=0,
+        help="Drop dialogue prompts whose token count after chat-template "
+             "application exceeds this value. 0 = disabled. Only used "
+             "with --dialogue-prompts.",
     )
     parser.add_argument("--num-prompts", type=int, default=4000,
                         help="Pool size (prompts loaded into the sampling pool).")
@@ -160,6 +184,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--presence-penalty", type=float, default=None)
     parser.add_argument("--repetition-penalty", type=float, default=None)
     args = parser.parse_args()
+    if args.dialogue_prompts and not args.apply_chat_template:
+        parser.error(
+            "--dialogue-prompts requires the chat template to serialize "
+            "multi-turn history; drop --no-chat-template.")
     # Parse rates list (accept "0.5,1,2" or "0.5 1 2" or single "4").
     raw = args.request_rates.replace(",", " ").split()
     try:
@@ -201,6 +229,16 @@ def load_workload(
     return repeated[:num_prompts]
 
 
+def _pool_source(args: argparse.Namespace) -> str:
+    """Identifier for the prompt pool, recorded in run_meta.json."""
+    if args.dialogue_prompts:
+        label = f"dialogue_{args.dataset_name}"
+        if args.max_prompt_tokens > 0:
+            label += f"_maxtok{args.max_prompt_tokens}"
+        return label
+    return "wildchat2048_lmsys2048"
+
+
 def _build_pool(args: argparse.Namespace) -> list[str]:
     """Build the sampling pool from the seed-agnostic combined cache.
 
@@ -209,7 +247,41 @@ def _build_pool(args: argparse.Namespace) -> list[str]:
     seeds. Seed only controls the load-time shuffle in
     `load_or_build_combine_pool`. Chat template is then applied
     per-model.
+
+    With --dialogue-prompts the pool is built from multi-turn dialogues
+    instead (see `build_dialogue_prompts`), cached raw — before chat
+    template application — in a per-source dialogue cache file.
     """
+    if args.dialogue_prompts:
+        from dataset_cache import load_or_build_dialogue_pool
+
+        def _build_dialogues() -> list[list[dict[str, Any]]]:
+            # Canonical seed, not args.dataset_seed: for --dataset-name
+            # combine the loader seed changes which dialogues land in the
+            # pool, and the cache content must stay seed-agnostic. Per-run
+            # ordering comes from the cache layer's shuffle below.
+            return load_dialogues(
+                args.dataset_name, max_dialogues=args.num_prompts,
+                exclude_code=args.exclude_code, seed=DIALOGUE_BUILD_SEED,
+                conversation_only=args.conversation_only,
+                english_only=args.english_only)
+
+        dialogues = load_or_build_dialogue_pool(
+            dataset_name=args.dataset_name,
+            conversation_only=args.conversation_only,
+            english_only=args.english_only,
+            exclude_code=args.exclude_code,
+            max_dialogues=args.num_prompts,
+            seed=args.dataset_seed,
+            build_fn=_build_dialogues)
+        pool = build_dialogue_prompts(
+            dialogues, args.model,
+            enable_thinking=args.enable_thinking,
+            max_prompt_tokens=args.max_prompt_tokens)
+        if not pool:
+            raise RuntimeError("dialogue pool is empty")
+        return pool
+
     from dataset_cache import load_or_build_combine_pool
 
     def _build_uncached() -> list[str]:
@@ -259,6 +331,50 @@ def apply_chat_template_to_prompts(
             add_generation_prompt=True,
             enable_thinking=enable_thinking,
         ))
+    return out
+
+
+def build_dialogue_prompts(
+    dialogues: list[list[dict[str, Any]]],
+    model: str,
+    *,
+    enable_thinking: bool,
+    max_prompt_tokens: int,
+) -> list[str]:
+    """Render each dialogue's prefix up to its last user turn as a prompt.
+
+    Trailing non-user messages are dropped so the templated prompt ends on
+    the user turn the model is asked to answer; dialogues with no user
+    turn are skipped. Prompts longer than `max_prompt_tokens` tokens are
+    dropped (0 = disabled).
+    """
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    out = []
+    dropped_no_user = 0
+    dropped_too_long = 0
+    for dialogue in dialogues:
+        messages = list(dialogue)
+        while messages and messages[-1].get("role") != "user":
+            messages.pop()
+        if not messages:
+            dropped_no_user += 1
+            continue
+        text = tok.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+        if (max_prompt_tokens > 0
+                and len(tok.encode(text, add_special_tokens=False))
+                > max_prompt_tokens):
+            dropped_too_long += 1
+            continue
+        out.append(text)
+    print(f"dialogue prompts: kept {len(out)} of {len(dialogues)} dialogues "
+          f"(dropped {dropped_no_user} without a user turn, "
+          f"{dropped_too_long} over {max_prompt_tokens} tokens)")
     return out
 
 
@@ -575,7 +691,7 @@ def write_run_meta(
         "trace_id": (
             f"poisson_rate{rate}_seed{args.request_rate_seed}"
         ),
-        "workload_id": "wildchat2048_lmsys2048",
+        "workload_id": _pool_source(args),
         "N": len(requests_rows),
         "M": args.max_num_seqs,
         "measurement_window_start_ts": window_start_ts,
@@ -588,7 +704,7 @@ def write_run_meta(
         "warmup_target_completions": warmup_target,
         "measurement_target_completions": measurement_target,
         "pool_size": pool_size,
-        "pool_source": "wildchat2048_lmsys2048",
+        "pool_source": _pool_source(args),
         "sampling_seed": sampling_seed,
         "pool_pass_count": pool_pass_count,
         "injected_count": injected_count,
@@ -612,7 +728,9 @@ async def run_one(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pool = _build_pool(args)
-    print(f"{args.run_kind}: built pool of {len(pool)} prompts (wildchat2048+lmsys2048)")
+    pool_label = (_pool_source(args) if args.dialogue_prompts
+                  else "wildchat2048+lmsys2048")
+    print(f"{args.run_kind}: built pool of {len(pool)} prompts ({pool_label})")
 
     # Build sslo_params. Both baseline and progress_serve modes run through
     # schedule_sslo() so chunk records / scheduler_stats / wall-step EMA are
@@ -628,19 +746,41 @@ async def run_one(args: argparse.Namespace) -> None:
     # the plain progress_serve mode. Never for baseline.
     if args.run_kind != "baseline":
         sslo_params["adaptive_batching"] = (
-            args.run_kind == "progress_serve_adaptive"
+            args.run_kind in ("progress_serve_adaptive",
+                              "progress_serve_offload_adaptive")
             or os.environ.get("SSLO_ADAPTIVE_BATCHING", "0") != "0")
-    # SSLO: KV offload tier — vacate deep-slack deferred requests' KV to CPU
-    # to reclaim admission headroom under KV pressure, prefetch back before
-    # their deadline. Only for progress_serve_offload. Numeric knobs default
+        # SSLO: admission criterion — marginal E_viol(k) - E_viol(0) < 1
+        # instead of the absolute E_viol(k) < 1. Applies to every
+        # ProgressServe kind; off by default so the existing runs are
+        # unchanged.
+        sslo_params["admission_delta_criterion"] = (
+            os.environ.get("SSLO_ADMISSION_DELTA_CRITERION", "0") != "0")
+    # SSLO: KV offload tier — offload deep-slack deferred requests' KV to CPU
+    # to reclaim admission headroom under KV pressure, onload back before
+    # their deadline. Only for the OFFLOAD_RUN_KINDS. Numeric knobs default
     # to SsloConfig; env overrides mirror the SSLO_ADAPTIVE_BATCHING pattern.
-    if args.run_kind == "progress_serve_offload":
+    if args.run_kind in OFFLOAD_RUN_KINDS:
         sslo_params["kv_offload"] = True
         for env_name, key, cast in (
             ("SSLO_KV_ONLOAD_LEAD_ITERS", "kv_onload_lead_iters", int),
             ("SSLO_KV_OFFLOAD_RISK_EPS", "kv_offload_risk_eps", float),
             ("SSLO_KV_OFFLOAD_MIN_RESIDENCY_STEPS",
              "kv_offload_min_residency_steps", int),
+            ("SSLO_KV_OFFLOAD_SHARE_INCLUDES_PARKED",
+             "kv_offload_share_includes_parked", lambda v: v != "0"),
+        ):
+            v = os.environ.get(env_name)
+            if v is not None:
+                sslo_params[key] = cast(v)
+    # SSLO: deadline-aware prefill token budget — cap the prefill tokens a
+    # step may schedule so a prefill spike can't blow the nearest in-flight
+    # chunk deadline. Request concurrency is untouched (no adaptive
+    # batching), so it composes with the offload tier.
+    if args.run_kind in PREFILL_BUDGET_RUN_KINDS:
+        sslo_params["prefill_budget_control"] = True
+        for env_name, key, cast in (
+            ("SSLO_PREFILL_BUDGET_FLOOR", "prefill_budget_floor", int),
+            ("SSLO_PREFILL_BUDGET_GAMMA", "prefill_budget_gamma", float),
         ):
             v = os.environ.get(env_name)
             if v is not None:
@@ -670,12 +810,12 @@ async def run_one(args: argparse.Namespace) -> None:
         engine_kwargs["max_model_len"] = args.max_model_len
     # else: omit so vLLM picks the model's config max.
     # SSLO: the KV offload tier needs the CPU-offload connector. Eager
-    # mirroring (lazy_offload=False) keeps a CPU copy of every block so a
-    # vacate is ~free; SimpleCPUOffloadConnector self-disables unless
+    # mirroring (lazy_offload=False) keeps a CPU copy of every block so
+    # an offload is ~free; SimpleCPUOffloadConnector self-disables unless
     # enable_prefix_caching is True, so force it on here (offload mode only —
     # other modes keep the engine default). CPU capacity from CPU_OFFLOAD_GB
     # (default 16). Non-offload modes carry no kv_transfer plumbing.
-    if args.run_kind == "progress_serve_offload":
+    if args.run_kind in OFFLOAD_RUN_KINDS:
         from vllm.config import KVTransferConfig
         cpu_offload_gb = float(os.environ.get("CPU_OFFLOAD_GB", "16"))
         engine_kwargs["kv_transfer_config"] = KVTransferConfig(

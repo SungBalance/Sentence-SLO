@@ -14,6 +14,12 @@ MODES_DEFAULT = (
     "progress_serve_adaptive",
     # SSLO
     "progress_serve_offload",
+    # SSLO
+    "progress_serve_offload_adaptive",
+    # SSLO
+    "progress_serve_prefill_budget",
+    # SSLO
+    "progress_serve_offload_prefill_budget",
 )
 
 

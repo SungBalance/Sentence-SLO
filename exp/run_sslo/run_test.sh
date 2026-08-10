@@ -6,7 +6,9 @@
 #
 # Required positional args:
 #   $1  run_kind   (baseline | progress_serve | progress_serve_adaptive |
-#                   progress_serve_offload)
+#                   progress_serve_offload | progress_serve_offload_adaptive |
+#                   progress_serve_prefill_budget |
+#                   progress_serve_offload_prefill_budget)
 #   $2  max_num_seqs
 #   $3  model
 #
@@ -22,13 +24,23 @@
 #   CHUNK_UNIT=sentence
 #   SECONDS_PER_WORD=0.28
 #   CUDA_VISIBLE_DEVICES=1
+#   DIALOGUE_PROMPTS=0            1 = inject multi-turn dialogue prefixes
+#                                 (needs DATASET_NAME=wildchat|lmsys|combine;
+#                                  the default koala has no dialogue rows)
+#   MAX_PROMPT_TOKENS=0           drop dialogue prompts over N tokens (0 = off)
 #
-# KV offload tier (progress_serve_offload run_kind only; read by run_test.py):
+# KV offload tier (progress_serve_offload[_adaptive] run_kinds only; read by
+# run_test.py):
 #   CPU_OFFLOAD_GB=16                       CPU KV-offload capacity (GB)
 #   SSLO_KV_ONLOAD_LEAD_ITERS               onload lead (iters)
-#   SSLO_KV_OFFLOAD_RISK_EPS                vacate/promote risk epsilon
+#   SSLO_KV_OFFLOAD_RISK_EPS                offload/onload risk epsilon
 #   SSLO_KV_OFFLOAD_MIN_RESIDENCY_STEPS     anti-thrash guard (steps; 0 = off)
-# progress_serve_offload wires the SimpleCPUOffloadConnector and forces
+#
+# Deadline-aware prefill budget (progress_serve[_offload]_prefill_budget
+# run_kinds only; read by run_test.py):
+#   SSLO_PREFILL_BUDGET_FLOOR               min prefill tokens per step
+#   SSLO_PREFILL_BUDGET_GAMMA               safety factor on t_min (0 < g <= 1)
+# Those run_kinds wire the SimpleCPUOffloadConnector and force
 # enable_prefix_caching in run_test.py — no extra env needed. Offload events
 # are recorded per-step in scheduler_stats.jsonl / decisions.jsonl (no
 # separate offload log file).
@@ -124,6 +136,13 @@ else
   ENGLISH_ONLY_FLAG=""
 fi
 MAX_RESPONSE_CHUNK_CHARS="${MAX_RESPONSE_CHUNK_CHARS:-1000}"
+# Multi-turn workload: inject each dialogue's prefix up to its last user turn.
+if [[ "${DIALOGUE_PROMPTS:-0}" == "1" ]]; then
+  DIALOGUE_PROMPTS_FLAG="--dialogue-prompts"
+else
+  DIALOGUE_PROMPTS_FLAG=""
+fi
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-0}"
 
 export HF_HOME=/cache
 export HF_HUB_CACHE=/cache/hub
@@ -154,6 +173,8 @@ python3 exp/run_sslo/run_test.py \
   ${CONVERSATION_ONLY_FLAG} \
   ${ENGLISH_ONLY_FLAG} \
   --max-response-chunk-chars "${MAX_RESPONSE_CHUNK_CHARS}" \
+  ${DIALOGUE_PROMPTS_FLAG} \
+  --max-prompt-tokens "${MAX_PROMPT_TOKENS}" \
   ${THINKING_FLAG} \
   ${SAMPLING_ARGS} \
   "${CONSUME_ARGS[@]}"
