@@ -258,11 +258,32 @@ Defaults shown; validation in `__post_init__`.
 | `admission_delta_criterion` | `False` | Admit on the marginal `E_viol(k) − E_viol(0) < 1` instead of the absolute `E_viol(k) < 1`. **Rejected** experiment option — see WORKLOG 2026-08-07 |
 | `kv_blocks_per_new_admit` | 8 | Admission cap = `free_kv_blocks // N`; 0 disables |
 
-### Deadline-aware prefill token budget
+### Deadline-aware Token Budget (TB*)
 
-Caps the **total** prefill tokens of one scheduler step at
-`P* = clamp((γ·t_min − Δ_decode)/κ, floor, max_num_batched_tokens)`
-(`progress_serve.prefill_budget`). Motivated by the measurement that
+One step-time constraint `Δ_dec(D) + κ_p·P ≤ γ·t_min`, solved on two axes and
+gated by the single `token_budget_control` flag.
+
+**D axis** (`progress_serve.select_decode_defer`). When the decode step time
+alone breaks the constraint (`P = 0` would already miss), the decode set is
+shrunk: defer-safe requests — GPU-resident, MEASURED, `R_defer ≤
+token_budget_decode_risk_eps` — are deferred deepest-slack-first until
+`Δ_dec(D')` fits. Forced (PREFILL/WARMUP), onloading and at-risk requests are
+never deferred, which is the natural floor `D_floor`. Eligibility is
+self-limiting — a deferred request keeps burning its deadline, so its `R_defer`
+rises until it exceeds `eps` — so no starvation counter is needed (unlike the P
+axis floor). `Δ_dec(n)` is the batch-matched decode-only wall-EMA cell; a missing
+cell stops the search rather than falling back to a cross-batch average (R5).
+Two guards keep the axis from paying throughput for nothing: **overdue
+requests** (`T_q ≤ 0`) are excluded from `t_min` — their current unit is already
+missed and no shrink saves it — and if **no reachable `D'` meets the budget**
+(the floor is still over, or a missing cell blocks the search) the axis reverts
+to zero defers instead of shrinking hopelessly. With deadlines far away (the read
+workload) `D' = D_policy`, i.e. the axis is a no-op.
+
+**P axis** (`progress_serve.token_budget_prefill`). Caps the **total** prefill
+tokens of one scheduler step at
+`TB*_pre = clamp((γ·t_min − Δ_dec(D'))/κ_p, floor, max_num_batched_tokens)`,
+where `D'` is what the D axis settled on. Motivated by the measurement that
 prefill-carrying steps are 6% of steps but 18.4% of wall clock (Δ p90 463 ms vs
 78 ms decode-only).
 
@@ -275,18 +296,19 @@ Both prefill paths drain one shared per-step counter, in this order:
    and retried next step. A KV-onload is exempt from the clamp (it is
    deadline-forced) but still charged.
 
-Decode tokens are never clamped and never charged. Concurrency and the service
-share `s` are untouched, so this does not interact with adaptive batching or
-the offload tier. κ is estimated online from
-`(Δ_observed − Δ_decode)/prefill_tokens` over the same token population the cap
-binds; the remainder of a capped prefill carries to the next step via chunked
-prefill (the control self-disables when chunked prefill is off).
+Decode tokens are never clamped and never charged — the D axis works in whole
+requests, never in tokens (R4). The service share `s` is untouched by the P
+axis. κ_p is estimated online from `(Δ_observed − Δ_decode)/prefill_tokens` as a
+ratio of sums over the same token population the cap binds; the remainder of a
+capped prefill carries to the next step via chunked prefill (the P axis
+self-disables when chunked prefill is off).
 
 | Field | Default | Meaning |
 |---|---|---|
-| `prefill_budget_control` | `False` | Enable the per-step prefill token cap |
-| `prefill_budget_floor` | 512 | Lower clamp on `P*` (tokens); must be > 0 so prefill always progresses |
-| `prefill_budget_gamma` | 0.5 | Safety factor γ on `t_min`, in `(0, 1]` |
+| `token_budget_control` | `False` | Enable the Token Budget (both axes) |
+| `token_budget_prefill_floor` | 512 | Lower clamp on `TB*_pre` (tokens); must be > 0 so prefill always progresses |
+| `token_budget_gamma` | 0.5 | Safety factor γ on `t_min`, in `(0, 1]` |
+| `token_budget_decode_risk_eps` | 1e-3 | D axis: only `R_defer ≤ eps` requests may be dropped from the decode set |
 
 ### KV offload tier (see §9)
 

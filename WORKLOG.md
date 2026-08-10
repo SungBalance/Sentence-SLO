@@ -2590,3 +2590,78 @@ Modes are now exactly `{baseline, progress_serve}`.
   `python -m py_compile` clean. GPU 실행 없음.
 - 구 추정기 재현 시뮬레이션(컨테이너)으로 새 소분모 테스트가 구 코드에서
   실패함을 확인(2.89배).
+
+## 2026-08-10 — P* → TB* 개명 + Token Budget D축 신설
+
+**Modified**
+- `vllm/vllm/sslo/config.py` — `prefill_budget_control/_floor/_gamma` →
+  `token_budget_control` / `token_budget_prefill_floor` / `token_budget_gamma`.
+  주석을 단일 제약 `Δ_dec(D) + κ_p·P ≤ γ·t_min` 의 2축(D/P) 서술로 교체.
+- `vllm/vllm/sslo/progress_serve.py` — `prefill_budget()` →
+  `token_budget_prefill()` (docstring P* → TB*_pre, Δ_dec 는 D 축이 정한 D′ 기준).
+- `vllm/vllm/v1/core/sched/scheduler.py` — `SsloStepState.prefill_budget` →
+  `token_budget_prefill`, 로컬 `sslo_prefill_budget` → `sslo_token_budget_prefill`,
+  step stats 키 `prefill_budget` → `token_budget_prefill`.
+- `exp/run_sslo/` — run kind `progress_serve[_offload]_prefill_budget` →
+  `progress_serve[_offload]_token_budget`, env `SSLO_PREFILL_BUDGET_FLOOR/GAMMA` →
+  `SSLO_TOKEN_BUDGET_PREFILL_FLOOR` / `SSLO_TOKEN_BUDGET_GAMMA`
+  (`run_test.py`, `run_test.sh`, `run_sweep.sh`, `README.md`).
+- `vllm/vllm/sslo/README.md` — TB* 절(D축/P축) 및 config 표 갱신.
+
+**Added**
+- `SsloConfig.token_budget_decode_risk_eps` (기본 1e-3) — D축 defer 자격 임계
+  (`kv_offload_risk_eps` 와 같은 문법).
+- `progress_serve.select_decode_defer()` — D축 순수 함수. 자격 = GPU 상주 ∧
+  MEASURED ∧ `R_defer ≤ eps`; slack 깊은 순으로 하나씩 defer 하며 `Δ_dec(D′)` 가
+  `γ·t_min` 에 들어올 때까지 축소. 배치-키 셀 부재 시 보수적 중단(폴백 평균 금지, R5).
+  forced/onloading/at-risk 는 구조적으로 후보에서 제외 = 자연 하한 D_floor.
+  자격은 자기제한적(defer 지속 → T_q 감소 → R_defer 상승 → 자격 상실)이라
+  별도 기아 카운터 불필요 — R_defer 가 매 스텝 live T_q 로 재계산되기 때문.
+- `Scheduler._sslo_apply_decode_budget()` — 훅 위치는 `_sslo_apply_offload()`
+  직후(스펙 ④ → ⑤ 순서), 결정 로그 build_plan 이전. `new_running`/`new_pending`
+  을 in-place 로 옮기므로 커밋 후 `len(self.running)` 이 곧 D′ 가 되어 P축
+  (`_sslo_prefill_token_budget`) 이 자동으로 `Δ_dec(D′)` 를 읽는다.
+  t_min 은 decode set 자신의 뷰에서 계산(훅 시점의 `self.running` 은 정책 이전
+  집합이라 `_sslo_min_time_to_deadline` 은 부적합).
+- step stats `token_budget_decode`(D′) / `token_budget_d_defers`.
+- `exp/run_sslo/metrics_utils.MODES_DEPRECATED` — 구 run kind 2종을
+  `MODES_DEFAULT`/`analyze.ALL_MODES` 에 alias 로 병존(phaseP 산출물 디렉토리
+  경로 추론 유지). CLI `--run-kind` choices 에서는 제외.
+
+**Debugging / verification**
+- 신규 테스트: `test_progress_serve.py` 5종(예산 미달 시 slack 깊은 순 축소 /
+  forced·at-risk 미defer 하한 / 마감 여유 시 no-op / 셀 부재 보수적 중단 /
+  자격 자기제한), `test_scheduler_sslo.py` 3종(D축 배선·기본 off·read 무개입),
+  `test_sslo_config.py` eps 기본값·음수 거부. 기존 P* 테스트는 개명 반영.
+- `python -m pytest tests/sslo/ -q` in `sk-sslo`: 195 passed, 1 skipped,
+  1 failed (기존 `test_tts_path_uses_audio_ready_time_for_slack_and_deadline`).
+- `py_compile`(exp 스크립트) / `bash -n`(run_test.sh, run_sweep.sh) clean.
+  `--run-kind progress_serve_prefill_budget` 는 invalid choice 로 거부되고
+  경로 기반 모드 추론은 구 이름을 계속 인식함을 컨테이너에서 확인. GPU 실행 없음.
+- 세션 중 사용자 secret-redaction 히스토리 재작성으로 워킹트리가 구 커밋으로
+  이동해 작업이 중단됨 → stash 복원 후 새 base(`75f6df911`)에서 재개·완료.
+
+## 2026-08-10 (TB* 통합 예산: D축 + 안전 가드)
+
+- 구현: prefill token budget(P*)을 **Token Budget TB***로 통합·개명하고
+  decode 축(D축) 신설. 단일 제약 `Δ_dec(D)+κ_p·P ≤ γ·T_min`을 두 축으로
+  풀며, D축(`select_decode_defer`)은 decode-only 스텝시간이 예산을 깨면
+  defer-safe(GPU·MEASURED·R_defer≤ε_d) 요청을 slack 깊은 순으로 defer해
+  D′ 축소, D′는 커밋 후 `len(self.running)`로 P축에 자동 전파. run kind
+  `progress_serve_token_budget[/offload]`; 구 prefill_budget 명칭은 analyze/
+  metrics의 deprecated alias로만 잔존(phaseP 경로 호환).
+- 안전 가드 2건 (기반 구현에 없던 것, 상상 실행 논의에서 도출):
+  ① overdue 제외 — `t_min≤0` 및 T_q≤0 요청은 D축 미발동(이미 놓친 유닛을
+  위해 처리량 버리는 것 방지; 과포화 read는 상당 시간 overdue).
+  ② 만족성 가드 — 도달 가능한 어떤 D′도 예산을 못 맞추면 defer 취소(floor
+  초과·셀 부재). 이 둘이 request-level adaptive의 처리량 붕괴 재발을 막는다.
+- 기아 방지: 스펙 초안은 "P_floor식 카운터 가드"를 적었으나, D축은
+  self-limiting으로 충분(defer된 MEASURED 요청은 T_q 감소→R_defer 상승→
+  ε_d 초과 시 자격 상실→자동 복귀; deadline 자체가 카운터). 카운터 미구현이
+  옳은 대체설계로 판정, scheduling.md·SWEEP_PLAN·sslo/README 문구를 구현에
+  맞춰 정정(검증 라운드 Important/Minor 반영).
+- 검증: pytest tests/sslo 197 passed(+D축 7종, 기존 tts 1 fail). D축
+  발동률은 오프라인 재생 불가(scheduler_stats에 per-request T_q/R_defer
+  없음) — 로직은 단위 테스트로, 발동률은 GPU 런의 `token_budget_d_defers`
+  stat으로만 확인. sslo-verifier: 로직 버그 0(7 케이스 손 트레이스),
+  문서 정합 지적만 반영.

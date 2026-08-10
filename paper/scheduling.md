@@ -1,61 +1,104 @@
-# `Scheduler.schedule_sslo()` — 스케줄링 규칙
+# ProgressServe 스케줄링 정책 — 현행 스펙 (2026-08-10 정리)
 
-## 매 스텝마다 유지되는 상태
+> 캐노니컬 현행 설계. 구현 상태 기준이며, 미구현 확장은 마지막 §7에 명시 구분.
+> 이전 버전(슬랙-히스테리시스 pending)은 폐기됨 — 이력은 WORKLOG 참조.
 
-- `self.running` — 실제로 디코딩 중인 요청들
-- `self.sslo_pending` — 입원은 되어 있지만(KV 유지) 더 급한 요청에 슬랙 예산을 양보하기 위해 일시 대기시킨 요청들
-- `self.sslo_consecutive_pending[req_id]` — 한 요청이 연속으로 pending 상태에 머문 스텝 수 (기아 방지 카운터)
+## 1. 상태 기계와 용어
 
-## 우선순위 키
+| 상태 | 뜻 |
+|---|---|
+| `waiting` | 미입장 (엔진 큐) |
+| `running` | 이번 스텝 디코딩 |
+| `pending` | 입장·defer됨, KV는 GPU 상주 |
+| `offloaded` | defer됨, KV는 CPU 상주 |
+| `onloading` | CPU→GPU 복원 중 (전이 상태) |
 
-`_sslo_score_key(req) = req.slo_state.cumulative_slack` — **값이 작을수록 더 급함**. `slo_state`가 없으면 `inf` (가장 낮은 우선순위).
+전이: **admit** (waiting→in-flight) / **defer** (running→pending) / **promote** (pending→running) / **offload** (pending→offloaded) / **onload** (offloaded→onloading→running).
 
-`cumulative_slack`(`slo_state.py`) = `decoding_start + Σ consume_time[0..i-1] − chunk[i].end_time`. 음수면 deadline을 넘긴 상태(overdue).
+라이프사이클: `PREFILL → WARMUP → MEASURED`. MEASURED만 청크 deadline을 보유하고 위험 계산에 참여한다. PREFILL/WARMUP은 *forced* — 무조건 슬롯을 받고 E_viol에서 제외 (첫 유닛을 내야 측정 가능해지므로).
 
-## 1단계 — `running ∪ sslo_pending` 재분배 (`scheduler.py:978-1043`)
+## 2. 위험 프리미티브
 
-슬랙 오름차순(급한 순)으로 정렬한 뒤, 각 요청의 pending 가능 여부를 결정.
+단일 통계 기반: 청크 길이 예측기의 **tail posterior** $\Pr[L > c+N \mid L > c]$.
 
-**스케줄러 측 가드 3가지** — 슬랙과 무관하게 `eligible=False`로 강제(즉, running 유지):
-1. `consec >= max_consecutive_pending` — 기아 방지 한도 도달, 무조건 running으로
-2. `slo_state is None` — SSLO 데이터 없음, running으로
-3. `len(self.waiting) == 0` — 대기 중인 요청이 없으면 demote할 이유 없음
+- service share $s = \min(1,\ B/|A^{+}|)$. $|A^{+}|$ = running + onloading + 신규 admit + **offloaded(parked) 포함** — offload는 메모리를 비우지 연산 부하를 없애지 않는다 (§5-R1).
+- deadline horizon $H_q = \lfloor T_q/\Delta \rfloor$ → run/defer 시 마감 전 생산 가능 토큰 $N_{run} > N_{defer}$ → 위험:
+  $$R_{run},\ R_{defer} = \Pr[L > c_q + N_{\cdot} \mid L > c_q], \qquad M = R_{defer} - R_{run}$$
+  $M$ = 디코드 슬롯 1개의 한계 효용. $R_{defer} \ge 1$이면 $M=1$ 강제 (가망 없다고 버리면 스톨이 복리로 커지므로 — doomed guard).
+- CPU 체류 위험: $N_{defer\_cpu} = N_{defer} - \ell \cdot s$ (onload lead $\ell$ 반영) → $M_{cpu} = R_{defer\_cpu} - R_{defer}$ = **CPU 체류의 위험 프리미엄**.
 
-가드를 통과하면 요청별 판정:
-- 직전 스텝에 pending이었던 경우 → `eligible = not should_exit_pending(now, prev_pending_count)`
-- 직전 스텝에 running이었던 경우 → `eligible = should_enter_pending(now, prev_pending_count)`
+## 3. 스텝 파이프라인
 
-요청별 enter/exit 로직 (`slo_state.py:423-473`):
-- **Pending 진입 조건**: 샘플 수 ≥ `pending_warmup_chunks` **그리고** `realtime_slack > (enter_factor + λ·pending_count) · gen_time`
-- **Pending 탈출 조건** (셋 중 하나):
-  - 저점 기준: `slack ≤ (effective_enter − hysteresis_gap) · gen_time`
-  - 예측 가드: 현재 진행 중인 청크의 남은 생성 시간이 슬랙을 초과
-  - 추정기에 데이터가 없는 경우(예외 케이스)
+```
+① prologue: onload 완료 요청을 running에 합류, offloaded 체류 계상
+② run/defer 분할 (build_plan):
+     forced + onloading → 무조건 슬롯 / MEASURED는 M 내림차순으로 decode_cap까지 run,
+     나머지 defer(pending)
+③ admission 탐색 (schedule_step):
+     k* = max{ k : E_viol(k) < 1  ∧  KV가 k명 admit 허용 }   (waiting FCFS 프리픽스)
+     E_viol = Σ_run R_run + Σ_pend R_defer + Σ_offl R_defer_cpu   (절대 임계; §5-R3)
+     KV가 스캔을 멈췄으면 kv_capped ← true
+④ offload/onload (kv_capped일 때만):
+     onload 먼저 — d−t ≤ ℓΔ+f̂ 인 offloaded를 복원 시작 (deadline 안전 우선)
+     offload — pending 중 M_cpu ≤ ε ∧ residency ≥ ρ 를 slack 깊은 순으로,
+               admission에 필요한 블록만큼만
+⑤ Token Budget TB* 계산 — 단일 스텝-시간 제약을 두 축으로 푼다:
+       Δ_dec(D) + κ_p·P  ≤  γ·T_min
+     [D축] Δ_dec(D_policy)만으로 초과하면(P=0에도 위협), slack 깊은 순으로
+           defer해 D' 축소.  하한 D_floor = forced + at-risk 요청 수 (자격
+           R_defer≤ε_d가 자연 하한 — defer된 요청은 T_q가 줄어 R_defer가
+           올라 자동으로 자격을 잃으므로 **P축식 카운터 불필요**, self-limiting).
+           overdue(T_q≤0)는 후보 제외; 도달 가능한 D'가 예산을 못 맞추면
+           defer 취소(만족성 가드 — 처리량만 잃는 무의미 defer 방지).
+           Δ_dec(·)은 배치-키 EMA/CUDA-graph 하이브리드의 직접 조회
+           (기울기 분해 불필요; 셀 부재 시 보수적 중단, R5).
+     [P축] 남는 시간으로 prefill 허용량:
+           TB*_pre = clamp( (γ·T_min − Δ_dec(D')) / κ_p,  P_floor,  P_base )
+           κ_p = ratio-of-sums: EMA[초과시간(무클리핑)]/EMA[P], 기준선은
+           배치-매칭 셀만 (부재 시 샘플 폐기 / 제어 비활성)
+⑥ 집행:
+     running 루프 — D'에 든 요청의 디코드 토큰은 무제한; 청킹된 프롬프트
+                    캐리오버는 TB*_pre 공유 카운터에서 우선 차감 (최소 1토큰)
+     waiting 루프 — k*·KV·TB*_pre 잔여 안에서 admit; onload는 클램프 면제(과금은 됨)
+     P_floor 연속 클램프 + prefill 무진행 N스텝이면 1스텝 base 허용 (기아 방지)
+```
 
-**압력(pressure) 효과**: pending 수가 많아질수록 effective 임계값이 커져 새로 pending에 보내기 어려워지고(λ), hysteresis_gap만큼 enter/exit 사이에 갭을 둠으로써 진동을 방지.
+## 4. 지렛대 × regime 매핑
 
-## 2단계 — 적응형 배치 크기 (`scheduler.py:1018-1023`)
+| 실패 국면 | 지렛대 | 발동 조건 | 무개입 보장 |
+|---|---|---|---|
+| slack 낭비 (기본) | ②③ run/defer + E_viol admission | 항상 | E_viol(0)≈0이면 baseline과 동일 admit |
+| KV-bound admission | ④ offload/onload | `kv_capped`일 때만 | KV 여유면 no-op (I4) |
+| prefill spike | ⑤⑥ TB* P축 | 급한 마감 ∧ prefill 작업 존재 | T_min 크면 TB*_pre=P_base (baseline 동일) |
+| decode-Δ-bound (촘촘한 마감) | ⑤ TB* D축 | γ·T_min이 Δ_dec(D)에 근접 | 마감 여유면 D'=D_policy (no-op) — 일반 워크로드 전제로 상시 탑재, read처럼 H_q≫1인 경우 자연 비발동 |
 
-`sslo_config.adaptive_batch_size`가 켜져 있고, new_running 중 하나라도 `is_overdue_post_warmup()`(워밍업 이후 슬랙<0)이면 이번 스텝의 `max_num_running_reqs`를 절반으로 축소.
+두 확장의 트리거는 실측상 **동시 발화 1~2%** (서로 다른 국면: "가득 참" vs "흡수 중") — 결합은 상호작용이 아니라 커버리지 합집합으로 동작한다.
 
-## 3단계 — 하드 캡 강제 (`scheduler.py:1030-1040`)
+## 5. 회계 원칙 (불변 규칙)
 
-`len(new_running) > max_num_running_reqs`이면 슬랙 기준으로 정렬해 **슬랙이 가장 큰(=덜 급한) 초과분을 pending으로 강등**. 캡이 기아 방지보다 우선 — vLLM의 `InputBatch`가 `max_num_seqs`로 사이징되어 있어 절대 초과 불가.
+- **R1 — parked도 share 분모에**: offload는 메모리만 비운다. 제외하면 s가 부풀어 M_cpu 과소평가 → 과잉 offload (실측: cap32 offload 8→1회 교정).
+- **R2 — parked도 E_viol에**: CPU에 내린 위험은 $R_{defer\_cpu}$로 계속 계상 (회계 연속성).
+- **R3 — 절대 위반 예산 유지**: `E_viol < 1`. 한계 기준(ΔE_viol)은 매몰비용 잠금을 풀지만 총위험 브레이크를 제거해 기각됨 (e_viol 16~41 폭주 실증; 코드에 기본 off로 보존).
+- **R4 — decode는 토큰 단위로 잘리지 않는다**: TB*의 D축은 요청 단위 defer로만 작용한다 (요청당 1토큰이라 부분 실행이 없음). run으로 확정된 요청의 디코드 토큰은 어떤 예산에도 잘리지 않는다. 원시 P+D 토큰 합산 캡은 단가 비대칭(KV-읽기 상각) 때문에 기각 — 예산의 화폐는 토큰 수가 아니라 **예측 스텝 시간**이다.
+- **R5 — 추정기는 자기 결정에 오염되면 안 됨**: κ의 기준선은 배치-매칭 셀만(폴백 금지), 샘플은 토큰 가중(ratio-of-sums, per-sample 나눗셈·클리핑 금지). 위반 시 폐루프 실증됨 (κ↑→P*↓→소P 샘플↑→κ↑).
 
-## 4단계 — Waiting 큐 admission 게이트 (`scheduler.py:1281-1294`)
+## 6. 폐기 결정 (근거 요약)
 
-`waiting`/`skipped_waiting`에서 새 요청을 받을 때:
-- `len(running) >= max_num_running_reqs`(축소된 로컬 캡)이면 중단
-- **pending 중에 `should_exit_pending(...)`인 요청이 하나라도 있으면 중단** — 곧 자리를 돌려줘야 할 요청이 있는 동안 새 요청을 받지 않음
+| 폐기안 | 사유 |
+|---|---|
+| request-level adaptive (`max_num_seqs` 축소) | 축이 틀림 — Δ 변동의 주범은 prefill 토큰(스텝 6%가 벽시계 18%, p90 463ms)이지 요청 수가 아님. 큐-블라인드 목적함수와 결합해 배치 1까지 붕괴 (대기 2,691명 방치). TB*(P축)로 대체 |
+| admission 한계 기준 (ΔE_viol) | R3 참조 — 총위험 무한 누적 |
+| 원시 P+D 토큰 캡 | 두 토큰의 단가가 다를 수 있고(KV-읽기 상각 비대칭) 교환비가 regime·컨텍스트 의존 — 시간 단위 예산(§7)으로 일반화해야 함 |
 
-## 5단계 — 오프로드 우선 선점 (`scheduler.py:1497-1539`, `sslo_config.offloading`일 때)
+## 7. Staged 확장 (미구현 — TODO, SWEEP_PLAN_v2.md와 동기)
 
-KV 할당 실패 시 FCFS tail이나 PRIORITY 최하위 대신 `running ∪ sslo_pending` 전체에서 **슬랙이 가장 큰 요청을 victim으로 선택**(`max(_sslo_score_key)`), 선점 후 `on_offload_enter`. 커넥터가 KV를 CPU로 저장하고, 재개 시 GPU로 로드.
+1. **오프라인 프로파일**: prefill 비용곡선 cost(P) (κ 스칼라 제거 — 토큰당 비용이 청크 크기 의존: ≤512에서 0.23~0.30 vs 2048에서 0.16), decode 비용은 (배치 × 컨텍스트) 그리드 필수 (관측 데이터는 공선성으로 분리 불가 실증). 기존 CUDA-graph 프로파일의 하이브리드(오프라인 shape × 라이브 anchor) 패턴 재사용.
+2. (승격됨 → §3⑤ TB*: 통합 예산은 2026-08-10 현행 정책으로 편입. κ_d 기울기 분해 없이 Δ_dec(D) 직접 조회로 구현 — 공선성 장애물은 선형 분해에만 해당했음. TTS 축 실측은 D축 실효 검증 항목으로 유지.)
+3. **③축 admission 잠금의 안전한 해제**: 델타+상한 하이브리드 / 유휴 조건부 델타 / M≈0 국소 제외 — 미결.
 
-## 라이프사이클 훅
+## 8. 알려진 한계 (기록)
 
-요청 완료/중단/free 시 (`scheduler.py:2261, 2582, 2627`) `sslo_pending`과 `sslo_consecutive_pending`에서 제거.
-
-## 한 줄 요약
-
-**슬랙 기준 정렬 → 가장 여유 있는 요청을 pending으로 demote(단, `max_consecutive_pending`·`waiting>0`·요청별 EMA 히스테리시스 조건 충족 시) → overdue가 있으면 배치 축소 → 하드 캡 초과분은 슬랙 큰 순으로 추가 demote → KV 압박 시에는 슬랙 큰 요청부터 오프로드.**
+- ③축 self-lock: 소수 고위험 in-flight의 위험 합이 절대 예산을 소진하면 KV·연산이 남아도 k*≈0 (과포화 + 만기 경과 큐에서 발생; R3 트레이드오프의 대가).
+- o+pb cap64 저하: κ_p 오염(소분모 발산)으로 진단·수정 완료 — GPU 재실행으로 최종 확인 대기 (예측: κ→0.15 수렴, tput 392→~470).
+- `request_risk_cpu`에는 doomed guard($R_{defer}\ge1 \Rightarrow$ offload 부적격)가 없음 — §2의 run-side 가드와 비대칭. 현행 kv_capped 게이트 하에서 실해가 관측되지 않아 미구현 (후보 유지).
+- offload tier는 full-attention(MLA 포함) 모델 한정 — hybrid(mamba/linear-attn)는 upstream 비호환 (`kv_offload_model_compat.md`).

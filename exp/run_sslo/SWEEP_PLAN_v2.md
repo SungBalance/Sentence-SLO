@@ -201,7 +201,7 @@ phaseP 산출물 경로 호환용 deprecated alias로만 잔존. TB*는 P축+D�
   D 고정 특수해(stage 1, 완료); decode 축(defer로 D 축소)은 stage 2 —
   큐 공백+at-risk 국면에서 별도 게이트 없이 제약이 자동 강제. 주의:
   decode 축은 정수(요청 단위)이며, 부하 심층에서 축소 나선 방지를 위해
-  **D 하한(at-risk+forced) + 기아 가드** 필수 (P_floor 문법 재사용).
+  **D 하한(at-risk+forced), self-limiting 자격(R_defer≤ε_d)이 기아 방지 — P축 카운터 불필요)** 필수 (P_floor 문법 재사용).
   κ_d·κ_p는 오프라인 프로파일 TODO가 커버. 구현 전 TTS 축 실험에서
   해당 국면 발생량 측정 선행 (waiting==0 ∧ T_min<τ 스텝 비율).
 - [x] Phase N′ 설계: read만,
