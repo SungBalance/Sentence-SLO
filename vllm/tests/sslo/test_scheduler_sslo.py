@@ -1027,6 +1027,59 @@ def test_kappa_ema_skips_decode_only_steps_and_clamps_negative():
     assert scheduler._sslo_prefill_kappa == 0.0
 
 
+def test_kappa_sample_uses_batch_matched_decode_cell():
+    # Low- and high-occupancy decode-only cells both populated. The κ sample
+    # of a batch-40 step must subtract the batch-40 baseline (72 ms), not the
+    # batch-8 one (6 ms). Positive-path check only: exact-match lookup already
+    # behaved this way pre-fix; the regression discriminators for the removed
+    # global-mean fallback (which doubled κ under the offload tier) are the
+    # two *_without_batch_matched_decode_cell tests below.
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True,
+                     tpot_ema_alpha=1.0)
+    scheduler = make_scheduler(running=[], cfg=cfg)
+    scheduler._sslo_step_wall_ema = {8: {0: 0.006}, 40: {0: 0.072}}
+    scheduler._sslo_prev_step_batch = 40
+    scheduler._sslo_prev_step_num_prefills = 2
+    scheduler._sslo_prev_step_prefill_tokens = 100
+    scheduler._sslo_prev_step_start_ts = 0.0
+
+    scheduler._update_tpot_ema(0.172)
+
+    # (0.172 - 0.072) / 100, not (0.172 - 0.006) / 100.
+    assert scheduler._sslo_prefill_kappa == pytest.approx(0.001)
+
+
+def test_kappa_sample_dropped_without_batch_matched_decode_cell():
+    # Batch 40 has only a prefill-carrying cell; the only decode-only cell is
+    # the low-occupancy one. The sample must be dropped, not fall back to it.
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True,
+                     tpot_ema_alpha=1.0)
+    scheduler = make_scheduler(running=[], cfg=cfg)
+    scheduler._sslo_step_wall_ema = {8: {0: 0.006}, 40: {2: 0.15}}
+    scheduler._sslo_prefill_kappa = 0.0005
+    scheduler._sslo_prev_step_batch = 40
+    scheduler._sslo_prev_step_num_prefills = 2
+    scheduler._sslo_prev_step_prefill_tokens = 100
+    scheduler._sslo_prev_step_start_ts = 0.0
+
+    scheduler._update_tpot_ema(0.172)
+
+    assert scheduler._sslo_prefill_kappa == 0.0005
+
+
+def test_prefill_budget_off_without_batch_matched_decode_cell():
+    # P*'s Δ_dec must come from the cell matching the current decode batch;
+    # with no such cell the control stays off (base budget) instead of
+    # borrowing a low-occupancy baseline.
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
+    r = make_request("r0", make_state(deadline=2.0))
+    scheduler = make_scheduler(running=[r], cfg=cfg)
+    _prep_prefill_budget(scheduler)
+    scheduler._sslo_step_wall_ema = {8: {0: 0.006}}
+
+    assert scheduler._sslo_prefill_token_budget(0.0) is None
+
+
 def test_prefill_budget_does_not_block_onload(monkeypatch):
     # Composition with the offload tier: an exhausted prefill budget must not
     # starve a deadline-forced onload; only normal admits are held back.

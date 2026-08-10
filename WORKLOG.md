@@ -2488,3 +2488,44 @@ Modes are now exactly `{baseline, progress_serve}`.
   통과. `grep -rn "vacate" vllm/vllm/ exp/` → 0건.
   구 산출물 재분석: output_sweep_v2/phaseP/.../cap32/progress_serve_offload/
   run_1/rate_1 에 analyze.py 재실행 → `summary.json` 기존본과 완전 동일.
+
+## Session: κ / P* decode baseline batch-matching (prefill budget control)
+
+**Modified**
+- `vllm/vllm/v1/core/sched/scheduler.py` — `_sslo_decode_wall_ema(n)` is now
+  batch-matched only: it returns the `(n, prefills=0)` wall-EMA cell or None.
+  Removed the "mean over every observed prefills=0 cell" fallback, which was
+  the single shared contamination path for both consumers: the κ sample in
+  `_update_tpot_ema` (baseline borrowed from low-occupancy decode-only cells →
+  the batch-size gap, ~15 ms between batch 16 and batch 43, was mis-attributed
+  to prefill tokens → κ inflated ~2x under the offload tier) and the Δ_dec term
+  of `_sslo_prefill_token_budget` (P*). No call-site changes were needed: the κ
+  site already keys on `_sslo_prev_step_batch` and already skips the sample when
+  the baseline is None; P* already disables the control (base budget) on None.
+  No low-occupancy-exclusion heuristic and no nearest-cell tolerance added.
+
+**Added**
+- `vllm/tests/sslo/test_scheduler_sslo.py` — 3 tests:
+  `test_kappa_sample_uses_batch_matched_decode_cell` (batch-8 6 ms and batch-40
+  72 ms cells both populated; a batch-40 prefill step must yield
+  (Δ_obs − 72 ms)/P), `test_kappa_sample_dropped_without_batch_matched_decode_cell`
+  (batch 40 has only a prefills=2 cell → sample dropped, κ EMA unchanged), and
+  `test_prefill_budget_off_without_batch_matched_decode_cell` (P* → None).
+
+**Debugging / verification**
+- Sparsity check on `output_sweep_v2/phaseP/.../cap64/{progress_serve_prefill_budget,
+  progress_serve_offload_prefill_budget}/run_1/rate_4/scheduler_stats.jsonl`:
+  every prefill step's batch key has a decode-only cell somewhere in the run
+  (100%); replayed chronologically, the cell is already populated for ~96% of
+  prefill steps (fallback fired 37/1072 and 41/1071). Exact matching is therefore
+  affordable and a ±25% nearest-cell tolerance was deliberately NOT added.
+  Same logs: `running` equals the scheduled batch on 99.5% of steps, so P*'s
+  `len(self.running)` key is consistent with the EMA cell keys.
+- Caveat recorded: the ~4% fallback rate alone does not fully explain the
+  measured κ p50 0.33 (pbud) vs 0.64 (o+pb); offload-tier KV transfer time
+  landing inside prefill-carrying steps remains a candidate for the remainder.
+- `python3 -m pytest tests/sslo/ -q` in `sk-sslo` (/workspace/mlsys/vllm):
+  184 passed, 1 skipped, 1 failed (pre-existing
+  `test_tts_consume_path.py::test_tts_path_uses_audio_ready_time_for_slack_and_deadline`).
+  Against pre-fix `scheduler.py` the two new regression tests fail as intended.
+  `python3 -m py_compile` clean. No GPU runs (effect re-run awaits user approval).

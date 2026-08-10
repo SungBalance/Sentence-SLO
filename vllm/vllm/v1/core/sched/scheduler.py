@@ -1157,20 +1157,19 @@ class Scheduler(SchedulerInterface):
     def _sslo_decode_wall_ema(self, n: int) -> float | None:
         """Δ_decode for batch size n — the prefills=0 cell of the wall-step EMA.
 
-        Falls back to the mean over every observed prefills=0 cell (decode-only
-        step time is near batch-invariant: measured p50 74 ms / p90 78 ms),
-        then None when no decode-only step has been observed yet.
+        Batch-matched only, no cross-batch fallback: decode step time is
+        strongly batch-dependent (measured 1-6 ms below batch 10, 55 ms at 10,
+        70-73 ms at 30-40), so borrowing another batch's cell mis-attributes
+        the batch-size gap to prefill tokens. Under the offload tier, where
+        decode-only steps concentrate at low occupancy (p50 batch 16) while
+        prefill steps run at high occupancy (p50 batch 43), the old mean-over-
+        all-cells fallback doubled κ. Exact cells are available for ~96% of
+        prefill steps (measured on phaseP cap64/rate 4), so requiring the match
+        costs few samples. None ⇒ the caller drops the κ sample / leaves the
+        prefill budget control off.
         """
         bucket = self._sslo_step_wall_ema.get(n)
-        if bucket and 0 in bucket:
-            return bucket[0]
-        vals = [
-            cells[0] for cells in self._sslo_step_wall_ema.values()
-            if 0 in cells
-        ]
-        if vals:
-            return sum(vals) / len(vals)
-        return None
+        return bucket.get(0) if bucket else None
 
     # SSLO
     def _sslo_step_ema_lookup(self, admitted: list[Request]) -> float | None:
