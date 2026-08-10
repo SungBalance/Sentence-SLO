@@ -115,9 +115,15 @@ Step 1–3 결과를 사용자에게 보고하고 방향을 확인한 뒤:
 
 ## 완료 조건
 
-- [ ] Step 1: `tests/sslo/` 전부 pass (실패 시 수정 내역 WORKLOG 기록)
-- [ ] Step 2: vacate/promote 왕복이 로그로 실증됨 (유도 설정 포함 기록)
-- [ ] Step 3: 셀별 KV 포화 근접 표 작성
-- [ ] WORKLOG.md 갱신
+- [x] Step 1: `tests/sslo/` 145/147 pass — KV-offload 신규 38개 전부 pass;
+      fail 1은 기존 알려진 tts 실패, skip 1은 TTS profile CSV 부재
+      (WORKLOG 2026-08-04)
+- [x] Step 2: vacate/promote 왕복 실증 — Qwen2.5-32B/cap512/rate32/GMU0.95,
+      vacate 6·promote 6, 왕복 후 전 요청 정상 완료. 유도는 GMU 축소가 아닌
+      모델 사이즈 업 + cap 증가 방식 (사용자 지시). 부수 발견: flashinfer
+      SM120 MoE 크래시(`VLLM_USE_FLASHINFER_MOE_FP16=0` 우회), hybrid
+      (Qwen3.5 계열) 모델은 offload tier와 비호환 (WORKLOG 2026-08-04)
+- [ ] Step 3: 이 머신에 기존 sweep 산출물 없음 — dev 머신 데이터 필요 (보류)
+- [x] WORKLOG.md 갱신
 - [ ] 완료 후 이 파일(HANDOFF.md)의 체크박스를 갱신하고, 전부 끝나면 파일
       삭제 여부를 사용자에게 확인

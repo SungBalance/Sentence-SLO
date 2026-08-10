@@ -1,0 +1,275 @@
+# Method Sections (§2–§4) — draft
+
+> Scope: paper Method sections only (no experimental history). Terminology follows the
+> unified state/transition scheme: `waiting / running / pending / offloaded / onloading`
+> (states), `admit / defer / promote / offload / onload` (transitions).
+
+---
+
+## Section 2. Motivation
+
+**LLM output is consumed, not delivered.** In interactive serving, the model's output
+stream is not the end product: a human reads it, or a TTS engine converts it into audio
+that plays in real time. Consumption is *incremental* and *paced* — a reader advances
+sentence by sentence at reading speed; a TTS pipeline synthesizes and plays one utterance
+while the next is being generated. The user experience is therefore governed not by when
+individual tokens arrive, but by whether each *consumable unit* of output is ready by the
+time the consumer reaches it. When it is not, the consumer stalls mid-stream — a pause in
+the middle of reading, or an audible gap in speech — which is qualitatively worse than an
+equivalently longer initial wait.
+
+**Existing SLO formulations do not capture this.** Token-level metrics (TTFT, TPOT/TBT)
+constrain the token stream uniformly, but consumers do not consume tokens: a 40-token
+sentence delivered as a burst after a 2-second gap reads identically to one delivered
+token-by-token, while a uniform token cadence that happens to straddle a sentence boundary
+can still starve the consumer. Request-level latency is coarser still — it says nothing
+about pacing within the stream. Serving under token- or request-level SLOs therefore
+either over-provisions (enforcing a uniform token cadence far stricter than consumption
+requires) or under-protects (meeting average latency while stalling the consumer
+mid-stream).
+
+**The gap is an opportunity, not just a mismatch.** Generation is typically much faster
+than consumption: a modern GPU decodes a sentence in a fraction of the time a human takes
+to read it. Every in-flight request that is ahead of its consumer holds *slack* — time
+during which its next unit is not yet needed. From the scheduler's perspective this slack
+is a resource: tokens the GPU does not owe anyone yet. A scheduler aware of per-unit
+deadlines can *spend* that slack — deferring requests that are ahead, admitting more
+concurrent requests into the freed capacity — and thereby serve more users per GPU while
+every consumer still receives each unit on time. Two obstacles stand between this idea
+and a working system:
+
+1. **Memory.** Admitting more requests consumes KV-cache memory; on long-context
+   workloads the KV pool, not compute, becomes the binding constraint on admission.
+   A deferred request that is merely *waiting ahead of its consumer* still occupies
+   GPU memory that could admit a new user (§4.2).
+2. **Compute interference.** Admission is not free at the step level: prefilling a new
+   request's prompt inflates the iteration time for everyone. In our measurements,
+   steps containing prefill work are only ~6% of steps but account for ~18% of
+   wall-clock time, with p90 step latency 6× the decode-only baseline (463 ms vs 78 ms).
+   These spikes are precisely what breaks unit pacing for already-running requests (§4.3).
+
+The remainder of this paper formalizes per-unit deadlines (§3) and presents ProgressServe,
+a scheduler that spends slack safely against an explicit violation budget (§4.1), together
+with two resource-specific mechanisms — memory-side offloading (§4.2) and compute-side
+adaptive token batching (§4.3) — that remove the two obstacles above.
+
+---
+
+## Section 3. Consumable-Unit SLO
+
+**Consumable units.** We segment a response stream into *consumable units* (CUs): the
+smallest spans a consumer ingests atomically. For reading we use sentences (paragraphs
+are an alternative granularity); for TTS we use the utterance units the synthesizer
+accepts. Segmentation runs online over the token stream with a streaming boundary
+detector; sub-minimal fragments are merged so that pathological outputs (e.g., long
+comma-separated lists) do not produce degenerate units.
+
+**Consumption model and deadline recurrence.** Each consumer class defines a per-unit
+consumption time. For reading, unit $i$ with $w_i$ words takes $c_i = w_i \cdot t_{word}$
+(seconds-per-word). For TTS, $c_i$ is the *audio playback duration* of unit $i$, and unit
+readiness additionally requires the synthesis (conversion) time, both taken from a
+measured per-word-count profile of the target TTS engine. Consumption is sequential and
+begins when the first unit is delivered ($t_{start}$). The deadline of unit $i$ is the
+moment the consumer finishes everything before it:
+
+$$d_i \;=\; t_{start} \;+\; \sum_{j < i} c_j .$$
+
+A unit that completes generation at $g_i$ has slack $d_i - g_i$; a negative value means
+the consumer stalled for $g_i - d_i$ seconds. Note the recurrence is *self-paced*: fast
+generation builds slack, and one late unit shifts all subsequent deadlines (the consumer
+resumes where it left off), so the SLO measures the stall actually experienced rather
+than an accumulating fiction.
+
+**CU-SLO.** A request satisfies its CU-SLO at tolerance $\tau$ if no unit stalls its
+consumer by more than $\tau$: $\max_i (g_i - d_i) \le \tau$. We report the fraction of
+requests violating this (per-request), plus stall-time distributions (per-unit). Requests
+that have not yet delivered their first unit have *no* unit deadlines — the time to first
+consumable unit (TTFC) is reported separately, as queueing policy, not pacing, governs it.
+
+**What the scheduler can know online.** Enforcing $d_i$ ahead of time requires knowing
+how many tokens remain in the unit under generation — which is unknown until the boundary
+appears. We maintain an online *unit-length predictor*: a per-request estimator blended
+with a shared global estimator (warm-started across requests), exposing an empirical
+*tail posterior*
+
+$$\Pr\big[\,L > c + N \,\big|\, L > c\,\big]$$
+
+— the probability that a unit already $c$ tokens long needs more than $N$ further tokens.
+Requests progress through a lifecycle (`PREFILL → WARMUP → MEASURED`): only MEASURED
+requests (first units delivered, estimator warmed) carry deadlines and participate in the
+risk calculations of §4. This tail posterior is the single statistical primitive on which
+all scheduling decisions below are built.
+
+---
+
+## Section 4. ProgressServe: Scheduling for CU-SLO
+
+ProgressServe replaces the engine's per-step scheduling decision. Its design premise:
+*every* placement question — who decodes this step, who waits, who enters, whose memory
+stays resident, how much prefill to take on — is the same question, "what does this do to
+the probability that some unit misses its deadline?", and should be answered by the same
+model. §4.1 develops that model and the core run/defer/admit decision. §4.2 and §4.3 then
+extend it along the two resource axes identified in §2: KV memory and step-time compute.
+Each extension is gated so that it acts only in the regime it targets and provably (or
+measurably) leaves other regimes untouched.
+
+### 4.1 CU-SLO-aware Scheduling
+
+**Why the baseline is not enough.** A vanilla continuous-batching scheduler admits
+whenever capacity allows and decodes everyone every step. Under CU-SLO this throws
+away exactly the resource that matters: it gives tokens to requests that are seconds
+ahead of their consumer at the same priority as requests about to stall, and its only
+admission throttle — total memory — is blind to pacing. The operator is left choosing a
+static concurrency cap: small caps meet deadlines but idle the GPU and cap the number of
+concurrent users; large caps raise occupancy but let stalls grow unchecked. ProgressServe
+replaces this static trade-off with a per-step, per-request decision made against an
+explicit violation budget.
+
+**Risk primitives.** Consider a step with batch capacity $B$ and $|A^{+}|$ requests
+sharing service (running, onloading, and new admits — and offloaded requests, see §4.2).
+Each request's expected per-step token allocation is the *service share*
+$s = \min(1, B/|A^{+}|)$. For a MEASURED request $q$ with time $T_q$ to its next unit
+deadline and step time $\Delta$, the deadline horizon is $H_q = \lfloor T_q/\Delta \rfloor$
+steps, from which we derive the tokens producible before the deadline if the request runs
+this step ($N_{run}$) or is deferred one step ($N_{defer} < N_{run}$). The tail posterior
+of §3 converts token budgets into risks:
+
+$$R_{run} = \Pr[L > c_q + N_{run} \mid L > c_q], \qquad
+  R_{defer} = \Pr[L > c_q + N_{defer} \mid L > c_q],$$
+
+and the *marginal benefit* of a decode slot is $M = R_{defer} - R_{run} \ge 0$: how much
+violation probability this one slot removes. Requests without deadlines (PREFILL/WARMUP)
+are *forced* — they always receive service (they must produce their first units to become
+measurable at all) and are excluded from the risk sums.
+
+**Run/defer partition.** Each step, decode slots go to measurable requests in descending
+$M$; the remainder are *deferred* to the `pending` state — admitted, KV resident, but not
+decoding this step. Deferral is the mechanism by which slack is harvested: a request far
+ahead of its consumer has $R_{defer} \approx R_{run} \approx 0$, so $M \approx 0$, and
+yielding its slot costs (in expectation) nothing. A `pending` request is re-evaluated
+every step and *promotes* back to `running` the moment its marginal benefit justifies a
+slot — typically well before its deadline horizon closes.
+
+**Admission under a violation budget.** The harvested capacity is spent on admission.
+Let $E_{viol}(k)$ be the expected number of unit-deadline violations this step if the
+$k$ oldest waiting requests are admitted:
+
+$$E_{viol}(k) \;=\; \sum_{\text{scheduled}} R_{run} \;+\; \sum_{\text{deferred}} R_{defer}
+\qquad\text{(sums over measurable requests, at share } s(k)\text{)} .$$
+
+New admits carry no deadlines, so they enter $E_{viol}$ only *indirectly* — each admission
+shrinks the service share and the decode budget, raising every incumbent's risk. Since
+$E_{viol}(k)$ is monotone in $k$, ProgressServe admits the largest FCFS prefix
+$k^{*} = \max\{k : E_{viol}(k) < 1\}$, i.e., it packs users up to the point where the
+system expects (at most) one unit violation — an interpretable, workload-independent
+budget. Admission is additionally capped by free KV blocks; when the KV cap, not the risk
+budget, is what stops the scan, the step is flagged **kv-capped**. This flag is the
+hand-off point to §4.2: it identifies, per step, that memory rather than pacing risk is
+the binding constraint.
+
+**What it improves.** In KV-slack regimes the mechanism converts slack into concurrency:
+occupancy rises (more handling users per GPU) while stalls stay within the budget. Its
+limits are equally instructive: it can only *reorder and admit* — when the constraint is
+memory (deferred requests still hold KV) or single-step compute (prefill spikes), the
+risk model correctly diagnoses the pressure but has no lever to relieve it. Those levers
+are §4.2 and §4.3.
+
+### 4.2 Offloading
+
+**Why it is needed.** Deferral separates a request's *service* from its *memory*: a
+pending request consumes no compute but still occupies its full KV footprint. On
+long-context workloads this is the dominant admission constraint — the KV pool saturates
+while the risk budget $E_{viol}$ still has room ($k^{*}$ wants to admit; free blocks do
+not allow it). The slack harvested by §4.1 is then stranded: it cannot be spent on new
+users because departed-but-parked state is holding the room. Offloading un-strands it by
+moving the KV of the *safest* pending requests to host memory, on the observation that a
+request that is many units ahead of its consumer does not need its KV on the GPU *right
+now* — it needs it back *before its deadline*.
+
+**Mechanism.** Offloading extends the state machine with `offloaded` (deferred, KV on
+CPU) and the transient `onloading` (KV streaming back). Three rules govern it, all
+expressed in the §4.1 risk model:
+
+- *Eligibility (offload).* For a pending request, define $N_{defer\_cpu}$ as $N_{defer}$
+  minus the tokens forgone during the *onload lead* $\ell$ (the iterations needed to
+  stream KV back before it can decode), and
+  $$M_{cpu} \;=\; R_{defer\_cpu} - R_{defer} \;\ge\; 0$$
+  — the *risk premium of a CPU stay*. Only requests with $M_{cpu} \le \varepsilon$
+  (default $10^{-3}$) may be offloaded: parking them is, to within $\varepsilon$,
+  free in violation probability. A minimum-residency guard suppresses thrashing.
+- *Trigger.* Offloading fires only on **kv-capped** steps (§4.1), and frees only as many
+  blocks as admission actually needs. On every other step the mechanism is a no-op —
+  in KV-slack regimes the system is bit-for-bit the scheduler of §4.1.
+- *Return (onload).* An offloaded request begins onloading when its deadline horizon
+  approaches the lead time ($d - t \le \ell\Delta + \hat{f}$), holds a slot while
+  streaming (so its return is never crowded out by new admissions), and rejoins
+  `running` with KV intact — the deadline-safety check precedes any new offload.
+
+Two accounting rules keep the extension consistent with §4.1's model. First, offloaded
+requests remain in the service-share denominator $|A^{+}|$: offloading frees *memory*,
+not *compute* — the parked request will return and reclaim its share of tokens, and
+pretending otherwise would systematically understate every risk in the system (and, in
+particular, understate $M_{cpu}$ itself, causing spurious offloads). Second, offloaded
+requests keep contributing $R_{defer\_cpu}$ to $E_{viol}$: risk parked on the CPU is
+still risk.
+
+**What it improves.** Offloading targets exactly the KV-bound regime: large concurrency
+caps, long prompts, long generations. There it converts stranded slack into admissions —
+in our evaluation setting (32B model, multi-turn prompts averaging ~1.3K tokens, 8K
+generation cap), it cuts CU-SLO violation rates from ~6% (baseline) to 0.7–2.0% at
+96–99% of baseline throughput, while sustaining comparable concurrent users. Where KV is
+not binding (small caps), the trigger simply never fires; the correct behavior there is
+to do nothing, and the gating guarantees it.
+
+### 4.3 Adaptive Token Batching
+
+**Why it is needed.** §4.1–4.2 manage *which requests* get service; neither controls
+*what a step costs*. Iteration time is, however, not uniform: decode-only steps are
+tightly concentrated (p50 74 ms, p90 78 ms in our measurements), while steps that carry
+prompt-prefill work exhibit heavy tails (p90 463 ms) — a single large prefill chunk
+freezes every in-flight request for the duration. For CU-SLO this is the worst possible
+disturbance: it hits all consumers simultaneously, and it is invisible to per-request
+scheduling — no run/defer/offload decision changes the cost of the step itself. Note
+that shrinking the *request-level* batch (the classical adaptive-batching knob) does not
+address this: the spike is caused by prefill *tokens*, not by the number of concurrent
+requests, and reducing concurrency taxes throughput without flattening the tail. The
+correct control variable is the *token composition of the step*.
+
+**Mechanism.** ProgressServe bounds the prefill tokens per step with a deadline-aware
+budget. Model the step time as $\Delta(P) \approx \Delta_{dec} + \kappa P$, where $P$ is
+the step's prefill token count, $\Delta_{dec}$ is the decode-only baseline (from the
+scheduler's step-time EMA) and $\kappa$ (ms/token) is estimated online from observed
+prefill-carrying steps. Given the tightest deadline among measured in-flight requests,
+$T_{min}$, the step's budget is
+
+$$P^{*} \;=\; \mathrm{clamp}\!\Big(\frac{\gamma\, T_{min} - \Delta_{dec}}{\kappa},\;
+P_{floor},\; P_{base}\Big),$$
+
+with safety factor $\gamma \le 1$: *take as much prefill as fits before the most urgent
+consumer would notice*. The budget is enforced over the step's total prefill — chunked
+carry-over of already-admitted prompts and newly admitted prompts drain a single shared
+counter (in-flight prefills first) — while decode tokens are never limited. Two guards
+complete the design: a positive floor $P_{floor}$ with a starvation counter ensures
+prefill always progresses (bounding TTFC inflation), and when no measured request exists
+($T_{min}$ undefined) or the estimator is cold, the budget rests at $P_{base}$ —
+i.e., the control degrades to the baseline scheduler, never below it.
+
+**What it improves — and when it does nothing.** The control is *smoothing, not
+reduction*: total prefill work is conserved and spread across steps that were going to
+run anyway, so it is throughput-neutral by construction (measured: 89–99% of baseline
+tokens/s, versus 20–40% losses for request-level batch shrinking). It engages only when
+prefill work and a tight deadline coexist — on our multi-turn workload this is 22–54% of
+steps; on short-prompt workloads the lever is proportionally smaller, and on steps with
+no pending prefill the scheduler is unmodified. In the same evaluation setting it matches
+offloading's violation reductions (1.1–1.5% vs baseline 5.4–6.2%) through an entirely
+disjoint mechanism.
+
+**Composability.** The two extensions bind on different resources in different phases:
+offloading acts when the system is *full* (KV blocks admission; prefill work is scarce
+because little is being admitted), adaptive token batching acts when the system is
+*absorbing* (prompts queued or in flight; KV still has room). Empirically the triggers
+co-fire on only 1–2% of steps — far below the product of their individual rates — so the
+combination behaves as coverage union rather than interaction: each mechanism handles the
+failure phase the other cannot see, on a shared risk model and without contending for the
+same control variable. The composed scheduler (ProgressServe + offload + token batching)
+is the configuration we evaluate as our full system.

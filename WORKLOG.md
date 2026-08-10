@@ -1,5 +1,184 @@
 # Work Log
 
+## 2026-08-05 (sweep v2 Phase N 중간 결과 + ProgressServe admission 자기잠금 진단)
+
+- 실행: sweep v2 Phase N (Qwen3-32B, GEN 8192, wildchat dialogue, 구 rate
+  사다리 {4,8,16,24,32}) — cap128 전체(45 rate-run) + cap64 대부분 완료 후
+  사용자 지시로 중단 (~65/135 산출물 보존, `output_sweep_v2/gen8192/`).
+- 중간 결과 (cap128): CU-SLO 위반율(tau=1s) offload 1.2-2.0%(read) /
+  0.1-0.7%(TTS) vs baseline 7.5-9.2% / 2.9-4.4% vs adaptive 3.5-5.4% —
+  offload가 전 rate에서 우세. tput/동시사용자(u≈41, KV가 ~41명에서 binding)
+  는 대부분 rate에서 baseline과 동률.
+- Debugging (offload/adaptive 일부 셀 tput -20~35% 저하의 원인): 저하 셀
+  (read/cap128/r16 offload) scheduler_stats 분석 — 65% 스텝이 running≈5.5,
+  waiting≈3,200, KV 20%, kv_capped 0%인데 k*_unconstrained=0.7,
+  e_viol=0.99(임계 1.0 직하 고정). KV offload tier가 아니라 **ProgressServe
+  admission의 절대 임계(E_viol<1)가 소수 고위험 in-flight 요청의 위험 합으로
+  소진되어 admission이 잠기는 구조** (대기 요청 자체는 설계대로 E_viol
+  미포함 — `progress_serve.py:201-204`; admission은 service share·decode
+  슬롯 축소를 통해 간접적으로만 기존 요청 위험을 올림). 최장 7,830스텝
+  저점유 지속. 개선 후보(미결정): 한계 기준 ΔE_viol / M≈0 매몰비용 예산
+  제외 / 유휴 시 k* 하한.
+- 추가 발견: 전 rate가 서비스 용량(~0.64 req/s)의 6~50배 과포화 → TTFC
+  12~30분(순수 큐 대기). 재보정 결정: Phase N′는 read만,
+  RATES="0.25 0.5 1 2 4", 결합 모드 포함 4모드 (SWEEP_PLAN_v2.md).
+
+## 2026-08-05 (handling-users offload 분리 + progress_serve_offload_adaptive)
+
+- Modified content (과제 A): `scheduler.py` `_sslo_dump_step_stats`의
+  per-step 통계에서 `num_handling_users`를 `running + sslo_pending +
+  _sslo_offloaded`(CPU 체류 요청 포함)로 바꾸고, 기존 GPU-only 값은
+  `num_handling_users_online`으로 병기. offload 미사용 모드에서는
+  `_sslo_offloaded`가 비어 두 키가 같은 값이라 기존 로그와 호환. `analyze.py`는
+  `mean_handling_users_online_time_weighted`(time-weighted mean)를
+  `metrics.scheduler[mode]`에 추가 — 주 지표(`mean_handling_users`)와 CSV
+  스칼라 컬럼 구성은 그대로 두고 비교값만 summary.json에 남긴다.
+- Added content (과제 B): 결합 모드 `progress_serve_offload_adaptive`
+  (KV offload tier + adaptive batching). `run_test.py`에 모듈 상수
+  `OFFLOAD_RUN_KINDS`를 두고 sslo_params/KVTransferConfig 두 분기가 공유하게
+  조건 확장, adaptive_batching 조건에 새 run_kind 추가. 모드 목록 상수
+  (`metrics_utils.MODES_DEFAULT`, `analyze.py SSLO_MODES`)에 등록 — argparse
+  choices와 sweep_analysis `--modes` 기본값이 여기서 파생되므로 추가 배선 불필요.
+  `run_test.sh`/`run_sweep.sh`는 주석의 selectable 목록만 갱신(MODES는 이미
+  임의 comma-sep이라 로직 변경 없음). `analyze.py` 경로 기반 mode 추론은
+  디렉토리명 정확 일치라 substring 충돌 없음.
+- Added content (테스트): `tests/sslo/test_scheduler_sslo.py`에
+  `test_step_stats_handling_users_counts_offloaded` — `_sslo_offloaded`에 1건을
+  넣고 stats를 덤프해 `num_handling_users==3`, `num_handling_users_online==2`
+  확인.
+- Debugging/verification: 컨테이너 `sk-sslo`, GPU 미사용
+  (`CUDA_VISIBLE_DEVICES=""`). `pytest tests/sslo/ -q` → 146 passed, 1 skipped,
+  1 failed(`test_tts_consume_path.py::test_tts_path_uses_audio_ready_time_for_slack_and_deadline`
+  — 이전부터 있던 실패, 이번 변경과 무관). py_compile/bash -n 통과,
+  `run_test.py --help`에 새 run_kind 노출. 엔진 생성을 가로챈 probe 스크립트로
+  네 run_kind의 sslo_params 확인: offload_adaptive는 adaptive_batching=True /
+  kv_offload=True / SimpleCPUOffloadConnector, plain offload는
+  adaptive_batching=False 유지.
+
+## 2026-08-04 (sweep v2 준비: multi-turn 하네스 + 캐시 웜업 — GPU 단계 직전까지)
+
+- 설계 확정 (사용자 결정, `exp/run_sslo/SWEEP_PLAN_v2.md` 소스 오브 트루스):
+  Qwen3-32B 단일 / GEN {2048,4096,8192} / 모드 {baseline,
+  progress_serve_adaptive, progress_serve_offload} / wildchat multi-turn
+  (`DIALOGUE_PROMPTS=1`) / repeat 1 / CAPS는 probe(B안)로 확정 / GEN 축은
+  `OUTPUT_ROOT` 분리 3회 호출.
+- Added content (하네스 라운드 1): `run_test.py` `--dialogue-prompts`
+  (`load_dialogues()` → 마지막 user 턴까지 프리픽스 + chat template) /
+  `--max-prompt-tokens`; `run_test.sh`에 `DIALOGUE_PROMPTS`/`MAX_PROMPT_TOKENS`
+  패스스루; `run_sweep.sh` `MODEL_SPECS` 1개 허용(Phase 2/4 스킵);
+  README dialogue 섹션. 라운드 2(풀 캐시 + 지적 처리)는 아래 항목 참조.
+- Added content (환경): 컨테이너에 `datasets` 5.0.1 설치 — dialogue 모드
+  필수 의존성; huggingface_hub/fsspec/dill 버전 변화 없음, vllm/torch import
+  정상 확인. Qwen/Qwen3-32B `/cache/hub` 다운로드 완료 (17/17 샤드, 62GB).
+- Verification: 개발(sslo-developer)↔검증(sslo-verifier) 루프 3라운드 —
+  R1: Critical/Important 0 (Minor 1은 R2에 포함 처리), R2: Important 1
+  (combine seed 캐시 고정) + Minor 1 (로그 구분자) → 수정, R3: 이슈 없음
+  (루프 종료). wildchat 캐시 웜업 4,000 대화 37s(30MB). 프롬프트 통계
+  (Qwen3-32B tokenizer): 평균 1,301 / p50 704 / p90 3,683 / p99 7,664 /
+  최대 9,186 토큰, 평균 user 턴 4.3 → `MAX_PROMPT_TOKENS=0` 확정, cap
+  사다리는 기존 {128,256,512}보다 하향 필요( ~50 동시 재적에서 KV-bound
+  예상), probe로 확정 예정. GPU 필요 단계(probe → sweep)만 남음.
+
+## 2026-08-04 (dialogue 워크로드: 풀 캐시 + 검증 지적 처리)
+
+- Added content: `exp/tools/dataset_cache.py` — `dialogue_cache_path()` /
+  `load_or_build_dialogue_pool()`. 기존 `load_or_build_combine_pool` 컨벤션
+  (DATASET_CACHE_DIR, `.tmp`→rename, seed는 로드 후 셔플만) 그대로, 소스
+  데이터셋 + 필터 조합별 파일 `dialogues_{dataset}_{conv-en-nocode}.jsonl`에
+  **chat template 적용 전 raw `{"messages": [...]}`** 를 캐싱해 모델 불문
+  재사용. 캐시가 요청 수보다 작으면 로그 한 줄 후 있는 만큼 사용(재빌드는
+  파일 삭제).
+- Modified content: `exp/run_sslo/run_test.py` — dialogue 분기가 이 캐시를
+  통해 대화를 얻도록 변경(miss 시에만 `load_dialogues()` HF 스트리밍).
+  캐시 빌드는 `DIALOGUE_BUILD_SEED=42` 고정 — `--dataset-name combine`은
+  loader seed가 풀 구성 자체를 바꿔 최초 빌드 seed가 캐시에 영구 고정되므로,
+  per-run 순서는 캐시 계층 셔플(`args.dataset_seed`)에만 맡긴다.
+  그 외:
+  `_pool_source()` 헬퍼로 pool 로그와 run_meta의 `workload_id`/`pool_source`를
+  dialogue 모드에서 `dialogue_<dataset>[_maxtok<N>]`로 기록(non-dialogue 문구
+  불변); `--dialogue-prompts`+`--no-chat-template` 조합을 `parser.error`로
+  차단(멀티턴 직렬화에 템플릿 필수). README/`run_test.sh` 주석에
+  `DIALOGUE_PROMPTS=1` 사용 시 `DATASET_NAME`을 wildchat/lmsys/combine으로
+  바꿔야 함(기본 koala는 즉시 에러)과 캐시 위치·shortfall 동작 명시.
+- Debugging/verification (컨테이너 `sk-sslo`, GPU 런 없음): py_compile /
+  `bash -n` / `--help` 통과. 격리 경로(`DATASET_CACHE_DIR=/tmp/...`)에서
+  wildchat 8대화(conv+en+nocode) 캐시 미스 11.20s → 히트 0.000s, 결과 동일,
+  파일 8줄·키 `messages` 확인, 100개 요청 시 shortfall 로그 후 8개 반환.
+  검증용 캐시는 삭제하고 기본 캐시 디렉터리는 미변경(단일턴 combine 풀
+  n=2591 캐시 히트 그대로).
+
+## 2026-08-04 (TI1 실험 머신 검증: HANDOFF Step 0–2)
+
+- Modified content: `exp/run_sslo/analyze.py` —
+  `finalize_round2_metrics()` 화이트리스트에 `offload` 그룹 전달 블록 추가
+  (truthy 체크라 non-offload 런의 summary.json 형태는 불변). 기존에는
+  `offload_request_stats()` 결과가 Round-2 finalize에서 탈락해
+  `metrics.offload.<mode>`가 summary.json에 절대 안 나왔고,
+  `metrics_utils.py`의 "KV offload" DISPLAY_GROUP은 죽은 코드였다.
+  sslo-verifier 검증: 이슈 없음 (1-pass).
+- Added content (환경, TI1 머신): `sk-sslo` 컨테이너 신규 생성 — GPU 0,1만
+  사용 가능하므로 `run_docker.sh`의 인자에서 `--privileged`를 빼고
+  `--gpus '"device=0,1"'`로 장치 제한 (privileged가 GPU 제한을 무력화함;
+  스크립트 자체는 미수정). vLLM editable 설치는
+  `VLLM_PRECOMPILED_WHEEL_COMMIT=5371d6fb4023a1a08021135e46e9354ba0923e50`
+  핀 필수: `vllm/`이 upstream 히스토리 없이 squash 벤더링돼 merge-base 탐지가
+  실패 → 최신 nightly wheel 폴백 → `vllm._C` ABI 불일치로 import가 깨진다.
+  벤더링 트리는 upstream 5371d6fb(2026-04-29, v0.20.1rc1.dev57)와 지문 5/5
+  일치 (변환 커밋의 gitlink b1388b1f는 실제 트리보다 오래됨). pytest/tblib은
+  별도 설치.
+- Verification (Step 1): `tests/sslo/` 147개 중 145 pass / 1 fail / 1 skip.
+  이 머신에서 처음 실행된 KV-offload 테스트 38개
+  (`test_scheduler_sslo.py` unit 8 + e2e 2 포함 26, `test_kv_offload_manager.py` 12)
+  전부 pass. fail 1은 기존 알려진 `test_tts_consume_path.py` 실패, skip 1은
+  TTS profile CSV 부재(이 머신에 `measure_tts_duration` 산출물 없음).
+- Verification (Step 2, vacate→promote 실증): Qwen2.5-32B(dense)/cap512/
+  rate32/GMU0.95(기본)에서 kv_capped 107스텝, vacate 6·promote 6
+  (decisions.jsonl `{"kind":"vacate"}`/`{"kind":"promote"}` row, 예:
+  요청 312-a144ac5a step 521 vacate → 523 promote), requests.jsonl에
+  offload 라이프사이클 비영 4건(onload 6회, 최대 CPU 체류 21.28s), 전 요청
+  정상 완료(2048개/309s, exit 0). summary.json에
+  `metrics.offload.progress_serve_offload` 집계 존재(값 0 — offload 이벤트가
+  전부 warmup 윈도 밖이라 in-window 집계상 0; 구조 검증 완료). kv_capped 유도는
+  사용자 지시대로 GMU 축소가 아니라 기본 utilization + 모델 사이즈 업 +
+  cap 증가로 수행 (8B는 rate를 올려도 KV가 안 묶임; 32B/cap256은 cap이 먼저
+  묶여 KV 최대 86.5%, cap512에서 KV 100% 도달로 kv_capped 발생).
+- Verification (발견 1, flashinfer SM120): Blackwell RTX PRO 6000(SM120)에서
+  flashinfer 0.6.8.post1 cutlass fused-MoE가 부팅 중
+  `TypeError: ... Expected 24 but got 25 arguments`로 크래시 (JIT 캐시
+  클리어로 해결 안 됨). MoE 모델은 `VLLM_USE_FLASHINFER_MOE_FP16=0`으로
+  flashinfer 백엔드를 제외하면 TRITON 폴백으로 정상 부팅.
+- Verification (발견 2, hybrid 비호환 — 실험 설계 영향): Qwen3.5-35B-A3B
+  스모크에서 kv_capped 자연 유도(KV 94.6%) 후 첫 vacate→promote 왕복 직후
+  upstream `_mamba_block_aligned_split()`의
+  `assert num_external_computed_tokens == 0`("External KV connector is not
+  verified yet")으로 엔진 크래시. Qwen3.5/3.6/gemma-4 등 hybrid
+  (mamba/linear-attn) 계열은 external KV connector 기반 offload tier와
+  비호환 (mamba state가 paged KV 밖이라 assert 제거로도 해결 불가).
+  → sweep 라인업의 35B 모델을 offload 모드 셀에 쓸 수 없음; offload 실험
+  모델 축은 dense full-attention(예: Qwen2.5-32B)으로 재설계 필요.
+- Step 3 (기존 sweep 산출물 kv_capped 사전 분석): 이 머신에는
+  `output_sweep/` 산출물이 없어 (리포·`/data` 전체 탐색) 수행 불가 —
+  dev 머신 데이터 필요.
+- Added content: `kv_offload_model_compat.md` (repo 루트) — external KV
+  connector 기반 offload의 모델 아키텍처 호환성 정리 (코드 조사, 실행 없음).
+  판정 기준 G1–G5(mamba align assert, full-attn 그룹 필수, HMA 딜레마,
+  prefix caching 전제, enc-dec 배제)와 호환/비호환/조건부 3분류,
+  실험 모델 축 권고(1순위 Qwen3-30B-A3B full-attn MoE) 포함.
+- Follow-up (사용자 결정, 2026-08-04): **본 sweep은 처음부터 재실행해야 함**
+  — 발견 2(hybrid 비호환)로 offload 모드가 기존 라인업(Qwen3.5-9B/35B-A3B)
+  에서 불가하므로 모델 축 재설계 후 baseline/progress_serve(/adaptive/
+  offload) 전 모드 재수행. 이 세션에서는 기록만 남기고 실행하지 않음.
+- Follow-up (flashinfer 24-vs-25 인자 크래시 근본 원인, 실행 없이 확인):
+  NGC 컨테이너 잔존 패키지 `flashinfer-jit-cache 0.6.7+a79fb63c.nv26.3`의
+  사전 빌드 `jit_cache/fused_moe_120/fused_moe_120.so`가 0.6.7 시그니처
+  (24인자, `swizzled_input_sf` 부재 — strings로 확인)인데, flashinfer 로더가
+  JIT 대신 이 AOT 아티팩트를 우선 로드해 flashinfer-python 0.6.8.post1
+  (25인자 호출)과 불일치. 해결책은 flashinfer 업그레이드가 아니라
+  **`pip uninstall flashinfer-jit-cache`** (또는 0.6.8.post1 대응 jit-cache
+  설치) — 그러면 sm120 모듈이 동일 버전 csrc에서 JIT 컴파일된다.
+  flashinfer-python 자체를 0.6.9+로 올리는 것은 vLLM 체크아웃(0.6.8.post1
+  핀, 2026-04 API 기준)과의 호환이 깨질 수 있어 비권장.
+
 ## 2026-07-31 (KV offload tier: stage 3 — harness + docs)
 
 - Modified content: `exp/run_sslo/run_test.py` — new run kind
@@ -2058,3 +2237,254 @@ Modes are now exactly `{baseline, progress_serve}`.
   request 0.86–1.36); CV agrees (chunk 0.29–0.52 vs request 0.40–0.74). Prompt
   length barely predicts output length (Pearson ≤0.30, ~0 for non-English).
   Nuance: chunk p99/p50 tail ratio can exceed request's (en-code 2.35 vs 1.13).
+
+## 2026-08-06 (ProgressServe: parked (CPU) requests count in the service share)
+
+- Modified content: `vllm/vllm/sslo/config.py` gained
+  `kv_offload_share_includes_parked` (default `True`) — vacating frees memory,
+  not compute, so a CPU-parked request stays in the `|A+|` service-share
+  denominator; excluding it inflated `s`, underestimated `M_cpu` (over-vacate)
+  and skewed the adaptive batch choice. `progress_serve.build_plan` /
+  `schedule_step` / `pick_adaptive_batch` take the flag as a plain argument
+  (module stays engine-import-free) and add `len(cpu_views)` to `n_aplus` when
+  set; the flag touches the `s` term only — parked reqs still take no decode
+  slot and still enter `E_viol` as `R_defer_cpu`. `scheduler.py` threads the
+  config value into the three calls and mirrors the same `|A+|` in
+  `_sslo_apply_offload`'s local `s` (the one feeding select_vacate /
+  select_promote) so plan-side and decision-side `M_cpu` agree.
+  `run_test.py` exposes `SSLO_KV_OFFLOAD_SHARE_INCLUDES_PARKED` alongside the
+  other `SSLO_KV_OFFLOAD_*` env overrides; `vllm/vllm/sslo/README.md` §9
+  documents the semantics and the default switch.
+- Added content: `tests/sslo/test_progress_serve.py` —
+  `test_build_plan_service_share_includes_cpu_by_default`,
+  `..._excludes_cpu_when_opted_out`,
+  `test_build_plan_parked_share_does_not_change_slots` (slots / offloaded set
+  unchanged, only `s` and `R_defer_cpu` move),
+  `test_schedule_step_threads_share_includes_parked` (parked in `|A+|` ⇒
+  strictly smaller `k*`),
+  `test_pick_adaptive_batch_threads_share_includes_parked`.
+- Debugging/verification: `python3 -m pytest tests/sslo/ -q` in `sk-sslo` →
+  150 passed, 1 skipped, 1 failed (pre-existing
+  `test_tts_path_uses_audio_ready_time_for_slack_and_deadline`). The
+  `schedule_step` spy in `test_scheduler_sslo.py` needed the new argument in
+  its signature. No GPU runs.
+
+## 2026-08-06 (ProgressServe: opt-in marginal (delta) admission criterion)
+
+- Modified content: `vllm/vllm/sslo/config.py` gained
+  `admission_delta_criterion` (default `False`). When set, `schedule_step`
+  admits while the MARGINAL `E_viol(k) - E_viol(0) < 1` instead of the
+  absolute `E_viol(k) < 1`: the risk the in-flight set already carries is
+  sunk cost, so the budget covers only the extra expected violations this
+  step's admits cause. This is the fix for the Phase N' admission self-lock —
+  once a few high-risk in-flight requests sum past 1, the absolute rule pins
+  `k*` to 0 even with idle KV / compute. `progress_serve.schedule_step` takes
+  the flag as a plain argument (module stays engine-import-free) and applies
+  `plan.e_viol - baseline_e` in both the main scan and the
+  `k_star_unconstrained` re-scan; `baseline_e` is `0.0` when the flag is off,
+  so the absolute path is unchanged. The delta expression also subsumes the
+  `k=0` early-exit (`E_viol(0) - E_viol(0) = 0 < 1` always proceeds).
+  `ScheduleResult.e_viol` stays the ABSOLUTE value at `k*` — the delta is used
+  for the admission decision only, so decisions.jsonl / scheduler_stats stay
+  comparable with earlier runs. `scheduler.py` threads
+  `self.sslo_config.admission_delta_criterion` into the `ps.schedule_step`
+  call. `run_test.py` exposes `SSLO_ADMISSION_DELTA_CRITERION` (0/1) for every
+  non-baseline run_kind (alongside `SSLO_ADAPTIVE_BATCHING`, not inside the
+  offload-only block) since the criterion applies to all ProgressServe kinds.
+  `vllm/vllm/sslo/README.md` §4 + the config table document the rule.
+- Added content: `tests/sslo/test_progress_serve.py` —
+  `test_schedule_step_delta_criterion_unlocks_sunk_risk` (same locked input as
+  `..._defer_only_when_infeasible_at_zero`: absolute `k*=0`, delta `k*=2`, and
+  the reported `e_viol` is still the absolute one),
+  `..._matches_absolute_at_low_risk` (`E_viol(0) == 0` ⇒ identical `k*` and
+  `e_viol`, with the risk budget still binding at `0 < k* < |W|`),
+  `..._still_bounded_by_marginal_budget` (two doomed reqs make `E_viol(0) = 2`
+  so the absolute rule locks; the delta scan admits some and then stops,
+  cross-checked against a build_plan oracle).
+- Debugging/verification: `python3 -m pytest tests/sslo/ -q` in `sk-sslo` (CPU
+  only, `CUDA_VISIBLE_DEVICES=""`, no GPU touched — the A1 sweep was running)
+  → 153 passed, 1 skipped, 1 failed (pre-existing
+  `test_tts_path_uses_audio_ready_time_for_slack_and_deadline`). The
+  `schedule_step` spy in `test_scheduler_sslo.py` needed the new argument in
+  its signature (same as the previous session's flag). `py_compile` clean on
+  all touched files.
+
+## 2026-08-07 (Ablation A1/A3: share 회계 채택, 델타 기준 기각)
+
+- 실행: A1 (`kv_offload_share_includes_parked=True`, offl/comb 6셀 24
+  rate-run 완주, `output_sweep_v2/a1_share`) / A3 (A1 + 델타 기준,
+  10/24에서 조기 중단, `.../a3_share_delta`).
+- 결과 A1 — **채택**: offload 단독의 저-cap 오작동이 교정됐다.
+  cap32/offl r0.5 vac 8→1 · tput 337→368, r1 viol 1.1→0.6% · tput
+  250→314, r4 1.6→1.2% · 251→284. cap64/128 offload는 동등(seed-less
+  샘플링 노이즈 범위). 결합 모드는 구제 실패 — cap32 vacate 272~498회
+  여전, 저부하 cap64 r0.5는 오히려 악화(viol 1.4→2.6%, vac 0→59) →
+  결합의 병인은 share 회계가 아니라 adaptive 축소 나선으로 확정.
+- 결과 A3 — **기각**: 델타 기준(`E_viol(k)−E_viol(0)<1`)이 offload
+  단독까지 악화시켰다 (cap128/offl r1/r2/r4 viol 1.3/1.5/2.0% →
+  3.7/4.5/7.0%; cap64/offl 1.8→3.4~6.3%; comb/cap128 r0.5 1.2→7.7%).
+  진단: per-step e_viol 최대가 16~41로 누적 폭주(A1은 ~1 유지) — 절대
+  임계는 매몰비용 잠금의 원인인 동시에 시스템 총위험의 유일한 브레이크
+  였다. rate 단조 악화라 노이즈 아님. 잔여 14 rate-run은 실익 없어 중단.
+- 코드 상태: `admission_delta_criterion`은 기본 False로 보존(기각 옵션),
+  `kv_offload_share_includes_parked`는 기본 True 채택. 두 변경 모두
+  개발↔검증 루프 통과("이슈 없음", tests/sslo 153 pass + 기존 tts 1건 실패).
+- 차기 설계 후보(미해결): ③축 잠금의 안전한 해제 — 델타+상한 하이브리드,
+  유휴 시에만 델타 적용, 또는 M≈0 요청만 예산 제외하는 국소 수정.
+
+## 2026-08-09 (deadline-aware prefill token budget: 새 run kind 2종)
+
+- 배경(실측 근거): cap128/r2 baseline 기준 decode-only 스텝 Δ는 p50 74ms /
+  p90 78ms로 매우 안정적인 반면, prefill이 섞인 스텝은 전체의 6%인데 벽시계의
+  18.4%를 차지하고 Δ p90 = 463ms. 즉 청크 마감을 깨는 것은 prefill spike이며
+  `max_num_seqs`(동시성) 축을 줄이는 현행 adaptive batching은 여기에 영향이
+  없다. 따라서 요청 수 대신 **스텝당 prefill 토큰 예산**을 마감 인지로 제어.
+- Added content:
+  - `vllm/vllm/sslo/progress_serve.py` — 순수 함수 `prefill_budget(t_min,
+    delta_decode, kappa, base_budget, floor, gamma)`:
+    `P* = clamp(int((γ·t_min − Δ_decode)/κ), floor, base_budget)`.
+    `kappa <= 0` 또는 `t_min is None`이면 제어 비활성(base 반환),
+    `t_min <= 0`(overdue)이면 floor. 엔진 import 없음.
+  - `vllm/vllm/sslo/config.py` — `prefill_budget_control`(기본 False),
+    `prefill_budget_floor`(512 토큰, >0 검증), `prefill_budget_gamma`(0.5,
+    0<γ≤1 검증).
+  - `exp/run_sslo/run_test.py` — run kind `progress_serve_prefill_budget`,
+    `progress_serve_offload_prefill_budget`(offload와 결합, adaptive 없음).
+    `PREFILL_BUDGET_RUN_KINDS` 상수 + env override
+    `SSLO_PREFILL_BUDGET_FLOOR` / `SSLO_PREFILL_BUDGET_GAMMA`.
+    두 kind 모두 `MODES_DEFAULT`(metrics_utils.py) / `SSLO_MODES`(analyze.py)에 추가.
+- Modified content (`vllm/vllm/v1/core/sched/scheduler.py`, 전부 `# SSLO` 표시):
+  - κ 온라인 추정: `_update_tpot_ema`에서 prefill을 실은 스텝마다
+    `max(0, (Δ_obs − Δ_decode)/prefill_tokens)`를 tpot EMA와 같은 alpha로 누적
+    (`_sslo_prefill_kappa`). Δ_decode는 새 헬퍼 `_sslo_decode_wall_ema(n)`가
+    기존 `_sslo_step_wall_ema`의 prefills=0 셀에서 조회(없으면 전 batch의
+    prefills=0 평균 → 그것도 없으면 None → 제어 비활성).
+  - prefill 토큰 집계: `_record_step_for_next_ema`가 prefill_count와 동일한
+    요청 집합에 대해 `_sslo_prev_step_prefill_tokens`를 기록.
+  - t_min: `_sslo_min_time_to_deadline(now)` — running 중 MEASURED 요청의
+    `slo_state.time_to_deadline(now)` 최솟값.
+  - 적용: `schedule_sslo()`가 policy 직후 `_sslo_prefill_token_budget(now)`로
+    P*를 구하고, waiting-큐 admission 루프에서만 `num_new_tokens`를 남은
+    예산으로 clamp + 소진 시 break. running(decode) 경로는 무제한. chunked
+    prefill이 꺼져 있으면 제어 자체를 비활성(잔여 이월이 불가하므로).
+  - offload 합성: 소진된 prefill 예산이 promoted onload traversal을 막지
+    않도록 k* 소진과 동일한 skip/break 규칙 적용(onload는 clamp 면제, 예산
+    차감은 유지).
+  - 기아 방지: floor로 clamp된 채 prefill 진행이 0인 스텝이
+    `_SSLO_PREFILL_FLOOR_STARVE_STEPS`(32) 연속되면 한 스텝 base budget 허용.
+  - 관측: `scheduler_stats.jsonl`에 `prefill_budget`,
+    `prefill_kappa_ms_per_tok` 추가. `reset_sslo_state()`에서 κ/스트릭/토큰
+    카운터 리셋.
+- Debugging/Verification (컨테이너 `sk-sslo`, GPU 미사용):
+  - `python3 -m pytest tests/sslo/ -q` → 168 passed, 1 skipped,
+    1 failed(기존 알려진 `test_tts_consume_path.py::
+    test_tts_path_uses_audio_ready_time_for_slack_and_deadline`, 본 변경과 무관).
+    신규 테스트: `test_progress_serve.py` 5건(순수 함수: 슬랙 증가 시 예산
+    증가/포화, t_min 단조성, overdue→floor, κ≤0·t_min None→base, 범위 불변),
+    `test_scheduler_sslo.py` 9건(제어 off 회귀, κ/Δ 미비 시 비활성, 긴급도별
+    P*, 기아 가드 32스텝 해제, waiting 루프 prefill 합 ≤ P*, decode 무제한,
+    onload 비차단, stats 필드, κ EMA 갱신/음수 클램프).
+  - run kind 검증: `AsyncEngineArgs`를 인터셉트해 GPU 없이 sslo_params 확인 —
+    `progress_serve_prefill_budget`(control=True, kv_offload=False),
+    `progress_serve_offload_prefill_budget`(control=True, kv_offload=True,
+    KVTransferConfig 연결), 두 kind 모두 adaptive_batching=False, env override
+    (floor=256, gamma=0.25) 반영 확인. `--help` choices에도 노출.
+  - `python3 -m py_compile` (변경 .py 전부) / `bash -n`
+    (`run_test.sh`, `run_sweep.sh`) 통과.
+- 남은 위험: κ는 스텝 전체 prefill 토큰(러닝 큐의 chunked 이월 포함)으로
+  추정하지만 예산은 waiting-큐 admission에만 걸린다 — 러닝 큐의 chunked
+  prefill 이월분은 상한 밖. GPU 실측 스윕 미실행(정책상 금지).
+
+### 보완 (같은 날, 코디네이터 지적 반영)
+
+- **문제**: 최초 구현은 waiting-큐 admission 루프에만 클램프를 걸었는데, vLLM
+  v1에서 chunked prefill의 **후속 청크는 running 루프**에서 스케줄된다
+  (RUNNING이지만 `num_computed_tokens < num_prompt_tokens`). 따라서 2,000토큰
+  프롬프트를 512로 잘라도 나머지 1,488이 다음 스텝에 무제한 유입되어 spike를
+  한 스텝 미룰 뿐 평활화가 되지 않았다. 실측 Δ p90 = 463ms의 주 경로가 여기다.
+- **수정** (`scheduler.py`, `# SSLO` 표시):
+  - `schedule_sslo()`의 running 루프에도 클램프 추가. 판별은
+    `request.num_computed_tokens < request.num_prompt_tokens`
+    (`sslo_is_carryover_prefill`) — 프롬프트를 다 처리한 디코딩 요청은 대상 아님.
+  - 단일 `sslo_prefill_remaining` 카운터를 running → waiting 순서로 공유 소진.
+    running이 먼저이므로 in-flight prefill이 신규 admit보다 우선한다.
+  - 진행 보장: 캐리오버는 예산 소진 상태에서도
+    `max(1, min(num_new_tokens, remaining))`로 최소 1토큰 확보(영구 정지 방지).
+    기존 `num_new_tokens == 0` 경로는 건드리지 않도록 `num_new_tokens > 0`일
+    때만 적용.
+  - 차감도 캐리오버 prefill에만 적용(decode 무과금). onload 면제와 chunked
+    prefill 게이트는 유지.
+  - 결과적으로 κ 추정 모집단(스텝 전체 prefill 토큰)과 클램프 모집단이 일치 →
+    이전 보고의 "남은 위험 1번" 해소.
+- `config.py`: `prefill_budget_control`에 `method="progress_serve"` 요구
+  `__post_init__` 가드 추가 (`kv_offload`와 동일한 결) → 이전 "남은 위험 2번" 해소.
+- 테스트 추가: `test_scheduler_sslo.py` 4건 — (a) running 캐리오버가 P*에
+  묶임, (b) waiting+running 합산이 정확히 P*, (c) 같은 스텝의 decode 요청은
+  무제한, (d) 예산 소진 시에도 캐리오버 1토큰 진행. `test_sslo_config.py` 4건 —
+  기본값/`progress_serve` 요구/floor>0/gamma 범위.
+- 검증: `python3 -m pytest tests/sslo/ -q` → **179 passed, 1 skipped,
+  1 failed**(기존 알려진 tts 1건). py_compile / bash -n 통과. GPU 실험 없음.
+- 남은 위험: `SchedulingPolicy.PRIORITY`에서 running 루프가 이미 스케줄된
+  요청을 선점 취소할 때 `token_budget`은 환급되지만 prefill 예산은 환급하지
+  않는다(과금 과다 = 보수적 방향, FCFS 실험 경로에서는 미발생).
+
+### 검증 루프 마무리 (Minor 2건 + κ 모집단 갭)
+
+- Minor 1 (`scheduler.py` PRIORITY preemption 분기): `token_budget`은 환불하나
+  `sslo_prefill_remaining`은 환불하지 않는 갭을 `# SSLO` 주석으로 명시(환불
+  구현은 기존 문장 재작성이 필요해 범위 밖). 방향은 과금 과다 = 보수적,
+  FCFS에서는 도달 불가.
+- Minor 2 (`progress_serve.prefill_budget`): 클램프 순서를
+  `floor = min(floor, base_budget)`로 선정규화 → 반환값이 항상
+  `<= base_budget`. `prefill_budget_floor`가 엔진 `max_num_batched_tokens`
+  이상이면 제어가 조용한 no-op이 된다는 점을 config 필드 주석과 docstring에
+  명시(SsloConfig는 SchedulerConfig를 볼 수 없어 교차 검증 불가).
+  테스트 `test_prefill_budget_floor_above_base_never_exceeds_base` 추가.
+- κ 회귀 모집단 갭 (사각지대로 판단 → 수정): `_sslo_pre_step_computed`는 스텝
+  시작 시 `running + sslo_pending`만 담으므로, preemption 후 이번 스텝
+  waiting 루프로 재-admit되는 요청은 `pre is None` 분기로 빠져 κ 분모에서
+  누락됐다(반면 예산에서는 차감). 분모 과소 → κ 과대 → P* 축소이므로 안전
+  측이지만, 예산 차감 모집단과 불일치라 국소 수정(3줄): 해당 분기에서
+  `prefill_tokens`에만 토큰을 더한다. `prefill_count`(기존 wall-EMA 셀 키)와
+  `decoding_only`은 의도적으로 불변. 테스트
+  `test_kappa_regressor_counts_resumed_admits` 추가.
+- 검증: `python3 -m pytest tests/sslo/ -q` → **181 passed, 1 skipped,
+  1 failed**(기존 알려진 tts 1건). py_compile 통과. GPU 실험 없음.
+
+## 2026-08-10 — KV offload tier 용어 통일 (vacate/promote → offload/onload)
+
+순수 리네이밍 + 문서 정합. 동작 변경 없음(GPU 실험 없음).
+
+- 배경: `promote`가 CPU→GPU 복원을 뜻해 자연스러운 pending→running 의미와
+  충돌. 상태(명사) `waiting`/`running`/`pending`/`offloaded`/`onloading`,
+  전이(동사) `admit`/`defer`/`promote`(pending→running)/`offload`(pending→
+  offloaded)/`onload`(offloaded→onloading→running)로 확정.
+- 수정: 코드 식별자 `select_vacate`→`select_offload`,
+  `select_promote`→`select_onload`, `_sslo_vacate_request`→
+  `_sslo_offload_request`, `_sslo_vacated_req_ids`→`_sslo_offloaded_this_step`,
+  `_sslo_promoting`→`_sslo_onloading`, 로컬 `pending_promote`→`pending_onload`.
+  per-step 스키마 `num_vacated`→`num_offloads`, `num_promoted`→`num_onloads`;
+  decision log `kind` "vacate"→"offload", "promote"→"onload".
+  잔여 vacate/promote 주석·docstring 전부 offload/onload 계열로.
+  유지: `num_offloaded`(CPU 상주 인구), `kv_offload_*` config, `M_cpu`/
+  `R_defer_cpu`/`n_defer_cpu`, `on_offload_enter/exit`, `LOC_*`, request-level
+  `num_onloads`/`num_offload_intervals`/`total_offloaded_time_s`, upstream
+  `_try_promote_blocked_waiting_request`.
+- 추가: `vllm/vllm/sslo/README.md` §2에 "Request states & transitions" —
+  5상태/5전이 표 + 카운터 ops(`num_offloads`/`num_onloads`) vs population
+  (`num_offloaded`) 구분을 단일 출처로 명시.
+- 문서: `vllm/vllm/sslo/README.md`, `exp/run_sslo/README.md`,
+  `exp/run_sslo/SWEEP_PLAN_v2.md`, `paper/algorithm3_kv_offload.md`
+  (\textsc{VacatePromote}→\textsc{OffloadOnload}),
+  `kv_offload_model_compat.md`, `exp/run_sslo/run_test.{py,sh}` 갱신.
+  `WORKLOG.md`/`HANDOFF.md` 과거 엔트리는 사실 기록이라 미수정.
+- 하위 호환: `exp/run_sslo/analyze.py` 및 `exp/run_sslo/analysis/` 전수 grep
+  결과 `num_vacated`/`num_promoted`/`kind=="vacate"|"promote"` 독자가 0건
+  (분석은 request-level `total_offloaded_time_s`/`num_onloads`/
+  `num_offload_intervals`만 소비 — 이 이름들은 유지됨). 따라서 fallback 코드
+  불필요 → 추가하지 않음.
+- 검증: `python3 -m pytest tests/sslo/ -q` → 181 passed, 1 skipped,
+  1 failed(기존 알려진 tts 1건) — 리네이밍 전과 동일. py_compile / bash -n
+  통과. `grep -rn "vacate" vllm/vllm/ exp/` → 0건.
+  구 산출물 재분석: output_sweep_v2/phaseP/.../cap32/progress_serve_offload/
+  run_1/rate_1 에 analyze.py 재실행 → `summary.json` 기존본과 완전 동일.
