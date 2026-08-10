@@ -10,6 +10,7 @@ decision-log emitter, and a couple of light progress_serve placement checks.
 The ProgressServe algorithm itself is covered by test_progress_serve.py.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +20,11 @@ from vllm.sslo.config import SsloConfig
 from vllm.sslo.slo_state import Phase, RequestSLOState
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
-from vllm.v1.core.sched.scheduler import Scheduler, SsloStepState
+from vllm.v1.core.sched.scheduler import (
+    _SSLO_PREFILL_FLOOR_STARVE_STEPS,
+    Scheduler,
+    SsloStepState,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 
@@ -131,6 +136,10 @@ def make_scheduler(
     scheduler._sslo_decode_profile_keys = []
     scheduler._sslo_prev_step_decoding_only = False
     scheduler._sslo_prev_step_start_ts = None
+    # SSLO: deadline-aware prefill budget state normally seeded by __init__.
+    scheduler._sslo_prev_step_prefill_tokens = 0
+    scheduler._sslo_prefill_kappa = None
+    scheduler._sslo_prefill_floor_streak = 0
     scheduler._sslo_step = SsloStepState(
         cur_max_num_requests=max_num_running_reqs)
     scheduler._sslo_done_logged = set()
@@ -145,9 +154,9 @@ def make_scheduler(
     scheduler._sslo_decision_log_dir_created = False
     # SSLO: KV-offload tier state normally seeded by Scheduler.__init__.
     scheduler._sslo_offloaded = {}
-    scheduler._sslo_promoting = {}
+    scheduler._sslo_onloading = {}
     scheduler._sslo_last_onload_step = {}
-    scheduler._sslo_vacated_req_ids = set()
+    scheduler._sslo_offloaded_this_step = set()
     scheduler._sslo_offload_conn = None
     scheduler.max_num_running_reqs = max_num_running_reqs
     scheduler.max_num_scheduled_tokens = 0
@@ -437,6 +446,28 @@ def test_decision_log_buffer_flushes_on_overflow(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Per-step stats dump
+# ---------------------------------------------------------------------------
+
+def test_step_stats_handling_users_counts_offloaded(monkeypatch, tmp_path):
+    stats_path = tmp_path / "scheduler_stats.jsonl"
+    monkeypatch.setenv("SSLO_STATS_LOG_PATH", str(stats_path))
+    r = make_request("r0", make_state())
+    p = make_request("p0", make_state())
+    o = make_request("o0", make_state())
+    scheduler = make_scheduler(running=[r], pending=[p])
+    scheduler.kv_cache_manager.block_pool.num_gpu_blocks = 1_000_000
+    scheduler._sslo_offloaded = {"o0": o}
+
+    scheduler._sslo_dump_step_stats(0.0)
+
+    row = json.loads(stats_path.read_text().splitlines()[0])
+    # Primary metric counts the CPU-resident request; `_online` does not.
+    assert row["num_handling_users"] == 3
+    assert row["num_handling_users_online"] == 2
+
+
+# ---------------------------------------------------------------------------
 # KV-offload tier (stage 2 engine integration)
 # ---------------------------------------------------------------------------
 
@@ -446,6 +477,9 @@ class FakeWaitingQueue(list):
 
     def prepend_request(self, request):
         self.insert(0, request)
+
+    def prepend_requests(self, requests):
+        self[:0] = list(requests)
 
     def remove_requests(self, requests):
         rm = {r.request_id for r in requests}
@@ -510,11 +544,11 @@ def test_kv_offload_disabled_leaves_offload_state_empty():
 
     assert scheduler._sslo_offload_conn is None
     assert scheduler._sslo_offloaded == {}
-    assert scheduler._sslo_promoting == {}
-    assert scheduler._sslo_vacated_req_ids == set()
+    assert scheduler._sslo_onloading == {}
+    assert scheduler._sslo_offloaded_this_step == set()
 
 
-def test_vacate_only_fully_mirrored_when_kv_capped():
+def test_offload_only_fully_mirrored_when_kv_capped():
     cfg = SsloConfig(method="progress_serve", kv_offload=True)
     p0 = make_offload_request(
         "p0", make_state(deadline=1000.0), status=RequestStatus.RUNNING)
@@ -522,7 +556,7 @@ def test_vacate_only_fully_mirrored_when_kv_capped():
         "p1", make_state(deadline=1000.0), status=RequestStatus.RUNNING)
     p2 = make_offload_request(
         "p2", make_state(deadline=1000.0), status=RequestStatus.RUNNING)
-    # Slack-deep tail (M_cpu ~ 0 <= eps) → all vacate-eligible.
+    # Slack-deep tail (M_cpu ~ 0 <= eps) → all offload-eligible.
     for r in (p0, p1, p2):
         r.slo_state.length_tail_prob = lambda x: 0.0
     scheduler = make_scheduler(
@@ -545,17 +579,17 @@ def test_vacate_only_fully_mirrored_when_kv_capped():
     assert "p1" not in scheduler._sslo_offloaded
     assert "p2" not in scheduler._sslo_offloaded
     assert new_pending == [p1, p2]
-    assert scheduler._sslo_vacated_req_ids == {"p0"}
+    assert scheduler._sslo_offloaded_this_step == {"p0"}
     assert p0.status == RequestStatus.PREEMPTED
     assert p0.num_computed_tokens == 0
     assert conn.pinned == {"p0"}
-    assert scheduler._sslo_step.num_vacated == 1
+    assert scheduler._sslo_step.num_offloads == 1
     assert p0.slo_state.num_offload_intervals == 1
-    # Minor: the vacate step itself is charged exactly one offloaded iter.
+    # Minor: the offload step itself is charged exactly one offloaded iter.
     assert p0.slo_state.chunk_stats._current_offloaded_iters == 1
 
 
-def test_vacate_skipped_when_not_kv_capped():
+def test_offload_skipped_when_not_kv_capped():
     cfg = SsloConfig(method="progress_serve", kv_offload=True)
     p0 = make_offload_request(
         "p0", make_state(deadline=1000.0), status=RequestStatus.RUNNING)
@@ -571,7 +605,7 @@ def test_vacate_skipped_when_not_kv_capped():
 
     assert scheduler._sslo_offloaded == {}
     assert new_pending == [p0]
-    assert scheduler._sslo_step.num_vacated == 0
+    assert scheduler._sslo_step.num_offloads == 0
 
 
 def test_offloaded_request_accounts_step_and_makes_cpu_view():
@@ -592,11 +626,11 @@ def test_offloaded_request_accounts_step_and_makes_cpu_view():
     assert view.is_measurable()
 
 
-def test_promote_forced_insert_off_budget_and_reserves_slot():
+def test_onload_forced_insert_off_budget_and_reserves_slot():
     cfg = SsloConfig(method="progress_serve", kv_offload=True)
     o0 = make_offload_request(
         "o0", make_state(deadline=5.0), status=RequestStatus.PREEMPTED)
-    # r_defer_cpu >= 1 forces promotion regardless of eps.
+    # r_defer_cpu >= 1 forces onload regardless of eps.
     o0.slo_state.length_tail_prob = lambda x: 1.0
     scheduler = make_scheduler(max_num_running_reqs=2, cfg=cfg)
     scheduler.waiting = FakeWaitingQueue()
@@ -609,13 +643,13 @@ def test_promote_forced_insert_off_budget_and_reserves_slot():
                      kv_capped=False),
         b=2, delta=1.0, admitted=[], new_pending=[])
 
-    assert "o0" in scheduler._sslo_promoting
+    assert "o0" in scheduler._sslo_onloading
     assert "o0" not in scheduler._sslo_offloaded
     assert list(scheduler.waiting)[0] is o0
-    assert scheduler._sslo_step.num_promoted == 1
-    # Promote must not consume the k* admission budget.
+    assert scheduler._sslo_step.num_onloads == 1
+    # Onload must not consume the k* admission budget.
     assert scheduler._sslo_step.waiting_admission_budget == 1
-    # A promoting req reserves a decode slot via its LOC_ONLOADING view.
+    # An onloading req reserves a decode slot via its LOC_ONLOADING view.
     view = scheduler._sslo_offload_view(o0, ps.LOC_ONLOADING, 0.0)
     assert view.location == ps.LOC_ONLOADING
 
@@ -627,19 +661,19 @@ def test_onload_completion_fires_offload_exit_and_records_residency():
     scheduler = make_scheduler(running=[req], max_num_running_reqs=2, cfg=cfg)
     conn = FakeOffloadConnector()
     scheduler._sslo_offload_conn = conn
-    scheduler._sslo_promoting = {"o0": req}
+    scheduler._sslo_onloading = {"o0": req}
     scheduler._sslo_step_idx = 7
     req.slo_state.on_offload_enter(1.0)  # open an offload interval to close
 
     scheduler._sslo_offload_prologue(now=3.0)
 
-    assert "o0" not in scheduler._sslo_promoting
+    assert "o0" not in scheduler._sslo_onloading
     assert scheduler._sslo_last_onload_step["o0"] == 7
     assert conn.unpinned == ["o0"]
     assert req.slo_state.num_onloads == 1
 
 
-def test_residency_guard_blocks_revacate():
+def test_residency_guard_blocks_reoffload():
     cfg = SsloConfig(
         method="progress_serve", kv_offload=True,
         kv_offload_min_residency_steps=5)
@@ -684,11 +718,12 @@ def test_finish_cleanup_unpins():
 # ---------------------------------------------------------------------------
 
 
-def _waiting_request(request_id):
+def _waiting_request(request_id, num_tokens=1):
     req = SimpleNamespace(
         request_id=request_id, slo_state=None, has_encoder_inputs=False,
-        status=RequestStatus.WAITING, num_computed_tokens=0, num_tokens=1,
-        num_prompt_tokens=1, num_output_placeholders=0, prefill_stats=None,
+        status=RequestStatus.WAITING, num_computed_tokens=0,
+        num_tokens=num_tokens, num_prompt_tokens=num_tokens,
+        num_output_placeholders=0, prefill_stats=None,
         spec_token_ids=[], lora_request=None)
     return req
 
@@ -703,6 +738,7 @@ def _prep_schedule_sslo(scheduler, *, budget, cur_max, monkeypatch):
     scheduler.is_encoder_decoder = False
     scheduler.scheduler_reserve_full_isl = False
     scheduler.need_mamba_block_aligned_split = False
+    scheduler.max_model_len = 4096
     scheduler.num_lookahead_tokens = 0
     scheduler.use_eagle = False
     scheduler.needs_kv_cache_zeroing = False
@@ -736,31 +772,31 @@ def test_schedule_sslo_disabled_admits_up_to_budget(monkeypatch):
     assert request_ids(scheduler.waiting) == ["n2"]
 
 
-def test_schedule_sslo_promoted_traverses_off_budget(monkeypatch):
-    # kv_offload enabled: a promoted onload req (in _sslo_promoting, front of
+def test_schedule_sslo_onload_traverses_off_budget(monkeypatch):
+    # kv_offload enabled: an onloading req (in _sslo_onloading, front of
     # waiting) is admitted WITHOUT spending the k* budget, so with budget=1 both
-    # the promoted req and one normal req are admitted.
+    # the onloading req and one normal req are admitted.
     cfg = SsloConfig(method="progress_serve", kv_offload=True)
     scheduler = make_scheduler(running=[], max_num_running_reqs=8, cfg=cfg)
-    promoted = _waiting_request("promoted")
-    promoted.status = RequestStatus.PREEMPTED
+    onloading = _waiting_request("onloading")
+    onloading.status = RequestStatus.PREEMPTED
     normals = [_waiting_request(f"n{i}") for i in range(2)]
-    scheduler.waiting = FakeWaitingQueue([promoted, *normals])
+    scheduler.waiting = FakeWaitingQueue([onloading, *normals])
     scheduler._sslo_offload_conn = FakeOffloadConnector()
-    scheduler._sslo_promoting = {"promoted": promoted}
+    scheduler._sslo_onloading = {"onloading": onloading}
     _prep_schedule_sslo(scheduler, budget=1, cur_max=8, monkeypatch=monkeypatch)
 
     scheduler.schedule_sslo()
 
     admitted = request_ids(scheduler.running)
-    assert "promoted" in admitted  # off-budget onload traversal
+    assert "onloading" in admitted  # off-budget onload traversal
     assert "n0" in admitted        # one normal admit under budget=1
     assert "n1" not in admitted    # budget spent → not admitted
     assert len(admitted) == 2
 
 
-def test_promoting_req_excluded_from_waiting_views(monkeypatch):
-    # Bug 1: a promoted onload req still queued in self.waiting must NOT be
+def test_onloading_req_excluded_from_waiting_views(monkeypatch):
+    # Bug 1: an onloading req still queued in self.waiting must NOT be
     # counted as a new admit (waiting_views) — its LOC_ONLOADING view is the
     # sole representative. Otherwise it would occupy two slots / +2 in |A+|.
     cfg = SsloConfig(method="progress_serve", kv_offload=True)
@@ -770,17 +806,19 @@ def test_promoting_req_excluded_from_waiting_views(monkeypatch):
     scheduler = make_scheduler(running=[], max_num_running_reqs=4, cfg=cfg)
     scheduler.waiting = FakeWaitingQueue([onloading, normal])
     scheduler._sslo_offload_conn = FakeOffloadConnector()
-    scheduler._sslo_promoting = {"o0": onloading}
+    scheduler._sslo_onloading = {"o0": onloading}
 
     captured = {}
     real_schedule_step = ps.schedule_step
 
-    def spy(views_A, waiting_views, b, delta, kv_feasible, lead=0):
+    def spy(views_A, waiting_views, b, delta, kv_feasible, lead=0,
+            share_includes_parked=True, admission_delta_criterion=False):
         captured["waiting_ids"] = [v.request_id for v in waiting_views]
         captured["onloading_locs"] = [
             v.location for v in views_A if v.request_id == "o0"]
         return real_schedule_step(
-            views_A, waiting_views, b, delta, kv_feasible, lead)
+            views_A, waiting_views, b, delta, kv_feasible, lead,
+            share_includes_parked, admission_delta_criterion)
 
     monkeypatch.setattr(ps, "schedule_step", spy)
 
@@ -790,3 +828,306 @@ def test_promoting_req_excluded_from_waiting_views(monkeypatch):
     assert "w0" in captured["waiting_ids"]      # normal waiting req still counted
     # The onload req appears exactly once, as its LOC_ONLOADING view.
     assert captured["onloading_locs"] == [ps.LOC_ONLOADING]
+
+
+# ---------------------------------------------------------------------------
+# Deadline-aware prefill token budget
+# ---------------------------------------------------------------------------
+
+
+def _decoding_request(request_id):
+    """A running request past its prompt — one decode token per step."""
+    return SimpleNamespace(
+        request_id=request_id, slo_state=None, has_encoder_inputs=False,
+        status=RequestStatus.RUNNING, num_computed_tokens=10,
+        num_prompt_tokens=10, num_tokens=11, num_tokens_with_spec=11,
+        num_output_placeholders=0, max_tokens=100, prefill_stats=None,
+        spec_token_ids=[], lora_request=None, num_preemptions=0)
+
+
+def _carryover_request(request_id, *, computed, prompt):
+    """A RUNNING request still short of its prompt — chunked-prefill carry-over.
+
+    This is the population the running loop schedules and where the measured
+    prefill spike lives.
+    """
+    return SimpleNamespace(
+        request_id=request_id, slo_state=None, has_encoder_inputs=False,
+        status=RequestStatus.RUNNING, num_computed_tokens=computed,
+        num_prompt_tokens=prompt, num_tokens=prompt,
+        num_tokens_with_spec=prompt, num_output_placeholders=0,
+        max_tokens=100, prefill_stats=None, spec_token_ids=[],
+        lora_request=None, num_preemptions=0)
+
+
+def _prep_prefill_budget(scheduler, *, kappa=0.001, delta_decode=0.08):
+    """Arm the prefill-budget control: κ estimate + decode-only Δ cell."""
+    scheduler.max_num_scheduled_tokens = 8192
+    scheduler.scheduler_config = SimpleNamespace(
+        async_scheduling=False, long_prefill_token_threshold=0,
+        enable_chunked_prefill=True)
+    scheduler._sslo_prefill_kappa = kappa
+    scheduler._sslo_step_wall_ema = {len(scheduler.running): {0: delta_decode}}
+
+
+def test_prefill_budget_off_by_default(monkeypatch):
+    # Control off → no budget, and a waiting request's full prompt is
+    # scheduled exactly as before (regression guard).
+    scheduler = make_scheduler(running=[], max_num_running_reqs=8)
+    _prep_prefill_budget(scheduler)
+    assert scheduler._sslo_prefill_token_budget(0.0) is None
+
+    scheduler.waiting = FakeWaitingQueue([_waiting_request("n0", 40)])
+    _prep_schedule_sslo(scheduler, budget=4, cur_max=8, monkeypatch=monkeypatch)
+    output = scheduler.schedule_sslo()
+
+    assert output.num_scheduled_tokens["n0"] == 40
+    assert scheduler._sslo_step.prefill_budget is None
+
+
+def test_prefill_budget_requires_kappa_and_decode_reference():
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
+    r = make_request("r0", make_state(deadline=10.0))
+    scheduler = make_scheduler(running=[r], cfg=cfg)
+    _prep_prefill_budget(scheduler)
+
+    # No κ sample yet → control stays off.
+    scheduler._sslo_prefill_kappa = None
+    assert scheduler._sslo_prefill_token_budget(0.0) is None
+    # No decode-only wall-EMA cell → control stays off.
+    scheduler._sslo_prefill_kappa = 0.001
+    scheduler._sslo_step_wall_ema = {1: {2: 0.4}}
+    assert scheduler._sslo_prefill_token_budget(0.0) is None
+
+
+def test_prefill_budget_tracks_urgency():
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True,
+                     prefill_budget_floor=512, prefill_budget_gamma=0.5)
+    # Deadline far away → the control does not bind (full base budget).
+    relaxed = make_request("relaxed", make_state(deadline=1e6))
+    scheduler = make_scheduler(running=[relaxed], cfg=cfg)
+    _prep_prefill_budget(scheduler)
+    assert scheduler._sslo_prefill_token_budget(0.0) == 8192
+
+    # Deadline already passed → floor.
+    urgent = make_request("urgent", make_state(deadline=-1.0))
+    scheduler = make_scheduler(running=[urgent], cfg=cfg)
+    _prep_prefill_budget(scheduler)
+    assert scheduler._sslo_prefill_token_budget(0.0) == 512
+
+    # t_min = 2 s → (0.5*2 - 0.08)/0.001 = 920 tokens.
+    mid = make_request("mid", make_state(deadline=2.0))
+    scheduler = make_scheduler(running=[mid], cfg=cfg)
+    _prep_prefill_budget(scheduler)
+    assert scheduler._sslo_prefill_token_budget(0.0) == 920
+
+
+def test_prefill_budget_starvation_guard_releases_base_budget():
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
+    urgent = make_request("urgent", make_state(deadline=-1.0))
+    scheduler = make_scheduler(running=[urgent], cfg=cfg)
+    _prep_prefill_budget(scheduler)
+    # No prefill progress at all while pinned to the floor.
+    scheduler._sslo_prev_step_prefill_tokens = 0
+
+    floor = cfg.prefill_budget_floor
+    for _ in range(_SSLO_PREFILL_FLOOR_STARVE_STEPS - 1):
+        assert scheduler._sslo_prefill_token_budget(0.0) == floor
+    # Streak exhausted → one step at the full base budget, streak reset.
+    assert scheduler._sslo_prefill_token_budget(0.0) == 8192
+    assert scheduler._sslo_prefill_floor_streak == 0
+    # Prefill did make progress → streak never accumulates.
+    scheduler._sslo_prev_step_prefill_tokens = 100
+    for _ in range(_SSLO_PREFILL_FLOOR_STARVE_STEPS + 5):
+        assert scheduler._sslo_prefill_token_budget(0.0) == floor
+
+
+def test_prefill_budget_caps_waiting_loop_prefill_tokens(monkeypatch):
+    # P* = 30: n0 takes its full 20-token prompt, n1 is chunked to the
+    # remaining 10, n2 is left for the next step.
+    scheduler = make_scheduler(running=[], max_num_running_reqs=8)
+    scheduler.waiting = FakeWaitingQueue(
+        [_waiting_request(f"n{i}", 20) for i in range(3)])
+    _prep_schedule_sslo(scheduler, budget=3, cur_max=8, monkeypatch=monkeypatch)
+    scheduler._sslo_prefill_token_budget = lambda now: 30
+
+    output = scheduler.schedule_sslo()
+
+    assert output.num_scheduled_tokens == {"n0": 20, "n1": 10}
+    assert sum(output.num_scheduled_tokens.values()) == 30
+    assert request_ids(scheduler.waiting) == ["n2"]
+    assert scheduler._sslo_step.prefill_budget == 30
+
+
+def test_prefill_budget_does_not_cap_decode(monkeypatch):
+    # An exhausted prefill budget must not touch the running set's decode
+    # tokens — only the waiting-queue prefill is bounded.
+    decoding = _decoding_request("d0")
+    scheduler = make_scheduler(running=[decoding], max_num_running_reqs=8)
+    scheduler.waiting = FakeWaitingQueue([_waiting_request("n0", 20)])
+    _prep_schedule_sslo(scheduler, budget=3, cur_max=8, monkeypatch=monkeypatch)
+    scheduler._sslo_prefill_token_budget = lambda now: 0
+
+    output = scheduler.schedule_sslo()
+
+    assert output.num_scheduled_tokens == {"d0": 1}  # decode untouched
+    assert request_ids(scheduler.waiting) == ["n0"]  # prefill fully blocked
+
+
+def test_step_stats_records_prefill_budget(monkeypatch, tmp_path):
+    stats_path = tmp_path / "scheduler_stats.jsonl"
+    monkeypatch.setenv("SSLO_STATS_LOG_PATH", str(stats_path))
+    scheduler = make_scheduler(running=[])
+    scheduler.kv_cache_manager.block_pool.num_gpu_blocks = 1_000_000
+    scheduler._sslo_step.prefill_budget = 920
+    scheduler._sslo_prefill_kappa = 0.001
+
+    scheduler._sslo_dump_step_stats(0.0)
+
+    row = json.loads(stats_path.read_text().splitlines()[0])
+    assert row["prefill_budget"] == 920
+    assert row["prefill_kappa_ms_per_tok"] == 1.0
+
+
+def test_kappa_ema_updates_from_prefill_step():
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True,
+                     tpot_ema_alpha=1.0)
+    scheduler = make_scheduler(running=[], cfg=cfg)
+    # Previous step: batch 4, 2 prefill reqs carrying 100 prefill tokens,
+    # decode-only reference 0.08 s, observed wall 0.18 s.
+    scheduler._sslo_step_wall_ema = {4: {0: 0.08}}
+    scheduler._sslo_prev_step_batch = 4
+    scheduler._sslo_prev_step_num_prefills = 2
+    scheduler._sslo_prev_step_prefill_tokens = 100
+    scheduler._sslo_prev_step_start_ts = 0.0
+
+    scheduler._update_tpot_ema(0.18)
+
+    # κ = (0.18 - 0.08) / 100 = 1 ms/token (alpha=1 → the sample itself).
+    assert scheduler._sslo_prefill_kappa == pytest.approx(0.001)
+
+
+def test_kappa_ema_skips_decode_only_steps_and_clamps_negative():
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True,
+                     tpot_ema_alpha=1.0)
+    scheduler = make_scheduler(running=[], cfg=cfg)
+    scheduler._sslo_step_wall_ema = {4: {0: 0.08}}
+    scheduler._sslo_prev_step_batch = 4
+    scheduler._sslo_prev_step_start_ts = 0.0
+
+    # No prefill tokens → no κ sample.
+    scheduler._sslo_prev_step_prefill_tokens = 0
+    scheduler._update_tpot_ema(0.09)
+    assert scheduler._sslo_prefill_kappa is None
+
+    # Faster than the decode-only reference → κ sample clamps to 0.
+    scheduler._sslo_prev_step_num_prefills = 1
+    scheduler._sslo_prev_step_prefill_tokens = 50
+    scheduler._update_tpot_ema(0.05)
+    assert scheduler._sslo_prefill_kappa == 0.0
+
+
+def test_prefill_budget_does_not_block_onload(monkeypatch):
+    # Composition with the offload tier: an exhausted prefill budget must not
+    # starve a deadline-forced onload; only normal admits are held back.
+    cfg = SsloConfig(method="progress_serve", kv_offload=True)
+    scheduler = make_scheduler(running=[], max_num_running_reqs=8, cfg=cfg)
+    onloading = _waiting_request("onloading", 20)
+    onloading.status = RequestStatus.PREEMPTED
+    scheduler.waiting = FakeWaitingQueue([_waiting_request("n0", 20), onloading])
+    scheduler.skipped_waiting = FakeWaitingQueue()
+    scheduler._sslo_offload_conn = FakeOffloadConnector()
+    scheduler._sslo_onloading = {"onloading": onloading}
+    _prep_schedule_sslo(scheduler, budget=2, cur_max=8, monkeypatch=monkeypatch)
+    scheduler._sslo_prefill_token_budget = lambda now: 0
+
+    output = scheduler.schedule_sslo()
+
+    # Onload admitted at its full (unclamped) prefill size; n0 held back.
+    assert output.num_scheduled_tokens == {"onloading": 20}
+    assert request_ids(scheduler.skipped_waiting) == ["n0"]
+
+
+def test_prefill_budget_caps_running_loop_carryover(monkeypatch):
+    # (a) A chunked-prefill carry-over is scheduled by the RUNNING loop, not
+    # the waiting loop. Without a clamp there it would take all 1488 remaining
+    # prompt tokens in one step; P* = 300 must bind it.
+    carryover = _carryover_request("c0", computed=512, prompt=2000)
+    scheduler = make_scheduler(running=[carryover], max_num_running_reqs=8)
+    _prep_schedule_sslo(scheduler, budget=0, cur_max=8, monkeypatch=monkeypatch)
+    scheduler._sslo_prefill_token_budget = lambda now: 300
+
+    output = scheduler.schedule_sslo()
+
+    assert output.num_scheduled_tokens == {"c0": 300}
+
+
+def test_prefill_budget_is_shared_by_running_and_waiting_loops(monkeypatch):
+    # (b) One budget for the whole step: the carry-over drains it first, the
+    # new admit gets only what is left, and the total equals P*.
+    carryover = _carryover_request("c0", computed=512, prompt=612)
+    scheduler = make_scheduler(running=[carryover], max_num_running_reqs=8)
+    scheduler.waiting = FakeWaitingQueue([_waiting_request("n0", 800)])
+    _prep_schedule_sslo(scheduler, budget=1, cur_max=8, monkeypatch=monkeypatch)
+    scheduler._sslo_prefill_token_budget = lambda now: 600
+
+    output = scheduler.schedule_sslo()
+
+    # carry-over needs 100 → takes 100; the new admit is clamped to the
+    # remaining 500 instead of its full 800-token prompt.
+    assert output.num_scheduled_tokens == {"c0": 100, "n0": 500}
+    assert sum(output.num_scheduled_tokens.values()) == 600
+
+
+def test_prefill_budget_spares_decode_alongside_carryover(monkeypatch):
+    # (c) A decoding request in the same step keeps its token even though the
+    # budget is fully spent by the carry-over next to it.
+    decoding = _decoding_request("d0")
+    carryover = _carryover_request("c0", computed=512, prompt=2000)
+    scheduler = make_scheduler(
+        running=[decoding, carryover], max_num_running_reqs=8)
+    _prep_schedule_sslo(scheduler, budget=0, cur_max=8, monkeypatch=monkeypatch)
+    scheduler._sslo_prefill_token_budget = lambda now: 50
+
+    output = scheduler.schedule_sslo()
+
+    assert output.num_scheduled_tokens == {"d0": 1, "c0": 50}
+
+
+def test_prefill_budget_carryover_always_progresses(monkeypatch):
+    # (d) Even with the budget fully spent, a carry-over gets at least one
+    # token so it can never stall permanently.
+    first = _carryover_request("c0", computed=0, prompt=2000)
+    second = _carryover_request("c1", computed=0, prompt=2000)
+    scheduler = make_scheduler(
+        running=[first, second], max_num_running_reqs=8)
+    _prep_schedule_sslo(scheduler, budget=0, cur_max=8, monkeypatch=monkeypatch)
+    scheduler._sslo_prefill_token_budget = lambda now: 10
+
+    output = scheduler.schedule_sslo()
+
+    # c0 exhausts the budget; c1 still advances by the guaranteed minimum.
+    assert output.num_scheduled_tokens == {"c0": 10, "c1": 1}
+
+
+def test_kappa_regressor_counts_resumed_admits():
+    # A request resumed from preemption is admitted by this step's waiting
+    # loop, so it is absent from the pre-step snapshot. Its recompute tokens
+    # are charged to the prefill budget, so κ's denominator must count them
+    # too — otherwise κ is over-estimated and P* silently shrinks.
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
+    resumed = _carryover_request("r0", computed=0, prompt=300)
+    scheduler = make_scheduler(running=[resumed], cfg=cfg)
+    # Pre-step snapshot does NOT contain r0 (it was preempted before).
+    scheduler._sslo_pre_step_computed = {}
+
+    output = SimpleNamespace(
+        num_scheduled_tokens={"r0": 300},
+        scheduled_new_reqs=[],
+        total_num_scheduled_tokens=300,
+    )
+    scheduler._record_step_for_next_ema(output, 1.0)
+
+    assert scheduler._sslo_prev_step_prefill_tokens == 300
+    # prefill_count keys the pre-existing wall-EMA cell; left as it was.
+    assert scheduler._sslo_prev_step_num_prefills == 0

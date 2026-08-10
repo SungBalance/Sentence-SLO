@@ -53,6 +53,30 @@ The `method` knob selects whether SSLO is **observed only** (`"baseline"` —
 fair comparison, but placement is vanilla vLLM) or **enforced**
 (`"progress_serve"`).
 
+### Request states & transitions
+
+The single source of truth for SSLO vocabulary. States are nouns, transitions
+are verbs; every identifier, log field and doc sentence uses these words.
+
+| State | Meaning | Where it lives |
+|---|---|---|
+| `waiting` | Not yet admitted | `scheduler.waiting` |
+| `running` | Holds a decode slot this step | `scheduler.running` |
+| `pending` | Deferred by ProgressServe, KV still on GPU | `scheduler.sslo_pending` |
+| `offloaded` | Deferred, KV parked on CPU, holds no decode slot | `_sslo_offloaded` (`LOC_CPU`) |
+| `onloading` | Mid CPU→GPU restore, slot reserved | `_sslo_onloading` (`LOC_ONLOADING`) |
+
+| Transition | From → To | Implemented by |
+|---|---|---|
+| **admit** | `waiting` → `running` \| `pending` | waiting-admission loop, budget `k*` |
+| **defer** | `running` → `pending` | `schedule_step` / `build_plan` |
+| **promote** | `pending` → `running` | `schedule_step` / `build_plan` |
+| **offload** | `pending` → `offloaded` | `select_offload` + `_sslo_offload_request` |
+| **onload** | `offloaded` → `onloading` → `running` | `select_onload` + `WAITING_FOR_REMOTE_KVS` |
+
+Counters follow the same split: `num_offloads` / `num_onloads` count **ops**
+this step, `num_offloaded` is the current CPU-resident **population**.
+
 ---
 
 ## 3. Control Flow
@@ -123,6 +147,16 @@ M       = R_defer − R_run   (forced to 1 if R_defer ≥ 1, to avoid abandonmen
 - **`schedule_step(...)`** — scans the FCFS waiting prefix upward for
   `k* = max{k : E_viol(k) < 1}` (E_viol is monotone in k), hard-capped by a
   `kv_feasible(k)` callback (free-KV-block based).
+  With `admission_delta_criterion` the test is the **marginal** one,
+  `E_viol(k) − E_viol(0) < 1`: the risk the in-flight set already carries is
+  sunk, so the budget covers only the violations the new admits add. This
+  unlocks the self-lock case where a few at-risk in-flight requests push
+  `E_viol(0) ≥ 1` and pin `k*` to 0 while KV / compute sit idle; under low load
+  (`E_viol(0) ≈ 0`) the two rules coincide. The reported `e_viol` stays
+  absolute.
+  *Rejected* (ablation A3, WORKLOG 2026-08-07): the absolute test is also the
+  only brake on total system risk — dropping it let per-step `e_viol` run to
+  16-41 and worsened violation rates across rates, so the flag stays `False`.
 - **`pick_adaptive_batch(...)`** — only when `E_viol(base_b) ≥ 1`: hill-climbs
   down through CUDA-graph-captured batch sizes (smaller b → smaller Δ → larger
   H_q for the urgent few, at the cost of deferring the slack-rich rest), stops
@@ -221,7 +255,38 @@ Defaults shown; validation in `__post_init__`.
 |---|---|---|
 | `method` | `"baseline"` | `"baseline"` = metrics only · `"progress_serve"` = enforce |
 | `adaptive_batching` | `False` | Allow decode-batch shrink when `E_viol ≥ 1` |
+| `admission_delta_criterion` | `False` | Admit on the marginal `E_viol(k) − E_viol(0) < 1` instead of the absolute `E_viol(k) < 1`. **Rejected** experiment option — see WORKLOG 2026-08-07 |
 | `kv_blocks_per_new_admit` | 8 | Admission cap = `free_kv_blocks // N`; 0 disables |
+
+### Deadline-aware prefill token budget
+
+Caps the **total** prefill tokens of one scheduler step at
+`P* = clamp((γ·t_min − Δ_decode)/κ, floor, max_num_batched_tokens)`
+(`progress_serve.prefill_budget`). Motivated by the measurement that
+prefill-carrying steps are 6% of steps but 18.4% of wall clock (Δ p90 463 ms vs
+78 ms decode-only).
+
+Both prefill paths drain one shared per-step counter, in this order:
+
+1. **Running loop** — chunked-prefill carry-over (`num_computed_tokens <
+   num_prompt_tokens`). In-flight prefills outrank new admits, and each is
+   guaranteed at least one token so it can never stall.
+2. **Waiting loop** — new admits. Once the counter is spent they are skipped
+   and retried next step. A KV-onload is exempt from the clamp (it is
+   deadline-forced) but still charged.
+
+Decode tokens are never clamped and never charged. Concurrency and the service
+share `s` are untouched, so this does not interact with adaptive batching or
+the offload tier. κ is estimated online from
+`(Δ_observed − Δ_decode)/prefill_tokens` over the same token population the cap
+binds; the remainder of a capped prefill carries to the next step via chunked
+prefill (the control self-disables when chunked prefill is off).
+
+| Field | Default | Meaning |
+|---|---|---|
+| `prefill_budget_control` | `False` | Enable the per-step prefill token cap |
+| `prefill_budget_floor` | 512 | Lower clamp on `P*` (tokens); must be > 0 so prefill always progresses |
+| `prefill_budget_gamma` | 0.5 | Safety factor γ on `t_min`, in `(0, 1]` |
 
 ### KV offload tier (see §9)
 
@@ -229,10 +294,11 @@ Only valid under `method == "progress_serve"`.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `kv_offload` | `False` | Enable the KV offload tier (vacate deep-slack deferred KV to CPU, prefetch before deadline). Requires the `SimpleCPUOffloadConnector` |
+| `kv_offload` | `False` | Enable the KV offload tier (offload deep-slack deferred KV to CPU, onload before deadline). Requires the `SimpleCPUOffloadConnector` |
 | `kv_onload_lead_iters` | 2 | Restore a CPU-resident request this many decode iters before its horizon: `N_defer_cpu = floor(max(H_q − 1 − lead, 0) · s)` |
-| `kv_offload_risk_eps` | 1e-3 | Risk-penalty threshold separating vacate (`M_cpu ≤ eps`) from promote (`M_cpu > eps`) candidates |
-| `kv_offload_min_residency_steps` | 0 | Anti-thrash: min scheduler steps a request stays resident after onload before it may re-vacate; 0 disables |
+| `kv_offload_risk_eps` | 1e-3 | Risk-penalty threshold separating offload (`M_cpu ≤ eps`) from onload (`M_cpu > eps`) candidates |
+| `kv_offload_share_includes_parked` | `True` | Count CPU-parked requests in the service-share denominator `\|A+\|`. Adopted default; `False` reproduces the pre-A1 semantics |
+| `kv_offload_min_residency_steps` | 0 | Anti-thrash: min scheduler steps a request stays resident after onload before it may be re-offloaded; 0 disables |
 
 ### Chunking & consumption
 
@@ -293,18 +359,18 @@ aggregated by `exp/run_sslo/analyze.py`.
 **Motivation.** In the KV-capped regime the admission cap
 (`free_kv_blocks // kv_blocks_per_new_admit`) — not the decode-batch width — is
 what throttles admission. Deep-slack **deferred** requests still occupy GPU KV
-blocks they will not consume for many iterations. Vacating that KV to CPU frees
-admission headroom so newly-arriving urgent requests can be admitted sooner,
-then prefetching it back before the deferred request's deadline keeps its own
-SLO intact.
+blocks they will not consume for many iterations. Offloading that KV to CPU
+frees admission headroom so newly-arriving urgent requests can be admitted
+sooner, then onloading it back before the deferred request's deadline keeps its
+own SLO intact.
 
 **Three-state math (`progress_serve.py`).** Each measurable deferred request is
 in one of three KV locations:
 
 - `LOC_GPU` — resident, contributes `R_defer` to `E_viol`.
-- `LOC_CPU` — vacated, holds no decode slot; contributes `R_defer_cpu` to
-  `E_viol` but is out of the service race (`|A+|` excludes it).
-- `LOC_ONLOADING` — promoted CPU→GPU, slot reserved for the restore. Behaves
+- `LOC_CPU` — offloaded, holds no decode slot; contributes `R_defer_cpu` to
+  `E_viol` and (by default) still counts in `|A+|`.
+- `LOC_ONLOADING` — onloading CPU→GPU, slot reserved for the restore. Behaves
   like a forced/new admit: it occupies a slot in `|A+|` and is excluded from
   `E_viol`.
 
@@ -316,18 +382,30 @@ Because `N_defer_cpu ≤ N_defer` and the length tail is non-increasing,
 `M_cpu = R_defer_cpu − R_defer ≥ 0`. The admission budget becomes
 `E_viol = Σ_{deferred GPU} R_defer + Σ_{CPU measurable} R_defer_cpu`.
 `kv_offload_risk_eps` splits candidates: `M_cpu ≤ eps` → the CPU stay is cheap
-→ **vacate** candidate; once the lead penalty surfaces (`M_cpu > eps`) →
-**promote** candidate.
+→ **offload** candidate; once the lead penalty surfaces (`M_cpu > eps`) →
+**onload** candidate.
+
+**Parked requests in `|A+|`** (`kv_offload_share_includes_parked`, default
+`True`) — the adopted accounting of the offload tier. Offloading frees memory,
+not compute: a parked request comes back and reclaims its service share, so it
+stays in the `|A+|` denominator. The earlier semantics excluded it, which
+inflated `s`, underestimated `M_cpu` (→ over-offload) and distorted the adaptive
+batch choice. Measured (ablation A1, WORKLOG 2026-08-07): the low-cap
+over-offload disappears — `max_num_seqs=32` drops from 8 offloads to 1 with
++9-26% throughput and lower
+violation rate, higher caps unchanged. The flag affects the `s` term only —
+parked requests still hold no decode slot and still enter `E_viol` as
+`R_defer_cpu`. Set `False` only to reproduce the pre-A1 behaviour.
 
 **Mechanism.** The scheduler mirrors KV eagerly through
 `SimpleCPUOffloadConnector` (a CPU copy of every block always exists), so a
-**vacate** is ~free — it just frees the GPU blocks. A **promote** reuses vLLM's
-asynchronous `WAITING_FOR_REMOTE_KVS` onload path (the same one used for remote
+**offload** is ~free — it just frees the GPU blocks. An **onload** reuses vLLM's
+asynchronous `WAITING_FOR_REMOTE_KVS` path (the same one used for remote
 KV transfer), so the CPU→GPU restore is hidden behind ongoing decode.
 `kv_offload_min_residency_steps` guards against thrash by pinning a just-onloaded
 request resident for a minimum number of steps. Per-step offload counters
-(`num_offloaded`, `kv_capped`, `k_star_unconstrained`) land in
-`scheduler_stats.jsonl`; per-request lifecycle
+(`num_offloads`, `num_onloads`, `num_offloaded`, `kv_capped`,
+`k_star_unconstrained`) land in `scheduler_stats.jsonl`; per-request lifecycle
 (`total_offloaded_time_s` / `num_offload_intervals` / `num_onloads`) rides on
 `SsloRequestStats`.
 

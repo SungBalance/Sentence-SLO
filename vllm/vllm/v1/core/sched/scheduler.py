@@ -91,8 +91,17 @@ class SsloStepState:
     # SSLO: KV-offload tier per-step diagnostics.
     kv_capped: bool = False
     k_star_unconstrained: int = 0
-    num_vacated: int = 0
-    num_promoted: int = 0
+    num_offloads: int = 0
+    num_onloads: int = 0
+    # SSLO: deadline-aware prefill token budget applied this step
+    # (None ⇒ the control is off / not yet armed).
+    prefill_budget: int | None = None
+
+
+# SSLO: starvation release for the deadline-aware prefill budget. After this
+# many consecutive floor-clamped steps that made no prefill progress, one step
+# is allowed the full base prefill budget.
+_SSLO_PREFILL_FLOOR_STARVE_STEPS = 32
 
 
 logger = init_logger(__name__)
@@ -252,6 +261,17 @@ class Scheduler(SchedulerInterface):
         # SSLO: count of prefill-active requests in the previous step, used
         # by _update_tpot_ema to key into _sslo_step_wall_ema.
         self._sslo_prev_step_num_prefills: int = 0
+        # SSLO: prefill tokens scheduled in the previous step — the regressor
+        # for the κ estimate below and the "no prefill progress" signal of the
+        # prefill-budget starvation guard.
+        self._sslo_prev_step_prefill_tokens: int = 0
+        # SSLO: EMA of κ (seconds of extra step time per prefill token),
+        # measured as (Δ_observed - Δ_decode) / prefill_tokens on steps that
+        # carried prefill. None until such a step has been observed.
+        self._sslo_prefill_kappa: float | None = None
+        # SSLO: consecutive floor-clamped prefill-budget steps with zero
+        # prefill progress; released at _SSLO_PREFILL_FLOOR_STARVE_STEPS.
+        self._sslo_prefill_floor_streak: int = 0
         # SSLO
         self._sslo_prev_step_batch: int | None = None
         # SSLO
@@ -285,19 +305,19 @@ class Scheduler(SchedulerInterface):
         # SSLO: KV-offload tier state. All only populated when
         # sslo_config.kv_offload; every access is guarded by that flag so a
         # disabled offload tier is byte-identical to plain ProgressServe.
-        #   _sslo_offloaded : req_id -> Request whose KV is vacated to CPU
+        #   _sslo_offloaded : req_id -> Request whose KV is offloaded to CPU
         #                     (not in running / sslo_pending / waiting).
-        #   _sslo_promoting : req_id -> Request re-queued for CPU->GPU onload
+        #   _sslo_onloading : req_id -> Request re-queued for CPU->GPU onload
         #                     (allocated + WAITING_FOR_REMOTE_KVS, or waiting).
         #   _sslo_last_onload_step : req_id -> step index of last onload
         #                     completion, for the anti-thrash residency guard.
-        #   _sslo_vacated_req_ids : ids vacated this step, folded into the
-        #                     SchedulerOutput.preempted_req_ids so the worker
-        #                     drops them exactly like a preemption.
+        #   _sslo_offloaded_this_step : ids offloaded this step, folded into
+        #                     the SchedulerOutput.preempted_req_ids so the
+        #                     worker drops them exactly like a preemption.
         self._sslo_offloaded: dict[str, Request] = {}
-        self._sslo_promoting: dict[str, Request] = {}
+        self._sslo_onloading: dict[str, Request] = {}
         self._sslo_last_onload_step: dict[str, int] = {}
-        self._sslo_vacated_req_ids: set[str] = set()
+        self._sslo_offloaded_this_step: set[str] = set()
         self._sslo_offload_conn = None
         if sslo_cfg.kv_offload:
             from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
@@ -1121,6 +1141,37 @@ class Scheduler(SchedulerInterface):
         bucket[prev_prefills] = (
             delta if prev_val is None else alpha * delta + (1 - alpha) * prev_val)
 
+        # SSLO: κ EMA — the marginal step time a prefill token costs on top of
+        # the decode-only baseline. Only prefill-carrying steps inform it.
+        if self.sslo_config.prefill_budget_control:
+            prefill_tokens = self._sslo_prev_step_prefill_tokens
+            delta_decode = self._sslo_decode_wall_ema(prev_batch)
+            if prefill_tokens > 0 and delta_decode is not None:
+                sample = max(0.0, (delta - delta_decode) / prefill_tokens)
+                prev_kappa = self._sslo_prefill_kappa
+                self._sslo_prefill_kappa = (
+                    sample if prev_kappa is None
+                    else alpha * sample + (1 - alpha) * prev_kappa)
+
+    # SSLO
+    def _sslo_decode_wall_ema(self, n: int) -> float | None:
+        """Δ_decode for batch size n — the prefills=0 cell of the wall-step EMA.
+
+        Falls back to the mean over every observed prefills=0 cell (decode-only
+        step time is near batch-invariant: measured p50 74 ms / p90 78 ms),
+        then None when no decode-only step has been observed yet.
+        """
+        bucket = self._sslo_step_wall_ema.get(n)
+        if bucket and 0 in bucket:
+            return bucket[0]
+        vals = [
+            cells[0] for cells in self._sslo_step_wall_ema.values()
+            if 0 in cells
+        ]
+        if vals:
+            return sum(vals) / len(vals)
+        return None
+
     # SSLO
     def _sslo_step_ema_lookup(self, admitted: list[Request]) -> float | None:
         """Pick the wall-step EMA cell — worst-case (max num_prefills) for
@@ -1212,6 +1263,60 @@ class Scheduler(SchedulerInterface):
         return sum(bucket.values()) / len(bucket)
 
     # SSLO
+    def _sslo_min_time_to_deadline(self, now: float) -> float | None:
+        """t_min — smallest remaining time-to-deadline (s) over the MEASURED
+        in-flight set. None when nothing measurable is in flight."""
+        t_min: float | None = None
+        for req in self.running:
+            state = req.slo_state
+            if state is None or state.phase != Phase.MEASURED:
+                continue
+            t_q = state.time_to_deadline(now)
+            if t_q is not None and (t_min is None or t_q < t_min):
+                t_min = t_q
+        return t_min
+
+    # SSLO
+    def _sslo_prefill_token_budget(self, now: float) -> int | None:
+        """Per-step prefill token cap P*, or None when the control is off.
+
+        Off unless `prefill_budget_control` is set and chunked prefill is
+        enabled (the cap only smooths the prefill spike if the remainder can
+        carry over to the next step), and until both κ and a decode-only Δ
+        reference exist. After _SSLO_PREFILL_FLOOR_STARVE_STEPS consecutive
+        floor-clamped steps with no prefill progress, one step gets the full
+        base budget.
+        """
+        cfg = self.sslo_config
+        if not cfg.prefill_budget_control:
+            return None
+        if not self.scheduler_config.enable_chunked_prefill:
+            return None
+        kappa = self._sslo_prefill_kappa
+        if kappa is None:
+            return None
+        delta_decode = self._sslo_decode_wall_ema(len(self.running))
+        if delta_decode is None:
+            return None
+        budget = ps.prefill_budget(
+            t_min=self._sslo_min_time_to_deadline(now),
+            delta_decode=delta_decode,
+            kappa=kappa,
+            base_budget=self.max_num_scheduled_tokens,
+            floor=cfg.prefill_budget_floor,
+            gamma=cfg.prefill_budget_gamma,
+        )
+        if (budget <= cfg.prefill_budget_floor
+                and self._sslo_prev_step_prefill_tokens == 0):
+            self._sslo_prefill_floor_streak += 1
+        else:
+            self._sslo_prefill_floor_streak = 0
+        if self._sslo_prefill_floor_streak >= _SSLO_PREFILL_FLOOR_STARVE_STEPS:
+            self._sslo_prefill_floor_streak = 0
+            return self.max_num_scheduled_tokens
+        return budget
+
+    # SSLO
     def _record_step_for_next_ema(
         self,
         scheduler_output: SchedulerOutput,
@@ -1226,6 +1331,10 @@ class Scheduler(SchedulerInterface):
         new_req_ids = {
             r.req_id for r in scheduler_output.scheduled_new_reqs}
         prefill_count = len(new_req_ids)
+        # SSLO: prefill tokens of this step (κ regressor for the prefill
+        # budget) — same request population as prefill_count.
+        prefill_tokens = sum(
+            scheduler_output.num_scheduled_tokens[r] for r in new_req_ids)
         decoding_only = scheduler_output.total_num_scheduled_tokens > 0
         if new_req_ids:
             decoding_only = False
@@ -1235,13 +1344,28 @@ class Scheduler(SchedulerInterface):
             req = self.requests.get(req_id)
             pre = self._sslo_pre_step_computed.get(req_id)
             if req is None or pre is None:
+                # SSLO: absent from the pre-step snapshot (which holds only
+                # running + sslo_pending) means the request was admitted by
+                # THIS step's waiting loop — a resume from preemption, since
+                # first-time admits already left via new_req_ids. All of its
+                # tokens are recompute/prefill and the waiting loop charged
+                # them to the prefill budget, so κ's denominator must count
+                # them too. prefill_count is deliberately left alone: it keys
+                # the pre-existing wall-EMA cell and is not ours to redefine.
+                if req is not None:
+                    prefill_tokens += (
+                        scheduler_output.num_scheduled_tokens[req_id])
                 decoding_only = False
                 continue
             if pre < req.num_prompt_tokens:
                 prefill_count += 1
+                # SSLO
+                prefill_tokens += scheduler_output.num_scheduled_tokens[req_id]
                 decoding_only = False
         self._sslo_prev_step_decoding_only = decoding_only
         self._sslo_prev_step_num_prefills = prefill_count
+        # SSLO
+        self._sslo_prev_step_prefill_tokens = prefill_tokens
         self._sslo_prev_step_start_ts = now
 
         # SSLO: per-request step accounting. Increments total_step_count
@@ -1606,7 +1730,7 @@ class Scheduler(SchedulerInterface):
                 if req.slo_state is not None:
                     views_a.append(
                         self._sslo_offload_view(req, ps.LOC_CPU, now))
-            for req in self._sslo_promoting.values():
+            for req in self._sslo_onloading.values():
                 if req.slo_state is not None:
                     views_a.append(
                         self._sslo_offload_view(req, ps.LOC_ONLOADING, now))
@@ -1618,12 +1742,12 @@ class Scheduler(SchedulerInterface):
         for req in self.waiting:
             if len(waiting_views) >= b:
                 break
-            # SSLO: a promoted onload req may still be sitting in self.waiting
+            # SSLO: an onloading req may still be sitting in self.waiting
             # before its CPU->GPU load starts; it is already represented by its
             # LOC_ONLOADING view, so skip it here to avoid double-counting the
             # same request as a new admit (inflates the slot / |A+| budget).
             if (self._sslo_offload_conn is not None
-                    and req.request_id in self._sslo_promoting):
+                    and req.request_id in self._sslo_onloading):
                 continue
             waiting_views.append(ps.ProgressView(
                 request_id=req.request_id, c_q=0, T_q=None,
@@ -1644,14 +1768,20 @@ class Scheduler(SchedulerInterface):
         # hybrid (capture-profile shape × live wall-EMA scale) estimator so the
         # search sees every batch size, not just the one currently running
         # (avoids stale-EMA lock-in).
+        # SSLO: whether CPU-parked reqs count in the service-share |A+|.
+        share_parked = self.sslo_config.kv_offload_share_includes_parked
         if self.sslo_config.adaptive_batching:
             b, _ = ps.pick_adaptive_batch(
                 views_a, b, delta, list(self._sslo_capture_sizes_below_base),
-                self._sslo_hybrid_delta, lead)
+                self._sslo_hybrid_delta, lead, share_parked)
             delta = self._sslo_hybrid_delta(b) or delta
 
         result = ps.schedule_step(
-            views_a, waiting_views, b, delta, kv_feasible, lead)
+            views_a, waiting_views, b, delta, kv_feasible, lead, share_parked,
+            # SSLO: budget admission on the marginal E_viol(k) - E_viol(0)
+            # instead of the absolute E_viol(k), so sunk in-flight risk cannot
+            # pin k* to 0 while KV / compute are idle.
+            self.sslo_config.admission_delta_criterion)
         self._sslo_step.e_viol = result.e_viol
         self._sslo_step.k_star = result.k_star
         # SSLO: onload / offloaded ids appear in result but are not in the
@@ -1664,16 +1794,17 @@ class Scheduler(SchedulerInterface):
         self._sslo_step.cur_max_num_requests = b
         self._sslo_step.has_critical = False
 
-        # SSLO: KV-offload tier — promote (CPU->GPU) then vacate (GPU->CPU).
-        # Runs before commit so vacated reqs never enter self.sslo_pending and
-        # promoted reqs are already queued for the waiting-admission loop.
+        # SSLO: KV-offload tier — onload (CPU->GPU) then offload (GPU->CPU).
+        # Runs before commit so offloaded reqs never enter self.sslo_pending and
+        # onloading reqs are already queued for the waiting-admission loop.
         if self._sslo_offload_conn is not None:
             self._sslo_apply_offload(now, result, b, delta, admitted,
                                      new_pending)
 
         # Decision-log score: R_run for measurable, 1.0 for forced.
         plan = ps.build_plan(
-            views_a, waiting_views[:result.k_star], b, delta, lead)
+            views_a, waiting_views[:result.k_star], b, delta, lead,
+            share_parked)
         for req in admitted:
             r = plan.risks.get(req.request_id)
             pressures[req.request_id] = 1.0 if r is None else r[0]
@@ -1688,7 +1819,7 @@ class Scheduler(SchedulerInterface):
     def _sslo_offload_view(
         self, req: Request, location: int, now: float
     ) -> "ps.ProgressView":
-        """ProgressView for a CPU-resident / mid-onload / vacate-candidate
+        """ProgressView for a CPU-resident / mid-onload / offload-candidate
         request. Caller guarantees req.slo_state is not None."""
         state = req.slo_state
         assert state is not None
@@ -1709,15 +1840,15 @@ class Scheduler(SchedulerInterface):
     def _sslo_offload_prologue(self, now: float) -> None:
         """Per-step KV-offload bookkeeping run before placement.
 
-        (1) A promoted request that has re-entered RUNNING has finished its
+        (1) An onloading request that has re-entered RUNNING has finished its
         CPU->GPU onload: close its offload interval, record the residency
         step, and unpin the CPU mirror. (2) Charge one offloaded step to every
         request still CPU-resident or mid-onload.
         """
         running_ids = {req.request_id for req in self.running}
-        for rid in list(self._sslo_promoting):
+        for rid in list(self._sslo_onloading):
             if rid in running_ids:
-                req = self._sslo_promoting.pop(rid)
+                req = self._sslo_onloading.pop(rid)
                 if req.slo_state is not None:
                     req.slo_state.on_offload_exit(now)
                 self._sslo_last_onload_step[rid] = self._sslo_step_idx
@@ -1725,7 +1856,7 @@ class Scheduler(SchedulerInterface):
         for req in self._sslo_offloaded.values():
             if req.slo_state is not None:
                 req.slo_state.chunk_stats.accumulate_offloaded_step()
-        for req in self._sslo_promoting.values():
+        for req in self._sslo_onloading.values():
             if req.slo_state is not None:
                 req.slo_state.chunk_stats.accumulate_offloaded_step()
 
@@ -1739,45 +1870,50 @@ class Scheduler(SchedulerInterface):
         admitted: list[Request],
         new_pending: list[Request],
     ) -> None:
-        """Promote CPU-resident requests nearing their deadline, then (only
-        under KV admission pressure) vacate slack-deep fully-mirrored deferred
-        requests to CPU. Mutates ``new_pending`` in place (vacated reqs are
+        """Onload CPU-resident requests nearing their deadline, then (only
+        under KV admission pressure) offload slack-deep fully-mirrored deferred
+        requests to CPU. Mutates ``new_pending`` in place (offloaded reqs are
         removed before commit)."""
         cfg = self.sslo_config
         lead = cfg.kv_onload_lead_iters
         eps = cfg.kv_offload_risk_eps
-        n_aplus = len(admitted) + len(self._sslo_promoting) + result.k_star
+        n_aplus = len(admitted) + len(self._sslo_onloading) + result.k_star
+        # SSLO: mirror build_plan's |A+| — CPU-parked reqs stay in the service
+        # share unless the config opts out, so the M_cpu that gates
+        # offload/onload matches the one inside the plan.
+        if cfg.kv_offload_share_includes_parked:
+            n_aplus += len(self._sslo_offloaded)
         s = ps.service_share(b, n_aplus)
 
-        # --- Promote (before vacate). ---
+        # --- Onload (before offload). ---
         cpu_views = [
             self._sslo_offload_view(req, ps.LOC_CPU, now)
             for req in self._sslo_offloaded.values()
             if req.slo_state is not None
         ]
-        num_promoted = 0
-        for rid in ps.select_promote(cpu_views, delta, s, lead, eps):
+        num_onloads = 0
+        for rid in ps.select_onload(cpu_views, delta, s, lead, eps):
             req = self._sslo_offloaded.pop(rid, None)
             if req is None:
                 continue
             # Forced front-of-queue insert: the waiting-admission loop restarts
             # the CPU->GPU onload via the connector, off the k* budget.
             self.waiting.prepend_request(req)
-            self._sslo_promoting[rid] = req
-            num_promoted += 1
-            self._sslo_log_offload_event("promote", rid, now)
+            self._sslo_onloading[rid] = req
+            num_onloads += 1
+            self._sslo_log_offload_event("onload", rid, now)
 
-        # --- Vacate: only when KV admission (not E_viol) capped k*. ---
-        num_vacated = 0
+        # --- Offload: only when KV admission (not E_viol) capped k*. ---
+        num_offloads = 0
         if result.kv_capped:
             per_admit = cfg.kv_blocks_per_new_admit
             blocks_needed = (
                 result.k_star_unconstrained - result.k_star) * per_admit
-            # Promoted reqs still awaiting GPU allocation need blocks too.
-            pending_promote = sum(
-                1 for r in self._sslo_promoting.values()
+            # Onloading reqs still awaiting GPU allocation need blocks too.
+            pending_onload = sum(
+                1 for r in self._sslo_onloading.values()
                 if r.status == RequestStatus.PREEMPTED)
-            blocks_needed += pending_promote * per_admit
+            blocks_needed += pending_onload * per_admit
 
             min_res = cfg.kv_offload_min_residency_steps
             cand_views: list[ps.ProgressView] = []
@@ -1798,32 +1934,32 @@ class Scheduler(SchedulerInterface):
                 cand_views.append(view)
                 cand_by_id[rid] = req
 
-            for rid in ps.select_vacate(
+            for rid in ps.select_offload(
                     cand_views, delta, s, lead, eps, blocks_needed,
                     self._sslo_num_gpu_blocks):
                 req = cand_by_id[rid]
                 if not self._sslo_offload_conn.pin_request_cpu_blocks(req):
                     continue
                 new_pending.remove(req)
-                self._sslo_vacate_request(req, now)
-                num_vacated += 1
-                self._sslo_log_offload_event("vacate", rid, now)
+                self._sslo_offload_request(req, now)
+                num_offloads += 1
+                self._sslo_log_offload_event("offload", rid, now)
 
-        self._sslo_step.num_promoted = num_promoted
-        self._sslo_step.num_vacated = num_vacated
+        self._sslo_step.num_onloads = num_onloads
+        self._sslo_step.num_offloads = num_offloads
         self._sslo_step.kv_capped = result.kv_capped
         self._sslo_step.k_star_unconstrained = result.k_star_unconstrained
 
     # SSLO
-    def _sslo_vacate_request(self, request: Request, now: float) -> None:
-        """Vacate a fully-mirrored deferred request's KV to CPU.
+    def _sslo_offload_request(self, request: Request, now: float) -> None:
+        """Offload a fully-mirrored deferred request's KV to CPU.
 
         Reuses ``_preempt_request`` for the exact preemption bookkeeping (free
         GPU blocks, reset computed tokens, status PREEMPTED, count preemption)
         so the worker and connector treat it identically to a preemption, then
         moves it off the waiting queue into ``_sslo_offloaded`` (CPU mirror
         pinned). ``is_fully_mirrored`` guarantees no in-flight store on this
-        request, so the vacated GPU blocks carry no in-progress copy — the
+        request, so the freed GPU blocks carry no in-progress copy — the
         SchedulerOutput's need_flush (from preempted_req_ids) is a harmless
         superset and no dedicated worker flush is required.
         """
@@ -1831,7 +1967,7 @@ class Scheduler(SchedulerInterface):
         # _preempt_request enqueues to the waiting queue; redirect to CPU.
         self.waiting.remove_requests([request])
         self._sslo_offloaded[request.request_id] = request
-        self._sslo_vacated_req_ids.add(request.request_id)
+        self._sslo_offloaded_this_step.add(request.request_id)
         if request.slo_state is not None:
             request.slo_state.on_offload_enter(now)
             # Count this step for the request: it left running/pending for CPU
@@ -1847,16 +1983,16 @@ class Scheduler(SchedulerInterface):
             return
         rid = request.request_id
         self._sslo_offloaded.pop(rid, None)
-        self._sslo_promoting.pop(rid, None)
+        self._sslo_onloading.pop(rid, None)
         self._sslo_last_onload_step.pop(rid, None)
-        self._sslo_vacated_req_ids.discard(rid)
+        self._sslo_offloaded_this_step.discard(rid)
         self._sslo_offload_conn.unpin_request_cpu_blocks(request)
 
     # SSLO
     def _sslo_log_offload_event(
         self, kind: str, rid: str, now: float
     ) -> None:
-        """Append a vacate / promote event row to the decision buffer."""
+        """Append an offload / onload event row to the decision buffer."""
         if self.sslo_config.decision_log_mode == "off":
             return
         if self._sslo_decision_log_resolve() is None:
@@ -1946,7 +2082,15 @@ class Scheduler(SchedulerInterface):
             "ts": now,
             "running": len(self.running),
             "pending": len(self.sslo_pending),
-            "num_handling_users": len(self.running) + len(self.sslo_pending),
+            # SSLO: handling users counts every request the engine is
+            # serving. The primary metric includes KV-offloaded (CPU-resident)
+            # requests; `_online` is the GPU-resident-only comparison value.
+            # Without the offload tier `_sslo_offloaded` is empty and both
+            # keys coincide.
+            "num_handling_users": (len(self.running) + len(self.sslo_pending)
+                                   + len(self._sslo_offloaded)),
+            "num_handling_users_online": (len(self.running)
+                                          + len(self.sslo_pending)),
             "waiting": len(self.waiting) + len(self.skipped_waiting),
             "cur_max_num_requests": self._sslo_step.cur_max_num_requests,
             "has_critical": self._sslo_step.has_critical,
@@ -1967,8 +2111,14 @@ class Scheduler(SchedulerInterface):
             "num_offloaded": len(self._sslo_offloaded),
             "kv_capped": self._sslo_step.kv_capped,
             "k_star_unconstrained": self._sslo_step.k_star_unconstrained,
-            "num_vacated": self._sslo_step.num_vacated,
-            "num_promoted": self._sslo_step.num_promoted,
+            "num_offloads": self._sslo_step.num_offloads,
+            "num_onloads": self._sslo_step.num_onloads,
+            # SSLO: deadline-aware prefill budget diagnostics. Both are None
+            # while the control is off / not yet armed.
+            "prefill_budget": self._sslo_step.prefill_budget,
+            "prefill_kappa_ms_per_tok": (
+                None if self._sslo_prefill_kappa is None
+                else self._sslo_prefill_kappa * 1000.0),
             # SSLO: per-step KV cache block usage
             "kv_blocks_used": (
                 self.kv_cache_manager.block_pool.num_gpu_blocks
@@ -2088,11 +2238,21 @@ class Scheduler(SchedulerInterface):
             for req in self.running + self.sslo_pending
         }
 
-        # SSLO: reset this step's KV-offload vacate set; the policy repopulates
+        # SSLO: reset this step's KV-offload set; the policy repopulates
         # it and it is folded into SchedulerOutput.preempted_req_ids below.
-        self._sslo_vacated_req_ids = set()
+        self._sslo_offloaded_this_step = set()
         # SSLO: dispatcher patched in __init__ based on (method, policy).
         sslo_scores = self._apply_sslo_policy(scheduled_timestamp)
+
+        # SSLO: deadline-aware prefill token budget for this step (None ⇒
+        # control off). One shared counter bounds the TOTAL prefill tokens of
+        # the step: the running loop's chunked-prefill carry-over drains it
+        # first, then the waiting loop's new admits. Decode tokens are never
+        # charged and never capped.
+        sslo_prefill_budget = self._sslo_prefill_token_budget(
+            scheduled_timestamp)
+        self._sslo_step.prefill_budget = sslo_prefill_budget
+        sslo_prefill_remaining = sslo_prefill_budget or 0
 
         self.kv_cache_manager.new_step_starts()
 
@@ -2131,6 +2291,22 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
+
+            # SSLO: chunked-prefill carry-over is scheduled here, not in the
+            # waiting loop — a request that is RUNNING but still short of its
+            # prompt. This is where the measured Δ p90 = 463 ms spike lives, so
+            # the same per-step prefill budget must bind it. Both loops drain
+            # one shared `sslo_prefill_remaining`, and this loop runs first so
+            # in-flight prefills outrank new admits. Requests past their prompt
+            # (pure decode) are never clamped. At least one token is always
+            # granted so a carry-over can never stall permanently.
+            sslo_is_carryover_prefill = (
+                request.num_computed_tokens < request.num_prompt_tokens)
+            if (sslo_prefill_budget is not None
+                    and sslo_is_carryover_prefill
+                    and num_new_tokens > 0):
+                num_new_tokens = max(
+                    1, min(num_new_tokens, sslo_prefill_remaining))
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -2197,6 +2373,11 @@ class Scheduler(SchedulerInterface):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
+                            # SSLO: sslo_prefill_remaining is NOT refunded here — a
+                            # prefill carry-over that gets un-scheduled stays charged, so
+                            # the rest of this step's budget is conservative, never
+                            # permissive. Unreachable under FCFS; revisit if PRIORITY is
+                            # ever combined with prefill_budget_control.
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
@@ -2231,6 +2412,10 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            # SSLO: charge only the prefill carry-over against the shared
+            # per-step prefill budget; decode tokens are free.
+            if sslo_is_carryover_prefill:
+                sslo_prefill_remaining -= num_new_tokens
             req_index += 1
 
             # Speculative decode related.
@@ -2284,11 +2469,11 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
             # SSLO: budget-driven admission (computed in _apply_sslo_policy).
             sslo_admit_remaining = self._sslo_step.waiting_admission_budget
-            # SSLO: KV-offload promoted reqs traverse the loop to (re)start
+            # SSLO: KV-offload onloading reqs traverse the loop to (re)start
             # their CPU->GPU onload without spending the k* admission budget;
             # reserve one traversal slot per in-flight onload.
             sslo_onload_remaining = (
-                len(self._sslo_promoting)
+                len(self._sslo_onloading)
                 if self._sslo_offload_conn is not None else 0)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -2301,8 +2486,16 @@ class Scheduler(SchedulerInterface):
                 if len(self.running) >= self._sslo_step.cur_max_num_requests:
                     break
                 # SSLO: stop when the admission budget is exhausted AND no
-                # promoted onloads remain to be traversed.
+                # onloads remain to be traversed.
                 if sslo_admit_remaining <= 0 and sslo_onload_remaining <= 0:
+                    break
+                # SSLO: this step's prefill token budget is spent; the rest of
+                # the waiting prefix carries over to the next step (chunked
+                # prefill), which is the intended smoothing. Onloads are
+                # deadline-forced, so they keep their traversal.
+                sslo_prefill_exhausted = (sslo_prefill_budget is not None
+                                          and sslo_prefill_remaining <= 0)
+                if sslo_prefill_exhausted and sslo_onload_remaining <= 0:
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -2311,7 +2504,7 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
-                # SSLO: KV-offload promoted onload reqs spend the onload
+                # SSLO: KV-offload onloading reqs spend the onload
                 # reservation (not the k* budget); each is peeked once per step,
                 # so decrement here. A normal req past the budget is skipped so
                 # the loop can still reach the (front-queued) onloads. The whole
@@ -2320,10 +2513,12 @@ class Scheduler(SchedulerInterface):
                 # the top-of-loop guard already broke on sslo_admit_remaining).
                 sslo_is_onload = False
                 if self._sslo_offload_conn is not None:
-                    sslo_is_onload = request_id in self._sslo_promoting
+                    sslo_is_onload = request_id in self._sslo_onloading
                     if sslo_is_onload:
                         sslo_onload_remaining -= 1
-                    elif sslo_admit_remaining <= 0:
+                    # SSLO: a spent prefill budget skips normal reqs the same
+                    # way a spent k* does, so the loop can still reach onloads.
+                    elif sslo_admit_remaining <= 0 or sslo_prefill_exhausted:
                         request_queue.pop_request()
                         step_skipped_waiting.prepend_request(request)
                         continue
@@ -2440,6 +2635,14 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    # SSLO: clamp this admission's prefill chunk to the step's
+                    # remaining deadline-aware prefill budget (> 0 here — the
+                    # guards above skipped/broke on exhaustion). An onload is
+                    # deadline-forced and is not clamped; it is
+                    # still charged below so the budget stays honest.
+                    if sslo_prefill_budget is not None and not sslo_is_onload:
+                        num_new_tokens = min(
+                            num_new_tokens, sslo_prefill_remaining)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -2569,7 +2772,7 @@ class Scheduler(SchedulerInterface):
 
                 self.running.append(request)
                 # SSLO: count successful admission against this step's budget,
-                # except a promoted onload completing synchronously (no CPU hit
+                # except an onload completing synchronously (no CPU hit
                 # to load) — its slot was reserved via the onload accounting.
                 if not sslo_is_onload:
                     sslo_admit_remaining -= 1
@@ -2594,6 +2797,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                # SSLO: waiting-loop tokens are all prefill — charge them to
+                # this step's deadline-aware prefill budget.
+                sslo_prefill_remaining -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Encoder-related.
@@ -2695,11 +2901,11 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
-            # SSLO: KV-offload vacated reqs are treated as preemptions by the
+            # SSLO: KV-offloaded reqs are treated as preemptions by the
             # worker (drop request state) and connector (need_flush); fold them
             # into preempted_req_ids alongside genuine preemptions.
             preempted_req_ids=({req.request_id for req in preempted_reqs}
-                               | self._sslo_vacated_req_ids),
+                               | self._sslo_offloaded_this_step),
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
             # It contains the request IDs that are finished in between
@@ -3698,6 +3904,10 @@ class Scheduler(SchedulerInterface):
             self._sslo_global_chunk_len_predictor.reset()
         self._sslo_step_wall_ema.clear()
         self._sslo_prev_step_num_prefills = 0
+        # SSLO: deadline-aware prefill budget accumulators.
+        self._sslo_prev_step_prefill_tokens = 0
+        self._sslo_prefill_kappa = None
+        self._sslo_prefill_floor_streak = 0
         self._sslo_prev_step_batch = None
         self._sslo_prev_step_decoding_only = False
         self._sslo_prev_step_start_ts = None
@@ -3713,12 +3923,12 @@ class Scheduler(SchedulerInterface):
         if self._sslo_offload_conn is not None:
             for req in list(self._sslo_offloaded.values()):
                 self._sslo_offload_conn.unpin_request_cpu_blocks(req)
-            for req in list(self._sslo_promoting.values()):
+            for req in list(self._sslo_onloading.values()):
                 self._sslo_offload_conn.unpin_request_cpu_blocks(req)
         self._sslo_offloaded.clear()
-        self._sslo_promoting.clear()
+        self._sslo_onloading.clear()
         self._sslo_last_onload_step.clear()
-        self._sslo_vacated_req_ids.clear()
+        self._sslo_offloaded_this_step.clear()
         # SSLO: per-step transient state — recomputed at top of
         # _apply_sslo_policy each step, but reset here for cleanliness
         # so any pre-first-step read sees the fresh initial value.

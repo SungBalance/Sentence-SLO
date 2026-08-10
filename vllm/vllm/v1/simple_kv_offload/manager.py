@@ -148,7 +148,7 @@ class SimpleCPUOffloadScheduler:
         self._store_event_to_reqs: dict[int, list[str]] = {}
 
         # SSLO KV-offload tier: request_id -> pinned CPU blocks (kept touched
-        # so the CPU mirror survives eviction while the request is GPU-vacated).
+        # so the CPU mirror survives eviction while the request is offloaded).
         self._pinned_cpu_blocks: dict[str, list] = {}
 
         # Event counters
@@ -664,7 +664,7 @@ class SimpleCPUOffloadScheduler:
         """True iff every confirmed full block of ``request`` is already
         mirrored on CPU with no in-flight store.
 
-        Lets the SSLO offload tier vacate a request to CPU by returning its
+        Lets the SSLO offload tier offload a request to CPU by returning its
         GPU refs without a bulk transfer. Uses the same confirmed-block
         accounting as ``_prepare_eager_store_specs`` on the full-attention
         group (``fa_gidx``). Returns False in lazy mode or for an unregistered
@@ -690,7 +690,7 @@ class SimpleCPUOffloadScheduler:
         """Pin every confirmed full CPU block of ``request`` (all-or-nothing).
 
         Touches the blocks so eviction can't reclaim the CPU mirror while the
-        request is GPU-vacated, records them, and returns True. If any full
+        request is offloaded, records them, and returns True. If any full
         block is missing from the CPU cache, pins nothing and returns False.
         Idempotent: a request already pinned returns True.
         """

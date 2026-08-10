@@ -136,6 +136,32 @@ def test_kv_offload_requires_progress_serve():
     assert cfg.kv_offload is True
 
 
+def test_prefill_budget_defaults():
+    cfg = SsloConfig()
+    assert cfg.prefill_budget_control is False
+    assert cfg.prefill_budget_floor == 512
+    assert cfg.prefill_budget_gamma == 0.5
+
+
+def test_prefill_budget_control_requires_progress_serve():
+    with pytest.raises(ValueError, match="prefill_budget_control"):
+        SsloConfig(prefill_budget_control=True)  # method defaults to baseline
+    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
+    assert cfg.prefill_budget_control is True
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_prefill_budget_floor_must_be_positive(value):
+    with pytest.raises(ValueError, match="prefill_budget_floor"):
+        SsloConfig(prefill_budget_floor=value)
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1, 1.5])
+def test_prefill_budget_gamma_range(value):
+    with pytest.raises(ValueError, match="prefill_budget_gamma"):
+        SsloConfig(prefill_budget_gamma=value)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

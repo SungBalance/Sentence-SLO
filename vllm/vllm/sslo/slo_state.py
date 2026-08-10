@@ -457,7 +457,7 @@ class ChunkRecord:
     num_iters: int
     num_running_iters: int
     num_pending_iters: int
-    # Steps this chunk window spent KV-vacated to CPU (offload tier).
+    # Steps this chunk window spent KV-offloaded to CPU (offload tier).
     num_offloaded_iters: int
     # Predictor's estimate (in tokens) at chunk start — i.e. value used by
     # pressure() during this chunk's generation. None for chunk 0 (no
@@ -578,7 +578,7 @@ class SsloRequestStats:
     chunks_completed: int
     final_chunk_expected_len: float | None
     # KV offload tier lifecycle. total_offloaded_time_s = wall-clock spent
-    # KV-vacated to CPU; num_offload_intervals = vacate events; num_onloads =
+    # KV-offloaded to CPU; num_offload_intervals = offload events; num_onloads =
     # completed CPU→GPU restores.
     total_offloaded_time_s: float = 0.0
     num_offload_intervals: int = 0

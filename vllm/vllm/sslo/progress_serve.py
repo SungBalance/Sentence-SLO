@@ -46,11 +46,13 @@ E_VIOL_FEASIBLE = 1.0
 # Request KV-cache location for the offload tier. Kept as local ints (like
 # PHASE_MEASURED) so this module stays engine-import-free:
 #   LOC_GPU        in-flight on GPU (the classic RUN/DEFER population).
-#   LOC_CPU        KV vacated to CPU — holds no decode slot and does not
-#                  compete for this epoch's service share; its deferred-on-CPU
-#                  risk R_defer_cpu still counts toward E_viol.
-#   LOC_ONLOADING  promoted CPU→GPU, slot reserved for the restore. Occupies a
-#                  slot like a new admit and is excluded from E_viol (forced).
+#   LOC_CPU        KV offloaded to CPU — holds no decode slot; its deferred-
+#                  on-CPU risk R_defer_cpu still counts toward E_viol. Whether
+#                  it counts in |A+| (service share) is the caller's choice,
+#                  see build_plan(share_includes_parked=...).
+#   LOC_ONLOADING  onloading CPU→GPU, slot reserved for the restore. Occupies
+#                  a slot like a new admit and is excluded from E_viol
+#                  (forced).
 LOC_GPU = 0
 LOC_CPU = 1
 LOC_ONLOADING = 2
@@ -100,7 +102,7 @@ class ScheduleResult:
     # k_star when the scan stopped on E_viol rather than KV.
     k_star_unconstrained: int = 0
     # True when KV admission — not E_viol — bounded k* (k_star_unconstrained
-    # > k_star). The vacate trigger fires only under this condition.
+    # > k_star). The offload trigger fires only under this condition.
     kv_capped: bool = False
     offloaded_A: list[str] = field(default_factory=list)
     cpu_risks: dict[str, tuple[float, float, float]] = field(
@@ -194,6 +196,7 @@ def build_plan(
     b: int,
     delta: float,
     lead: int = 0,
+    share_includes_parked: bool = True,
 ) -> Plan:
     """Partition existing in-flight A into scheduled / deferred under a fixed
     batch size ``b`` and candidate in-flight set A+ = A ∪ A_new.
@@ -208,9 +211,12 @@ def build_plan(
       - LOC_ONLOADING reqs behave like forced/new admits: they take a slot
         (reserved for the restore) and are excluded from E_viol, but they DO
         count in |A+| (service share).
-      - LOC_CPU reqs take no slot and are absent from |A+| (they are not in
-        this epoch's service race). Each measurable CPU req adds its
-        R_defer_cpu to E_viol and is recorded in ``offloaded_A`` / cpu_risks.
+      - LOC_CPU reqs take no slot (decode_cap is unaffected). Each measurable
+        CPU req adds its R_defer_cpu to E_viol and is recorded in
+        ``offloaded_A`` / cpu_risks. ``share_includes_parked`` controls only
+        whether they count in |A+|: True (default) keeps them in the service
+        share because offloading frees memory, not compute — they come back and
+        reclaim their share.
 
     E_viol = Σ_{scheduled measurable} R_run + Σ_{deferred measurable} R_defer
              + Σ_{CPU measurable} R_defer_cpu.
@@ -219,8 +225,12 @@ def build_plan(
     cpu_views = [v for v in views_A if v.location == LOC_CPU]
     onloading_views = [v for v in views_A if v.location == LOC_ONLOADING]
 
-    # CPU reqs are out of the service race; ONLOADING reqs stay in |A+|.
+    # ONLOADING reqs always stay in |A+|; CPU reqs only when the caller keeps
+    # parked requests in the service race. This affects s alone — parked reqs
+    # still hold no decode slot and still enter E_viol as R_defer_cpu.
     n_aplus = len(gpu_views) + len(onloading_views) + len(views_Anew)
+    if share_includes_parked:
+        n_aplus += len(cpu_views)
     s = service_share(b, n_aplus)
 
     forced = [v for v in gpu_views if not v.is_measurable()]
@@ -275,6 +285,8 @@ def schedule_step(
     delta: float,
     kv_feasible: Callable[[int], bool],
     lead: int = 0,
+    share_includes_parked: bool = True,
+    admission_delta_criterion: bool = False,
 ) -> ScheduleResult:
     """Find k* = max{k : E_viol(A+(k), B) < 1} over the FCFS prefix of W.
 
@@ -284,24 +296,36 @@ def schedule_step(
     deferred partition at k* and k* itself (an upper bound on admits; the
     engine's allocate_slots is the hard KV backstop).
 
+    With ``admission_delta_criterion`` the feasibility test becomes the
+    MARGINAL one, E_viol(k) - E_viol(0) < 1: the risk the in-flight set
+    already carries is sunk cost, so the budget applies only to the extra
+    expected violations this step's admissions cause. This also removes the
+    k=0 early-exit (E_viol(0) - E_viol(0) = 0 is always feasible), which is
+    the point — under the absolute rule a handful of at-risk in-flight
+    requests can pin k* to 0 while KV and compute sit idle.
+    ``ScheduleResult.e_viol`` stays the ABSOLUTE E_viol at k* either way; the
+    delta is used for the admission decision only.
+
     Also reports ``k_star_unconstrained``: had the KV cap been lifted, how far
     the E_viol scan would have reached. When the scan stopped on the KV cap
     (not on E_viol), it continues under E_viol only to compute this, and
     ``kv_capped`` becomes True — the signal the scheduler uses to trigger
-    vacate.
+    offload.
     """
-    best = build_plan(views_A, [], b, delta, lead)
+    best = build_plan(views_A, [], b, delta, lead, share_includes_parked)
     best_k = 0
     kv_break_k: int | None = None
     n = len(waiting_views)
+    baseline_e = best.e_viol if admission_delta_criterion else 0.0
     # If even admitting nobody is already over budget, defer-only at k=0.
-    if best.e_viol < E_VIOL_FEASIBLE:
+    if best.e_viol - baseline_e < E_VIOL_FEASIBLE:
         for k in range(1, n + 1):
             if not kv_feasible(k):
                 kv_break_k = k
                 break
-            plan = build_plan(views_A, waiting_views[:k], b, delta, lead)
-            if plan.e_viol < E_VIOL_FEASIBLE:
+            plan = build_plan(views_A, waiting_views[:k], b, delta, lead,
+                              share_includes_parked)
+            if plan.e_viol - baseline_e < E_VIOL_FEASIBLE:
                 best, best_k = plan, k
             else:
                 break
@@ -310,8 +334,9 @@ def schedule_step(
         # KV — not E_viol — stopped the scan; keep going ignoring KV.
         for k in range(kv_break_k, n + 1):
             if build_plan(
-                    views_A, waiting_views[:k], b, delta,
-                    lead).e_viol < E_VIOL_FEASIBLE:
+                    views_A, waiting_views[:k], b, delta, lead,
+                    share_includes_parked).e_viol - baseline_e < (
+                        E_VIOL_FEASIBLE):
                 k_star_unconstrained = k
             else:
                 break
@@ -334,6 +359,7 @@ def pick_adaptive_batch(
     candidates: list[int],
     delta_of: Callable[[int], float | None],
     lead: int = 0,
+    share_includes_parked: bool = True,
 ) -> tuple[int, Plan]:
     """Choose the decode batch size that minimizes E_viol over the in-flight
     set, shrinking from ``base_b`` only when it is infeasible.
@@ -350,11 +376,13 @@ def pick_adaptive_batch(
     - ``candidates``: captured sizes strictly below base_b, DESCENDING.
     - ``delta_of(b)``: Δ estimate for size b (None ⇒ no sample yet, skip).
     The search uses the in-flight set only (no new admits); admission is
-    handled afterward by schedule_step at the chosen size. ``lead`` is passed
-    through to build_plan so LOC_CPU risk (R_defer_cpu) matches schedule_step.
+    handled afterward by schedule_step at the chosen size. ``lead`` and
+    ``share_includes_parked`` are passed through to build_plan so LOC_CPU risk
+    (R_defer_cpu) and |A+| match schedule_step.
     """
     best_b = base_b
-    best_plan = build_plan(views_A, [], base_b, base_delta, lead)
+    best_plan = build_plan(views_A, [], base_b, base_delta, lead,
+                           share_includes_parked)
     if best_plan.e_viol < E_VIOL_FEASIBLE:
         return best_b, best_plan  # not under pressure → keep full batch
     # Forced (PREFILL/WARMUP) requests are always scheduled, so the batch
@@ -369,14 +397,60 @@ def pick_adaptive_batch(
         d = delta_of(b)
         if d is None or d <= 0:
             continue
-        plan = build_plan(views_A, [], b, d, lead)
+        plan = build_plan(views_A, [], b, d, lead, share_includes_parked)
         if plan.e_viol > prev_e:
             break  # shrinking made it worse → stop, keep previous size
         best_b, best_plan, prev_e = b, plan, plan.e_viol
     return best_b, best_plan
 
 
-def select_vacate(
+def prefill_budget(
+    t_min: float | None,
+    delta_decode: float,
+    kappa: float,
+    base_budget: int,
+    floor: int,
+    gamma: float,
+) -> int:
+    """Deadline-aware per-step prefill token budget P*.
+
+    Rationale (measured, cap128 / rate 2 baseline): decode-only steps are
+    extremely stable (Δ p50 74 ms / p90 78 ms), while the 6% of steps that
+    carry prefill eat 18.4% of the wall clock at Δ p90 = 463 ms. Chunk
+    deadlines are broken by the prefill spike, not by decode concurrency, so
+    the spike — not the request concurrency — is what to bound.
+
+        P* = clamp(int((gamma * t_min - delta_decode) / kappa),
+                   floor, base_budget)
+
+    i.e. spend at most a ``gamma`` fraction of the most urgent in-flight
+    request's remaining time on this step, minus the decode cost that step
+    already owes.
+
+    Units: ``t_min`` seconds to the nearest in-flight chunk deadline (None ⇒
+    no measurable request in flight), ``delta_decode`` seconds per decode-only
+    step, ``kappa`` seconds of extra step time per prefill token,
+    ``base_budget`` / ``floor`` tokens, ``gamma`` dimensionless in (0, 1].
+
+    ``floor`` is itself clamped to ``base_budget`` so the result never exceeds
+    what the engine would schedule anyway. For the control to have any effect,
+    configure ``floor`` well below the engine's ``max_num_batched_tokens``
+    (which is what the caller passes as ``base_budget``) — a floor at or above
+    it makes every step return ``base_budget``, i.e. a silent no-op.
+
+    Control is disabled — returns ``base_budget`` — when ``kappa <= 0`` or
+    ``t_min is None``. An already-overdue ``t_min <= 0`` returns ``floor``.
+    """
+    floor = min(floor, base_budget)
+    if kappa <= 0 or t_min is None:
+        return base_budget
+    if t_min <= 0:
+        return floor
+    p = int((gamma * t_min - delta_decode) / kappa)
+    return max(floor, min(base_budget, p))
+
+
+def select_offload(
     deferred_views: list[ProgressView],
     delta: float,
     s: float,
@@ -385,7 +459,7 @@ def select_vacate(
     blocks_needed: int,
     blocks_of: Callable[[str], int],
 ) -> list[str]:
-    """Pick deferred GPU reqs whose KV to vacate to CPU to free ``blocks_needed``.
+    """Pick deferred GPU reqs whose KV to offload to CPU to free ``blocks_needed``.
 
     Only reqs with a cheap CPU stay (M_cpu <= eps) are eligible. They are
     chosen by ascending M_cpu (cheapest first), ties broken by descending
@@ -412,7 +486,7 @@ def select_vacate(
     return selected
 
 
-def select_promote(
+def select_onload(
     cpu_views: list[ProgressView],
     delta: float,
     s: float,
@@ -421,16 +495,16 @@ def select_promote(
 ) -> list[str]:
     """Pick CPU-resident reqs to restore (CPU→GPU) ahead of their deadline.
 
-    A req is promoted once its CPU stay stops being free — the lead penalty
+    A req is onloaded once its CPU stay stops being free — the lead penalty
     surfaces in the risk (M_cpu > eps) — which is exactly the deadline-aware
     prefetch point. Safety net: R_defer_cpu >= 1 (a certain miss direction)
-    forces promotion regardless. Non-measurable CPU views are skipped.
+    forces onload regardless. Non-measurable CPU views are skipped.
     """
-    promoted: list[str] = []
+    onloaded: list[str] = []
     for v in cpu_views:
         if v.location != LOC_CPU or not v.is_measurable():
             continue
         _r_defer, r_defer_cpu, m_cpu = request_risk_cpu(v, delta, s, lead)
         if m_cpu > eps or r_defer_cpu >= 1.0:
-            promoted.append(v.request_id)
-    return promoted
+            onloaded.append(v.request_id)
+    return onloaded

@@ -12,11 +12,12 @@ from vllm.sslo.progress_serve import (
     n_defer_cpu,
     n_run_defer,
     pick_adaptive_batch,
+    prefill_budget,
     request_risk,
     request_risk_cpu,
     schedule_step,
-    select_promote,
-    select_vacate,
+    select_onload,
+    select_offload,
     service_share,
 )
 
@@ -213,6 +214,66 @@ def test_schedule_step_defer_only_when_infeasible_at_zero():
     assert len(res.deferred_A) == 2
 
 
+def test_schedule_step_delta_criterion_unlocks_sunk_risk():
+    # Same self-locking input as above: E_viol(0) = 3 >= 1 from in-flight risk
+    # alone. The absolute rule pins k*=0; the marginal rule sees a flat tail
+    # (admits add no extra expected violations) and admits the whole prefix.
+    tail = lambda x: 1.0
+    a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(3)]
+    waiting = [_new_admit(f"w{i}") for i in range(2)]
+    absolute = schedule_step(a, waiting, b=1, delta=1.0,
+                             kv_feasible=lambda k: True)
+    delta_res = schedule_step(a, waiting, b=1, delta=1.0,
+                              kv_feasible=lambda k: True,
+                              admission_delta_criterion=True)
+    assert absolute.k_star == 0
+    assert delta_res.k_star == 2
+    # e_viol stays the ABSOLUTE value at k*, not the marginal one.
+    assert delta_res.e_viol >= E_VIOL_FEASIBLE
+
+
+def test_schedule_step_delta_criterion_matches_absolute_at_low_risk():
+    # E_viol(0) == 0 → sunk cost is nothing → both criteria are identical.
+    tail = lambda x: max(0.0, 1.0 - x / 2.0)
+    a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(3)]
+    waiting = [_new_admit(f"w{i}") for i in range(5)]
+    assert build_plan(a, [], 3, 1.0).e_viol == 0.0
+    absolute = schedule_step(a, waiting, b=3, delta=1.0,
+                             kv_feasible=lambda k: True)
+    delta_res = schedule_step(a, waiting, b=3, delta=1.0,
+                              kv_feasible=lambda k: True,
+                              admission_delta_criterion=True)
+    assert 0 < absolute.k_star < len(waiting)  # the risk budget did bind
+    assert delta_res.k_star == absolute.k_star
+    assert delta_res.e_viol == absolute.e_viol
+
+
+def test_schedule_step_delta_criterion_still_bounded_by_marginal_budget():
+    # Two doomed reqs (tail == 1) make E_viol(0) = 2 >= 1 → absolute locks at
+    # k=0. Three more reqs whose deferral risk grows with k supply the
+    # marginal cost, so the delta scan admits some and then stops.
+    tail = lambda x: max(0.0, 1.0 - x / 2.0)
+    a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(3)]
+    a += [_measurable(f"d{i}", 0, 3.0, lambda x: 1.0) for i in range(2)]
+    waiting = [_new_admit(f"w{i}") for i in range(4)]
+    absolute = schedule_step(a, waiting, b=5, delta=1.0,
+                             kv_feasible=lambda k: True)
+    delta_res = schedule_step(a, waiting, b=5, delta=1.0,
+                              kv_feasible=lambda k: True,
+                              admission_delta_criterion=True)
+    assert absolute.k_star == 0
+    # Oracle: largest k with E_viol(k) - E_viol(0) < 1.
+    base = build_plan(a, [], 5, 1.0).e_viol
+    expected_k = 0
+    for k in range(1, len(waiting) + 1):
+        if build_plan(a, waiting[:k], 5, 1.0).e_viol - base < 1.0:
+            expected_k = k
+        else:
+            break
+    assert 0 < expected_k < len(waiting)  # the marginal budget did bind
+    assert delta_res.k_star == expected_k
+
+
 # ---- pick_adaptive_batch -----------------------------------------------
 
 def _expected_pick(views, base_b, base_delta, candidates, delta_of):
@@ -314,15 +375,45 @@ def test_build_plan_cpu_no_slot_contributes_rdefer_cpu():
     assert abs(plan.e_viol - (r_run_v1 + r_defer_cpu)) < 1e-9
 
 
-def test_build_plan_service_share_excludes_cpu():
-    # A lone GPU measurable with one CPU sibling: |A+| must be 1 (CPU out),
-    # so s = min(1, B/1). If CPU were counted, s would halve and change R_run.
+def test_build_plan_service_share_includes_cpu_by_default():
+    # A lone GPU measurable with one CPU sibling: parked reqs stay in the
+    # service race by default, so |A+| == 2 and s = min(1, B/2).
     v1 = _measurable("v1", 0, 11.0, _T1)
     cpu = _cpu("c", 0, 11.0, _T2)
     plan = build_plan([v1, cpu], [], b=1, delta=1.0)
+    s = service_share(1, 2)  # n_aplus == 2 (GPU + CPU)
+    nr, _nd = n_run_defer(horizon(11.0, 1.0), s)
+    assert abs(plan.risks["v1"][0] - _T1(nr)) < 1e-9
+
+
+def test_build_plan_service_share_excludes_cpu_when_opted_out():
+    # Legacy semantics: |A+| == 1 (CPU out) → larger s → smaller R_run.
+    v1 = _measurable("v1", 0, 11.0, _T1)
+    cpu = _cpu("c", 0, 11.0, _T2)
+    plan = build_plan([v1, cpu], [], b=1, delta=1.0,
+                      share_includes_parked=False)
     s = service_share(1, 1)  # n_aplus == 1
     nr, _nd = n_run_defer(horizon(11.0, 1.0), s)
     assert abs(plan.risks["v1"][0] - _T1(nr)) < 1e-9
+    # The two semantics must actually differ here.
+    inc = build_plan([v1, cpu], [], b=1, delta=1.0)
+    assert plan.risks["v1"][0] < inc.risks["v1"][0]
+
+
+def test_build_plan_parked_share_does_not_change_slots():
+    # Including parked reqs in |A+| touches s only: decode_cap is unchanged
+    # (the CPU req still holds no slot) and it still contributes R_defer_cpu.
+    v1 = _measurable("v1", 0, 11.0, _T1)
+    v2 = _measurable("v2", 0, 11.0, _T2)
+    cpu = _cpu("c", 0, 11.0, _T2)
+    inc = build_plan([v1, v2, cpu], [], b=1, delta=1.0)
+    exc = build_plan([v1, v2, cpu], [], b=1, delta=1.0,
+                     share_includes_parked=False)
+    assert inc.scheduled_A == exc.scheduled_A == ["v2"]
+    assert inc.deferred_A == exc.deferred_A == ["v1"]
+    assert inc.offloaded_A == exc.offloaded_A == ["c"]
+    # Smaller s → less future service on CPU → higher R_defer_cpu.
+    assert inc.cpu_risks["c"][1] > exc.cpu_risks["c"][1]
 
 
 def test_build_plan_onloading_takes_slot_excluded_from_eviol():
@@ -363,7 +454,33 @@ def test_schedule_step_not_capped_when_eviol_bounds():
     assert res.k_star_unconstrained == res.k_star
 
 
-# ---- select_vacate ----------------------------------------------------
+def test_schedule_step_threads_share_includes_parked():
+    # Parked reqs in |A+| shrink s → higher risk → a smaller admission k*.
+    # Step tail: P(L>x)=0.6 for x<7 (two such reqs ⇒ E_viol >= 1), else 0.
+    def tail(x):
+        return 0.6 if x < 7 else 0.0
+
+    # Two GPU measurables (H_q=20) plus two risk-free parked reqs that move
+    # |A+| only.
+    views = [_measurable(f"v{i}", 0, 20.0, tail) for i in range(2)] + [
+        _cpu(f"c{i}", 0, 20.0, lambda x: 0.0) for i in range(2)]
+    waiting = [_new_admit(f"w{i}") for i in range(5)]
+    inc = schedule_step(views, waiting, b=2, delta=1.0,
+                        kv_feasible=lambda k: True)
+    exc = schedule_step(views, waiting, b=2, delta=1.0,
+                        kv_feasible=lambda k: True,
+                        share_includes_parked=False)
+    assert inc.k_star < exc.k_star
+    # Each result must match build_plan under the same flag (threaded, not
+    # silently defaulted).
+    assert abs(inc.e_viol - build_plan(
+        views, waiting[:inc.k_star], 2, 1.0).e_viol) < 1e-9
+    assert abs(exc.e_viol - build_plan(
+        views, waiting[:exc.k_star], 2, 1.0,
+        share_includes_parked=False).e_viol) < 1e-9
+
+
+# ---- select_offload ---------------------------------------------------
 
 # Gentle vs steep tails → different M_cpu at (delta=1, s=1, lead=2, h=10):
 #   N_defer=9, N_defer_cpu=7.
@@ -373,64 +490,64 @@ _GENTLE = lambda x: max(0.0, 1.0 - x / 100.0)
 _STEEP = lambda x: max(0.0, 1.0 - x / 20.0)
 
 
-def test_select_vacate_zero_blocks_needed_is_empty():
+def test_select_offload_zero_blocks_needed_is_empty():
     a = _measurable("a", 0, 10.0, _GENTLE)
-    assert select_vacate([a], 1.0, 1.0, 2, eps=1.0, blocks_needed=0,
+    assert select_offload([a], 1.0, 1.0, 2, eps=1.0, blocks_needed=0,
                           blocks_of=lambda r: 5) == []
 
 
-def test_select_vacate_filters_by_eps():
+def test_select_offload_filters_by_eps():
     a = _measurable("a", 0, 10.0, _GENTLE)  # M_cpu ~0.02
     b = _measurable("b", 0, 10.0, _STEEP)  # M_cpu ~0.10
-    # eps excludes the steep one; only 'a' is vacate-eligible.
-    got = select_vacate([a, b], 1.0, 1.0, 2, eps=0.05, blocks_needed=100,
+    # eps excludes the steep one; only 'a' is offload-eligible.
+    got = select_offload([a, b], 1.0, 1.0, 2, eps=0.05, blocks_needed=100,
                         blocks_of=lambda r: 1)
     assert got == ["a"]
 
 
-def test_select_vacate_sorts_by_mcpu_then_meets_blocks():
+def test_select_offload_sorts_by_mcpu_then_meets_blocks():
     a = _measurable("a", 0, 10.0, _GENTLE)  # M_cpu ~0.02 (smaller)
     b = _measurable("b", 0, 10.0, _STEEP)  # M_cpu ~0.10 (larger)
     blocks = {"a": 3, "b": 5}
     # Ascending M_cpu → a first. blocks_needed=2 met by a alone.
-    got1 = select_vacate([b, a], 1.0, 1.0, 2, eps=1.0, blocks_needed=2,
+    got1 = select_offload([b, a], 1.0, 1.0, 2, eps=1.0, blocks_needed=2,
                          blocks_of=lambda r: blocks[r])
     assert got1 == ["a"]
     # blocks_needed=4 → a(3) then b(8) to cross the threshold.
-    got2 = select_vacate([b, a], 1.0, 1.0, 2, eps=1.0, blocks_needed=4,
+    got2 = select_offload([b, a], 1.0, 1.0, 2, eps=1.0, blocks_needed=4,
                          blocks_of=lambda r: blocks[r])
     assert got2 == ["a", "b"]
 
 
-def test_select_vacate_tiebreak_prefers_larger_block_count():
+def test_select_offload_tiebreak_prefers_larger_block_count():
     # Equal M_cpu (same tail) → larger block count first.
     a = _measurable("a", 0, 10.0, _GENTLE)
     b = _measurable("b", 0, 10.0, _GENTLE)
     blocks = {"a": 2, "b": 9}
-    got = select_vacate([a, b], 1.0, 1.0, 2, eps=1.0, blocks_needed=5,
+    got = select_offload([a, b], 1.0, 1.0, 2, eps=1.0, blocks_needed=5,
                         blocks_of=lambda r: blocks[r])
     assert got == ["b"]  # b's 9 blocks alone meets the need
 
 
-# ---- select_promote ---------------------------------------------------
+# ---- select_onload ----------------------------------------------------
 
-def test_select_promote_boundary_by_eps():
+def test_select_onload_boundary_by_eps():
     cheap = _cpu("cheap", 0, 10.0, _GENTLE)  # M_cpu ~0.02 → stay
-    costly = _cpu("costly", 0, 10.0, _STEEP)  # M_cpu ~0.10 → promote
-    got = select_promote([cheap, costly], 1.0, 1.0, 2, eps=0.05)
+    costly = _cpu("costly", 0, 10.0, _STEEP)  # M_cpu ~0.10 → onload
+    got = select_onload([cheap, costly], 1.0, 1.0, 2, eps=0.05)
     assert got == ["costly"]
 
 
-def test_select_promote_certain_miss_safety_net():
-    # Saturated tail → M_cpu = 0 (<= eps) but R_defer_cpu = 1 forces promote.
+def test_select_onload_certain_miss_safety_net():
+    # Saturated tail → M_cpu = 0 (<= eps) but R_defer_cpu = 1 forces onload.
     miss = _cpu("miss", 0, 10.0, lambda x: 1.0)
-    assert select_promote([miss], 1.0, 1.0, 2, eps=0.05) == ["miss"]
+    assert select_onload([miss], 1.0, 1.0, 2, eps=0.05) == ["miss"]
 
 
-def test_select_promote_skips_non_measurable_cpu():
+def test_select_onload_skips_non_measurable_cpu():
     prefill = ProgressView(
         "p", 0, None, PHASE_PREFILL, False, lambda x: 1.0, LOC_CPU)
-    assert select_promote([prefill], 1.0, 1.0, 2, eps=0.05) == []
+    assert select_onload([prefill], 1.0, 1.0, 2, eps=0.05) == []
 
 
 def test_pick_adaptive_batch_threads_lead_to_cpu_risk():
@@ -451,3 +568,70 @@ def test_pick_adaptive_batch_threads_lead_to_cpu_risk():
     # Default lead=0 keeps back-compat with existing call sites.
     _bd, plan_default = pick_adaptive_batch(views, 4, 1.0, [], lambda b: None)
     assert plan_default.e_viol == plan0.e_viol
+
+
+def test_pick_adaptive_batch_threads_share_includes_parked():
+    # 1 GPU + 3 parked, b=2: |A+| = 4 (parked in) → s = 0.5 vs |A+| = 1
+    # (parked out) → s = 1. The GPU req's R_run must follow the flag.
+    views = [_measurable("v1", 0, 11.0, _T1)] + [
+        _cpu(f"c{i}", 0, 11.0, _T2) for i in range(3)]
+    _bi, plan_inc = pick_adaptive_batch(views, 2, 1.0, [], lambda b: None)
+    _be, plan_exc = pick_adaptive_batch(views, 2, 1.0, [], lambda b: None,
+                                        share_includes_parked=False)
+    assert plan_inc.risks["v1"][0] > plan_exc.risks["v1"][0]
+
+
+# ---------------------------------------------------------------------------
+# Deadline-aware prefill token budget
+# ---------------------------------------------------------------------------
+
+# Δ_decode 80 ms, κ 1 ms/prefill-token, base 8192 tokens, floor 512, γ = 0.5.
+_PB = dict(delta_decode=0.08, kappa=0.001, base_budget=8192, floor=512,
+           gamma=0.5)
+
+
+def test_prefill_budget_grows_with_slack_and_saturates():
+    # t_min = 2 s → (0.5*2 - 0.08)/0.001 = 920 tokens.
+    assert prefill_budget(t_min=2.0, **_PB) == 920
+    # More slack → strictly more prefill allowed.
+    assert prefill_budget(t_min=4.0, **_PB) > prefill_budget(t_min=2.0, **_PB)
+    # Enough slack → saturates at the engine's base budget.
+    assert prefill_budget(t_min=1000.0, **_PB) == _PB["base_budget"]
+
+
+def test_prefill_budget_monotone_non_decreasing_in_t_min():
+    prev = 0
+    for t_min in (0.1, 0.5, 1.0, 2.0, 5.0, 20.0, 100.0):
+        cur = prefill_budget(t_min=t_min, **_PB)
+        assert cur >= prev
+        prev = cur
+
+
+def test_prefill_budget_overdue_clamps_to_floor():
+    # Already past the deadline → smallest budget that still makes progress.
+    assert prefill_budget(t_min=0.0, **_PB) == _PB["floor"]
+    assert prefill_budget(t_min=-3.0, **_PB) == _PB["floor"]
+    # Positive but tighter than the decode cost alone → also floor.
+    assert prefill_budget(t_min=0.01, **_PB) == _PB["floor"]
+
+
+def test_prefill_budget_disabled_returns_base():
+    # No κ estimate yet / degenerate κ → control off.
+    assert prefill_budget(t_min=1.0, **{**_PB, "kappa": 0.0}) == 8192
+    assert prefill_budget(t_min=1.0, **{**_PB, "kappa": -1.0}) == 8192
+    # Nothing measurable in flight → nothing to protect → control off.
+    assert prefill_budget(t_min=None, **_PB) == 8192
+
+
+def test_prefill_budget_stays_within_floor_and_base():
+    for t_min in (None, -10.0, 0.0, 0.05, 0.3, 1.0, 7.5, 1e6):
+        p = prefill_budget(t_min=t_min, **_PB)
+        assert _PB["floor"] <= p <= _PB["base_budget"]
+
+
+def test_prefill_budget_floor_above_base_never_exceeds_base():
+    # Misconfiguration guard: a floor above the engine's base budget must not
+    # push the result past base_budget (the control degrades to a no-op).
+    over = {**_PB, "floor": 20000}
+    for t_min in (None, -1.0, 0.0, 0.5, 3.0, 1e6):
+        assert prefill_budget(t_min=t_min, **over) == over["base_budget"]

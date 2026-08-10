@@ -70,12 +70,25 @@ class SsloConfig:
     # ProgressServe: min global-history samples above c_q required to trust
     # the empirical tail posterior (else the analytic cold-start fallback).
     progress_serve_min_denom: int = 4
+    # Admission criterion. False (default): admit while the ABSOLUTE
+    # E_viol(k) < 1. True: admit while the MARGINAL E_viol(k) - E_viol(0) < 1,
+    # i.e. budget only the extra expected violations this step's admissions
+    # cause, treating the risk already carried by in-flight requests as sunk.
+    # The absolute rule self-locks — once a few high-risk in-flight requests
+    # sum past 1, k* pins to 0 even with idle KV / compute. Under low load
+    # (E_viol(0) ~ 0) the two rules coincide.
+    # REJECTED experiment option (ablation A3, WORKLOG 2026-08-07): kept at
+    # False. Dropping the absolute test removes the only brake on the system's
+    # total risk — per-step e_viol accumulated to 16-41 (vs ~1) and violation
+    # rates worsened monotonically in request rate, degrading even plain
+    # kv_offload (e.g. cap128 offload 1.3-2.0% → 3.7-7.0%).
+    admission_delta_criterion: bool = False
     # When True, ProgressServe may shrink the decode batch (to a smaller
     # CUDA-graph-captured size) when E_viol(B) >= 1, trading throughput for a
     # lower per-iteration latency so the few urgent requests meet their
     # deadlines. See vllm.sslo.progress_serve.pick_adaptive_batch.
     adaptive_batching: bool = False
-    # KV offload tier. When True, ProgressServe may vacate the KV blocks of
+    # KV offload tier. When True, ProgressServe may offload the KV blocks of
     # slack-deep deferred requests to CPU (freeing GPU headroom) and prefetch
     # them back before their deadline approaches. Only valid under
     # method == "progress_serve".
@@ -85,14 +98,47 @@ class SsloConfig:
     # the risk math as N_defer_cpu = floor(max(H_q - 1 - lead, 0) * s).
     kv_onload_lead_iters: int = 2
     # Risk-penalty epsilon (in tail-posterior probability units) separating
-    # vacate-eligible from promote-eligible requests. A CPU stay is cheap
-    # (M_cpu <= eps) → vacate candidate; once the lead penalty surfaces in the
-    # risk (M_cpu > eps) → promote candidate.
+    # offload-eligible from onload-eligible requests. A CPU stay is cheap
+    # (M_cpu <= eps) → offload candidate; once the lead penalty surfaces in the
+    # risk (M_cpu > eps) → onload candidate.
     kv_offload_risk_eps: float = 1e-3
+    # Adopted default behaviour of the KV offload tier: count CPU-parked
+    # (offloaded) requests in the service-share denominator |A+|. Offloading
+    # frees memory, not compute: a parked request returns and reclaims its
+    # share, so excluding it inflates s, which underestimates M_cpu (→
+    # over-offload) and distorts the adaptive batch choice. Measured (ablation
+    # A1, WORKLOG 2026-08-07): fixes kv_offload's low-cap over-offload — cap32
+    # offloads 8→1 with +9-26% throughput and lower violation rate; higher caps
+    # unchanged.
+    # Affects the s term only — parked reqs still hold no decode slot and still
+    # enter E_viol as R_defer_cpu. Set False only to reproduce the pre-A1
+    # semantics.
+    kv_offload_share_includes_parked: bool = True
     # Anti-thrash guard: once onload completes, a request may not be
-    # re-vacated within this many scheduler steps. 0 disables. The step-count
+    # re-offloaded within this many scheduler steps. 0 disables. The step-count
     # check itself lives in the scheduler (stage 2); this is the knob only.
     kv_offload_min_residency_steps: int = 0
+    # Deadline-aware prefill token budget. Measured (cap128/rate2 baseline):
+    # prefill-carrying steps are only 6% of steps but 18.4% of the wall clock
+    # (Δ p90 463 ms vs 78 ms decode-only) — deadline misses come from the
+    # prefill spike, not decode concurrency. When True the scheduler caps the
+    # TOTAL prefill tokens of a step — chunked-prefill carry-over in the
+    # running loop plus new admits in the waiting loop, sharing one budget —
+    # at P* (progress_serve.prefill_budget). Decode tokens are never charged.
+    # Request concurrency and the service share s are left untouched, so this
+    # is throughput-neutral and does not interact with the offload tier.
+    # Requires method="progress_serve".
+    prefill_budget_control: bool = False
+    # Lower clamp on P* (tokens). Must be > 0 so prefill always makes
+    # progress under chunked prefill (no prefill starvation). Keep it well
+    # below the engine's max_num_batched_tokens: prefill_budget() clamps the
+    # floor to that base budget, so a floor at or above it turns the control
+    # into a silent no-op. SsloConfig cannot cross-validate this — it does not
+    # see SchedulerConfig.
+    prefill_budget_floor: int = 512
+    # Safety factor on t_min: at most this fraction of the most urgent
+    # in-flight request's remaining time may be spent on this step.
+    prefill_budget_gamma: float = 0.5
 
     def __post_init__(self) -> None:
         if self.method not in ("baseline", "progress_serve"):
@@ -182,3 +228,15 @@ class SsloConfig:
             raise ValueError(
                 "kv_offload_min_residency_steps must be >= 0 (0 disables), "
                 f"got {self.kv_offload_min_residency_steps}")
+        if self.prefill_budget_control and self.method != "progress_serve":
+            raise ValueError(
+                "prefill_budget_control requires method='progress_serve', "
+                f"got method={self.method!r}")
+        if self.prefill_budget_floor < 1:
+            raise ValueError(
+                "prefill_budget_floor must be >= 1 (prefill starvation), "
+                f"got {self.prefill_budget_floor}")
+        if not (0 < self.prefill_budget_gamma <= 1):
+            raise ValueError(
+                "prefill_budget_gamma must be in (0, 1], "
+                f"got {self.prefill_budget_gamma}")
