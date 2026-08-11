@@ -20,6 +20,7 @@ from vllm.sslo.progress_serve import (
     select_offload,
     service_share,
     token_budget_prefill,
+    token_budget_prefill_risk,
 )
 
 PHASE_PREFILL = 0
@@ -586,78 +587,71 @@ def test_pick_adaptive_batch_threads_share_includes_parked():
 # Token Budget — D axis (select_decode_defer)
 # ---------------------------------------------------------------------------
 
-# Δ_dec cells for decode sets of 5..2 requests (seconds). No cell below 2.
-_DDEC = {5: 0.30, 4: 0.24, 3: 0.18, 2: 0.12}.get
-_SAFE = lambda x: 0.0  # deep slack → R_defer = 0
+_SAFE = lambda x: 0.0  # deep slack → R_defer = 0, and no risk to save either
 _ATRISK = lambda x: 1.0  # certain miss → R_defer = 1
+# An urgent-but-savable request: its risk actually falls when the decode step
+# gets shorter, which is what makes a defer pay for itself.
+_URGENT = lambda x: max(0.0, 1.0 - x / 40.0)
 
 
-def test_select_decode_defer_shrinks_until_budget_fits():
-    # γ·t_min = 0.5 * 0.4 = 0.2 s. Δ_dec(5) = 0.30 and Δ_dec(4) = 0.24 break
-    # it, Δ_dec(3) = 0.18 fits → exactly two defers, deepest slack first.
-    views = [_measurable(f"v{i}", 0, float(10 + i), _SAFE) for i in range(5)]
-    got = select_decode_defer(views, 1.0, 1.0, t_min=0.4, gamma=0.5, eps=1e-3,
-                              delta_decode_of=_DDEC)
-    assert got == ["v4", "v3"]
+def test_select_decode_defer_accepts_while_e_viol_improves():
+    # 1 urgent (T_q = 10 s) + 3 deep-slack requests. Δ_dec(4) = 1.0 s →
+    # R_run(urgent) = 0.75. Deferring one shortens the step to 0.5 s, which
+    # buys the urgent request a longer horizon (R_run 0.75 → 0.625) for the
+    # price of a smaller service share — E_viol drops, so the defer is taken.
+    # The next one (Δ_dec(2) = 0.4 s) no longer pays: the share loss outweighs
+    # the shorter step (0.675), so the search stops there.
+    views = [_measurable("u", 0, 10.0, _URGENT)] + [
+        _measurable(f"s{i}", 0, float(20 + i), _SAFE) for i in range(3)]
+    got = select_decode_defer(views, 1.0, 1.0, eps=1e-3,
+                              delta_decode_of={4: 1.0, 3: 0.5, 2: 0.4}.get)
+    assert got == ["s2"]  # deepest slack first, and only while it improves
+
+
+def test_select_decode_defer_no_op_when_no_defer_improves():
+    # (a) Every in-flight request is doomed (R_run = R_defer = 1): E_viol is
+    # flat in the decode set size, so the marginal value of a defer is 0 and
+    # the axis stays out of the way — the sunk-cost case the γ·t_min rule
+    # needed an explicit overdue guard for.
+    doomed = [_measurable(f"d{i}", 0, float(10 + i), _ATRISK) for i in range(4)]
+    assert select_decode_defer(doomed, 1.0, 1.0, eps=1e-3,
+                               delta_decode_of={4: 1.0, 3: 0.5}.get) == []
+    # (b) Same population as the accepting case, but the shorter step barely
+    # differs (1.0 → 0.99 s), so the lost service share dominates.
+    views = [_measurable("u", 0, 10.0, _URGENT)] + [
+        _measurable(f"s{i}", 0, float(20 + i), _SAFE) for i in range(3)]
+    assert select_decode_defer(views, 1.0, 1.0, eps=1e-3,
+                               delta_decode_of={4: 1.0, 3: 0.99}.get) == []
+    # (c) Deadlines far away (the read workload) → nothing to save.
+    relaxed = [_measurable(f"v{i}", 0, 100.0, _SAFE) for i in range(4)]
+    assert select_decode_defer(relaxed, 1.0, 1.0, eps=1e-3,
+                               delta_decode_of={4: 1.0, 3: 0.5}.get) == []
 
 
 def test_select_decode_defer_never_drops_forced_or_at_risk():
-    # D_floor = forced + at-risk. γ·t_min = 0.5*0.3 = 0.15 s; the floor size
-    # D'=2 (Δ_dec=0.12) fits, so shrinking is worthwhile and runs all the way
-    # down — yet only the three defer-safe reqs may go: the PREFILL one is not
+    # D_floor = forced + at-risk. Shrinking keeps paying here (Δ_dec 1.0 →
+    # 0.5 → 0.3 s), so the search runs until the candidates are exhausted —
+    # yet only the two defer-safe reqs may go: the PREFILL one is not
     # measurable and the R_defer = 1 one fails the eps test.
-    views = [_forced("f0"), _measurable("hot", 0, 10.0, _ATRISK)] + [
-        _measurable(f"safe{i}", 0, float(11 + i), _SAFE) for i in range(3)]
-    got = select_decode_defer(views, 1.0, 1.0, t_min=0.3, gamma=0.5, eps=1e-3,
-                              delta_decode_of=_DDEC)
-    assert got == ["safe2", "safe1", "safe0"]
-    assert len(views) - len(got) == 2  # D' = D_floor
-
-
-def test_select_decode_defer_no_op_with_deadline_slack():
-    # Deadlines far away (the read workload, H_q >> 1) → the axis never fires.
-    views = [_measurable(f"v{i}", 0, 100.0, _SAFE) for i in range(5)]
-    assert select_decode_defer(views, 1.0, 1.0, t_min=100.0, gamma=0.5,
-                               eps=1e-3, delta_decode_of=_DDEC) == []
-    # Nothing measurable in the decode set → no deadline to protect.
-    assert select_decode_defer(views, 1.0, 1.0, t_min=None, gamma=0.5,
-                               eps=1e-3, delta_decode_of=_DDEC) == []
-
-
-def test_select_decode_defer_no_op_when_overdue():
-    # The tightest deadline is already missed (t_min <= 0): the current unit is
-    # sunk and no shrink can save it, so the axis must not fire (else an
-    # oversaturated trace would defer for unreachable deadlines every step).
-    views = [_measurable(f"v{i}", 0, float(10 + i), _SAFE) for i in range(5)]
-    assert select_decode_defer(views, 1.0, 1.0, t_min=0.0, gamma=0.5,
-                               eps=1e-3, delta_decode_of=_DDEC) == []
-    assert select_decode_defer(views, 1.0, 1.0, t_min=-1.0, gamma=0.5,
-                               eps=1e-3, delta_decode_of=_DDEC) == []
-
-
-def test_select_decode_defer_reverts_when_unsatisfiable():
-    # γ·t_min = 0.1 s is below every reachable Δ_dec — the floor D'=2 (0.12) is
-    # still over budget and D'=1 has no cell. Shrinking cannot meet the budget,
-    # so paying the throughput cost buys nothing → revert to no defers.
-    views = [_measurable(f"v{i}", 0, float(10 + i), _SAFE) for i in range(5)]
-    assert select_decode_defer(views, 1.0, 1.0, t_min=0.2, gamma=0.5,
-                               eps=1e-3, delta_decode_of=_DDEC) == []
+    views = [_forced("f0"), _measurable("hot", 0, 10.0, _ATRISK),
+             _measurable("u", 0, 10.0, _URGENT)] + [
+        _measurable(f"safe{i}", 0, float(20 + i), _SAFE) for i in range(2)]
+    got = select_decode_defer(views, 1.0, 1.0, eps=1e-3,
+                              delta_decode_of={5: 1.0, 4: 0.5, 3: 0.3}.get)
+    assert got == ["safe1", "safe0"]
+    assert len(views) - len(got) == 3  # D' = D_floor = forced + hot + u
 
 
 def test_select_decode_defer_stops_without_batch_matched_cell():
-    views = [_measurable(f"v{i}", 0, float(10 + i), _SAFE) for i in range(5)]
-    # γ·t_min = 0.2 s. Cell for 4 (0.24) is over budget and cell for 3 is
-    # missing, so the search cannot verify that shrinking further reaches the
-    # budget — no fallback average (R5) → revert to no defers.
-    assert select_decode_defer(views, 1.0, 1.0, t_min=0.4, gamma=0.5, eps=1e-3,
-                               delta_decode_of={5: 0.30, 4: 0.24}.get) == []
-    # A reached size that already fits is kept even if the deeper cell is gone.
-    got = select_decode_defer(views, 1.0, 1.0, t_min=0.4, gamma=0.5, eps=1e-3,
-                              delta_decode_of={5: 0.30, 4: 0.18}.get)
-    assert got == ["v4"]
+    views = [_measurable("u", 0, 10.0, _URGENT)] + [
+        _measurable(f"s{i}", 0, float(20 + i), _SAFE) for i in range(3)]
+    # No cell for the size below the current one → the search cannot price the
+    # shrink and stops rather than falling back to a cross-batch average (R5).
+    assert select_decode_defer(views, 1.0, 1.0, eps=1e-3,
+                               delta_decode_of={4: 1.0}.get) == []
     # No cell for the current size either → the axis stays off.
-    assert select_decode_defer(views, 1.0, 1.0, t_min=0.4, gamma=0.5,
-                               eps=1e-3, delta_decode_of=lambda n: None) == []
+    assert select_decode_defer(views, 1.0, 1.0, eps=1e-3,
+                               delta_decode_of=lambda n: None) == []
 
 
 def test_select_decode_defer_eligibility_is_self_limiting():
@@ -665,21 +659,102 @@ def test_select_decode_defer_eligibility_is_self_limiting():
     # rises until it crosses eps and the request stops being defer-safe —
     # which is why the axis needs no starvation counter.
     tail = lambda x: max(0.0, 1.0 - x / 10.0)
-    forced = [_forced(f"f{i}") for i in range(4)]
-    # γ·t_min = 0.25 s; deferring the one measurable req reaches D'=4
-    # (Δ_dec=0.24 <= 0.25), so the shrink is satisfiable and runs.
-    kw = dict(t_min=0.5, gamma=0.5, eps=1e-3, delta_decode_of=_DDEC)
+    # Two forced fillers so "v" is the only defer candidate; deferring it
+    # shortens the step for the urgent request, so the defer does pay.
+    others = [_forced("f0"), _forced("f1"),
+              _measurable("u", 0, 10.0, _URGENT)]
+    kw = dict(eps=1e-3, delta_decode_of={4: 1.0, 3: 0.5}.get)
     # T_q = 20 → N_defer = 19 → R_defer = tail(19) = 0 → defer-safe.
-    fresh = [_measurable("v", 0, 20.0, tail)] + forced
+    fresh = [_measurable("v", 0, 20.0, tail)] + others
     assert select_decode_defer(fresh, 1.0, 1.0, **kw) == ["v"]
     # Same request several defers later: T_q = 5 → N_defer = 4 →
     # R_defer = 0.6 > eps → it keeps its slot.
-    stale = [_measurable("v", 0, 5.0, tail)] + forced
+    stale = [_measurable("v", 0, 5.0, tail)] + others
     assert select_decode_defer(stale, 1.0, 1.0, **kw) == []
 
 
 # ---------------------------------------------------------------------------
-# Token Budget — P axis (TB*_pre)
+# Token Budget — P axis (TB*_pre, risk dosing)
+# ---------------------------------------------------------------------------
+
+# Δ_dec(D') 80 ms, κ_p 1 ms/prefill-token, base 8192 tokens, floor 512.
+_PBR = dict(b=8, delta_dec=0.08, kappa_p=0.001, base_budget=8192, floor=512,
+            eps_p=0.01)
+
+
+def _tb_oracle(views, **kw):
+    """Brute-force max{P in [floor, base] : E(P) - E(0) <= eps_p}, plus the
+    feasibility sequence so the test can assert the monotonicity the bisection
+    relies on."""
+    def e_at(p):
+        return build_plan(views, [], kw["b"],
+                          kw["delta_dec"] + kw["kappa_p"] * p).e_viol
+    base_e = e_at(0)
+    feasible = [e_at(p) - base_e <= kw["eps_p"]
+                for p in range(kw["floor"], kw["base_budget"] + 1)]
+    best = kw["floor"]
+    for i, ok in enumerate(feasible):
+        if ok:
+            best = kw["floor"] + i
+    return best, feasible
+
+
+def test_token_budget_prefill_risk_doomed_in_flight_does_not_throttle():
+    # The recovery case that killed the γ·t_min rule: the survivors hold
+    # near-zero time to their deadlines but are unsavable (R = 1 either way),
+    # so E_viol does not move with P and the full base budget is released for
+    # the refill. The old worst-case rule read the same state as t_min = 0.2 s
+    # and pinned the step to the floor.
+    views = [_measurable(f"d{i}", 0, 0.2, _ATRISK) for i in range(4)]
+    assert token_budget_prefill_risk(views, **_PBR) == 8192
+    assert token_budget_prefill(t_min=0.2, delta_decode=0.08, kappa=0.001,
+                                base_budget=8192, floor=512, gamma=0.5) == 512
+
+
+def test_token_budget_prefill_risk_slack_returns_base():
+    # Nothing at risk → the dosing never binds.
+    views = [_measurable(f"v{i}", 0, 100.0, _SAFE) for i in range(4)]
+    assert token_budget_prefill_risk(views, **_PBR) == 8192
+
+
+def test_token_budget_prefill_risk_stops_at_eps_and_matches_brute_force():
+    # One sensitive in-flight request: every extra prefill token stretches the
+    # step, shrinking its horizon, so E_viol climbs with P and the dose stops
+    # where the climb reaches eps_p. Bisection must land on the same integer a
+    # linear scan does (small range so the scan is cheap).
+    kw = {**_PBR, "base_budget": 400, "floor": 10, "eps_p": 0.005}
+    gentle = lambda x: max(0.0, 1.0 - x / 2000.0)
+    views = [_measurable("u", 0, 2.0, gentle)] + [
+        _measurable(f"s{i}", 0, 100.0, _SAFE) for i in range(3)]
+    got = token_budget_prefill_risk(views, **kw)
+    oracle, feasible = _tb_oracle(views, **kw)
+    assert got == oracle
+    assert kw["floor"] < got < kw["base_budget"]  # the dosing actually binds
+    # E_viol is non-decreasing in P, i.e. feasibility is a prefix — the
+    # premise the bisection stands on.
+    assert feasible == sorted(feasible, reverse=True)
+
+
+def test_token_budget_prefill_risk_disabled_returns_base():
+    views = [_measurable("u", 0, 2.0, _URGENT)]
+    # No κ estimate yet / degenerate κ → control off.
+    assert token_budget_prefill_risk(views, **{**_PBR, "kappa_p": 0.0}) == 8192
+    assert token_budget_prefill_risk(views, **{**_PBR, "kappa_p": -1.0}) == 8192
+    # Nothing measurable in flight → no ledger to protect → control off.
+    assert token_budget_prefill_risk([_forced("f0")], **_PBR) == 8192
+
+
+def test_token_budget_prefill_risk_stays_within_floor_and_base():
+    views = [_measurable("u", 0, 0.5, _URGENT),
+             _measurable("d", 0, 0.1, _ATRISK)]
+    for floor in (1, 512, 8192, 20000):  # incl. floor above base (no-op)
+        p = token_budget_prefill_risk(views, **{**_PBR, "floor": floor})
+        assert min(floor, 8192) <= p <= 8192
+
+
+# ---------------------------------------------------------------------------
+# Token Budget — P axis, DEPRECATED worst-case rule (token_budget_prefill)
+# Kept for the A/B replay of γ·t_min against the risk dosing above.
 # ---------------------------------------------------------------------------
 
 # Δ_decode 80 ms, κ 1 ms/prefill-token, base 8192 tokens, floor 512, γ = 0.5.

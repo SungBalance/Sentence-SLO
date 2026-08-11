@@ -136,30 +136,43 @@ def test_kv_offload_requires_progress_serve():
     assert cfg.kv_offload is True
 
 
-def test_prefill_budget_defaults():
+def test_token_budget_defaults():
     cfg = SsloConfig()
-    assert cfg.prefill_budget_control is False
-    assert cfg.prefill_budget_floor == 512
-    assert cfg.prefill_budget_gamma == 0.5
+    assert cfg.token_budget_control is False
+    assert cfg.token_budget_prefill_floor == 512
+    assert cfg.token_budget_risk_eps == 0.01
+    assert cfg.token_budget_gamma == 0.5
+    assert cfg.token_budget_decode_risk_eps == 1e-3
 
 
-def test_prefill_budget_control_requires_progress_serve():
-    with pytest.raises(ValueError, match="prefill_budget_control"):
-        SsloConfig(prefill_budget_control=True)  # method defaults to baseline
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
-    assert cfg.prefill_budget_control is True
+def test_token_budget_control_requires_progress_serve():
+    with pytest.raises(ValueError, match="token_budget_control"):
+        SsloConfig(token_budget_control=True)  # method defaults to baseline
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True)
+    assert cfg.token_budget_control is True
 
 
 @pytest.mark.parametrize("value", [0, -1])
-def test_prefill_budget_floor_must_be_positive(value):
-    with pytest.raises(ValueError, match="prefill_budget_floor"):
-        SsloConfig(prefill_budget_floor=value)
+def test_token_budget_prefill_floor_must_be_positive(value):
+    with pytest.raises(ValueError, match="token_budget_prefill_floor"):
+        SsloConfig(token_budget_prefill_floor=value)
 
 
 @pytest.mark.parametrize("value", [0.0, -0.1, 1.5])
-def test_prefill_budget_gamma_range(value):
-    with pytest.raises(ValueError, match="prefill_budget_gamma"):
-        SsloConfig(prefill_budget_gamma=value)
+def test_token_budget_gamma_range(value):
+    with pytest.raises(ValueError, match="token_budget_gamma"):
+        SsloConfig(token_budget_gamma=value)
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1])
+def test_token_budget_risk_eps_must_be_positive(value):
+    with pytest.raises(ValueError, match="token_budget_risk_eps"):
+        SsloConfig(token_budget_risk_eps=value)
+
+
+def test_token_budget_decode_risk_eps_rejects_negative():
+    with pytest.raises(ValueError, match="token_budget_decode_risk_eps"):
+        SsloConfig(token_budget_decode_risk_eps=-0.1)
 
 
 @pytest.mark.parametrize(

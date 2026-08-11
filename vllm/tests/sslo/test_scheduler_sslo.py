@@ -179,7 +179,8 @@ def make_scheduler(
     scheduler.finished_req_ids = set()
     scheduler.use_pp = False
     scheduler.log_stats = False
-    scheduler.scheduler_config = SimpleNamespace(async_scheduling=False)
+    scheduler.scheduler_config = SimpleNamespace(
+        async_scheduling=False, enable_chunked_prefill=False)
     scheduler._update_after_schedule = lambda output: None
     # SSLO: __init__ normally patches _apply_sslo_policy based on method;
     # tests bypass __init__ via __new__, so do it here.
@@ -729,7 +730,8 @@ def _waiting_request(request_id, num_tokens=1):
     return req
 
 
-def _prep_schedule_sslo(scheduler, *, budget, cur_max, monkeypatch):
+def _prep_schedule_sslo(scheduler, *, budget, cur_max, monkeypatch,
+                        tb_prefill=None):
     # Attrs the real waiting loop / output construction read but which
     # make_scheduler (bypassing __init__) does not set.
     scheduler.max_num_scheduled_tokens = 1000
@@ -748,6 +750,9 @@ def _prep_schedule_sslo(scheduler, *, budget, cur_max, monkeypatch):
     def stub_policy(now):
         scheduler._sslo_step.waiting_admission_budget = budget
         scheduler._sslo_step.cur_max_num_requests = cur_max
+        # The real policy records TB*_pre here (stage ⑤) for the running /
+        # waiting loops to spend; `tb_prefill` injects it.
+        scheduler._sslo_step.token_budget_prefill = tb_prefill
         return {}
 
     scheduler._apply_sslo_policy = stub_policy
@@ -861,7 +866,7 @@ def _carryover_request(request_id, *, computed, prompt):
         lora_request=None, num_preemptions=0)
 
 
-def _prep_prefill_budget(scheduler, *, kappa=0.001, delta_decode=0.08):
+def _prep_token_budget_prefill(scheduler, *, kappa=0.001, delta_decode=0.08):
     """Arm the prefill-budget control: κ estimate + decode-only Δ cell."""
     scheduler.max_num_scheduled_tokens = 8192
     scheduler.scheduler_config = SimpleNamespace(
@@ -873,109 +878,151 @@ def _prep_prefill_budget(scheduler, *, kappa=0.001, delta_decode=0.08):
     scheduler._sslo_step_wall_ema = {len(scheduler.running): {0: delta_decode}}
 
 
-def test_prefill_budget_off_by_default(monkeypatch):
+def _tb_prefill(scheduler):
+    """Call the P axis with the ledger the policy hands it: ProgressViews over
+    the in-flight set, the step's batch size, and D' = len(running)."""
+    views = [
+        ps.ProgressView(
+            request_id=req.request_id,
+            c_q=req.slo_state.current_chunk_generated_len,
+            T_q=req.slo_state.time_to_deadline(0.0),
+            phase=int(req.slo_state.phase), is_new_admit=False,
+            tail_prob=req.slo_state.length_tail_prob)
+        for req in scheduler.running
+    ]
+    return scheduler._sslo_prefill_token_budget(
+        views, scheduler.max_num_running_reqs, len(scheduler.running), 0, True)
+
+
+def _tb_request(request_id, *, deadline, tail):
+    req = make_request(request_id, make_state(deadline=deadline))
+    req.slo_state.length_tail_prob = tail
+    return req
+
+
+# A request whose risk actually moves with the step time (the cold-start tail
+# make_state ships is a step function at 2048 tokens, i.e. flat R = 1 for any
+# realistic horizon, which would read as "doomed" and never dose).
+_TB_SENSITIVE = lambda x: max(0.0, 1.0 - x / 2000.0)
+
+
+def test_token_budget_prefill_off_by_default(monkeypatch):
     # Control off → no budget, and a waiting request's full prompt is
     # scheduled exactly as before (regression guard).
     scheduler = make_scheduler(running=[], max_num_running_reqs=8)
-    _prep_prefill_budget(scheduler)
-    assert scheduler._sslo_prefill_token_budget(0.0) is None
+    _prep_token_budget_prefill(scheduler)
+    assert _tb_prefill(scheduler) is None
 
     scheduler.waiting = FakeWaitingQueue([_waiting_request("n0", 40)])
     _prep_schedule_sslo(scheduler, budget=4, cur_max=8, monkeypatch=monkeypatch)
     output = scheduler.schedule_sslo()
 
     assert output.num_scheduled_tokens["n0"] == 40
-    assert scheduler._sslo_step.prefill_budget is None
+    assert scheduler._sslo_step.token_budget_prefill is None
 
 
-def test_prefill_budget_requires_kappa_and_decode_reference():
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
-    r = make_request("r0", make_state(deadline=10.0))
+def test_token_budget_prefill_requires_kappa_and_decode_reference():
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True)
+    r = _tb_request("r0", deadline=10.0, tail=_TB_SENSITIVE)
     scheduler = make_scheduler(running=[r], cfg=cfg)
-    _prep_prefill_budget(scheduler)
+    _prep_token_budget_prefill(scheduler)
 
     # No κ sample yet → control stays off.
     scheduler._sslo_kappa_excess_ema = None
     scheduler._sslo_kappa_tokens_ema = None
-    assert scheduler._sslo_prefill_token_budget(0.0) is None
+    assert _tb_prefill(scheduler) is None
     # Non-positive κ (prefill steps no slower than the decode-only baseline)
     # is not a usable estimate either → control stays off.
-    _prep_prefill_budget(scheduler)
+    _prep_token_budget_prefill(scheduler)
     scheduler._sslo_kappa_excess_ema = -1.0
-    assert scheduler._sslo_prefill_token_budget(0.0) is None
+    assert _tb_prefill(scheduler) is None
     # No decode-only wall-EMA cell → control stays off.
-    _prep_prefill_budget(scheduler)
+    _prep_token_budget_prefill(scheduler)
     scheduler._sslo_step_wall_ema = {1: {2: 0.4}}
-    assert scheduler._sslo_prefill_token_budget(0.0) is None
+    assert _tb_prefill(scheduler) is None
 
 
-def test_prefill_budget_tracks_urgency():
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True,
-                     prefill_budget_floor=512, prefill_budget_gamma=0.5)
-    # Deadline far away → the control does not bind (full base budget).
-    relaxed = make_request("relaxed", make_state(deadline=1e6))
+def test_token_budget_prefill_doses_by_risk():
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True,
+                     token_budget_prefill_floor=64)
+    # Nothing at risk → the dosing does not bind (full base budget).
+    relaxed = _tb_request("relaxed", deadline=1e6, tail=_TB_SENSITIVE)
     scheduler = make_scheduler(running=[relaxed], cfg=cfg)
-    _prep_prefill_budget(scheduler)
-    assert scheduler._sslo_prefill_token_budget(0.0) == 8192
+    _prep_token_budget_prefill(scheduler)
+    assert _tb_prefill(scheduler) == 8192
 
-    # Deadline already passed → floor.
-    urgent = make_request("urgent", make_state(deadline=-1.0))
-    scheduler = make_scheduler(running=[urgent], cfg=cfg)
-    _prep_prefill_budget(scheduler)
-    assert scheduler._sslo_prefill_token_budget(0.0) == 512
+    # Overdue AND unsavable (R = 1 whatever the step time): its risk is sunk,
+    # so it must not throttle the refill. The γ·t_min rule returned floor here.
+    doomed = _tb_request("doomed", deadline=-1.0, tail=lambda x: 1.0)
+    scheduler = make_scheduler(running=[doomed], cfg=cfg)
+    _prep_token_budget_prefill(scheduler)
+    assert _tb_prefill(scheduler) == 8192
 
-    # t_min = 2 s → (0.5*2 - 0.08)/0.001 = 920 tokens.
-    mid = make_request("mid", make_state(deadline=2.0))
+    # Savable request under time pressure → the dose stops strictly inside
+    # [floor, base], and a looser ε_p buys strictly more prefill.
+    mid = _tb_request("mid", deadline=2.0, tail=_TB_SENSITIVE)
     scheduler = make_scheduler(running=[mid], cfg=cfg)
-    _prep_prefill_budget(scheduler)
-    assert scheduler._sslo_prefill_token_budget(0.0) == 920
+    _prep_token_budget_prefill(scheduler)
+    tight = _tb_prefill(scheduler)
+    assert 64 < tight < 8192
+
+    loose_cfg = SsloConfig(method="progress_serve", token_budget_control=True,
+                           token_budget_prefill_floor=64,
+                           token_budget_risk_eps=10 * cfg.token_budget_risk_eps)
+    scheduler = make_scheduler(
+        running=[_tb_request("mid", deadline=2.0, tail=_TB_SENSITIVE)],
+        cfg=loose_cfg)
+    _prep_token_budget_prefill(scheduler)
+    assert _tb_prefill(scheduler) > tight
 
 
-def test_prefill_budget_starvation_guard_releases_base_budget():
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
-    urgent = make_request("urgent", make_state(deadline=-1.0))
+def test_token_budget_prefill_starvation_guard_releases_base_budget():
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True)
+    # Under pressure the dose lands below the 512-token floor, so every step
+    # is floor-clamped.
+    urgent = _tb_request("urgent", deadline=2.0, tail=_TB_SENSITIVE)
     scheduler = make_scheduler(running=[urgent], cfg=cfg)
-    _prep_prefill_budget(scheduler)
+    _prep_token_budget_prefill(scheduler)
     # No prefill progress at all while pinned to the floor.
     scheduler._sslo_prev_step_prefill_tokens = 0
 
-    floor = cfg.prefill_budget_floor
+    floor = cfg.token_budget_prefill_floor
     for _ in range(_SSLO_PREFILL_FLOOR_STARVE_STEPS - 1):
-        assert scheduler._sslo_prefill_token_budget(0.0) == floor
+        assert _tb_prefill(scheduler) == floor
     # Streak exhausted → one step at the full base budget, streak reset.
-    assert scheduler._sslo_prefill_token_budget(0.0) == 8192
+    assert _tb_prefill(scheduler) == 8192
     assert scheduler._sslo_prefill_floor_streak == 0
     # Prefill did make progress → streak never accumulates.
     scheduler._sslo_prev_step_prefill_tokens = 100
     for _ in range(_SSLO_PREFILL_FLOOR_STARVE_STEPS + 5):
-        assert scheduler._sslo_prefill_token_budget(0.0) == floor
+        assert _tb_prefill(scheduler) == floor
 
 
-def test_prefill_budget_caps_waiting_loop_prefill_tokens(monkeypatch):
-    # P* = 30: n0 takes its full 20-token prompt, n1 is chunked to the
+def test_token_budget_prefill_caps_waiting_loop_prefill_tokens(monkeypatch):
+    # TB*_pre = 30: n0 takes its full 20-token prompt, n1 is chunked to the
     # remaining 10, n2 is left for the next step.
     scheduler = make_scheduler(running=[], max_num_running_reqs=8)
     scheduler.waiting = FakeWaitingQueue(
         [_waiting_request(f"n{i}", 20) for i in range(3)])
-    _prep_schedule_sslo(scheduler, budget=3, cur_max=8, monkeypatch=monkeypatch)
-    scheduler._sslo_prefill_token_budget = lambda now: 30
+    _prep_schedule_sslo(scheduler, budget=3, cur_max=8,
+                        monkeypatch=monkeypatch, tb_prefill=30)
 
     output = scheduler.schedule_sslo()
 
     assert output.num_scheduled_tokens == {"n0": 20, "n1": 10}
     assert sum(output.num_scheduled_tokens.values()) == 30
     assert request_ids(scheduler.waiting) == ["n2"]
-    assert scheduler._sslo_step.prefill_budget == 30
+    assert scheduler._sslo_step.token_budget_prefill == 30
 
 
-def test_prefill_budget_does_not_cap_decode(monkeypatch):
+def test_token_budget_prefill_does_not_cap_decode(monkeypatch):
     # An exhausted prefill budget must not touch the running set's decode
     # tokens — only the waiting-queue prefill is bounded.
     decoding = _decoding_request("d0")
     scheduler = make_scheduler(running=[decoding], max_num_running_reqs=8)
     scheduler.waiting = FakeWaitingQueue([_waiting_request("n0", 20)])
-    _prep_schedule_sslo(scheduler, budget=3, cur_max=8, monkeypatch=monkeypatch)
-    scheduler._sslo_prefill_token_budget = lambda now: 0
+    _prep_schedule_sslo(scheduler, budget=3, cur_max=8,
+                        monkeypatch=monkeypatch, tb_prefill=0)
 
     output = scheduler.schedule_sslo()
 
@@ -983,19 +1030,100 @@ def test_prefill_budget_does_not_cap_decode(monkeypatch):
     assert request_ids(scheduler.waiting) == ["n0"]  # prefill fully blocked
 
 
-def test_step_stats_records_prefill_budget(monkeypatch, tmp_path):
+def _d_axis_scheduler(cfg=None):
+    """One savable-but-pressed request + two deep-slack ones, with Δ_dec cells
+    for batch 3 and 2.
+
+    Deferring one request halves the decode step (1.0 s → 0.5 s), which buys r0
+    a longer horizon: E_viol 0.75 → 0.675. So a control that is on defers
+    exactly one request, then stops (no Δ_dec cell for 1).
+    """
+    reqs = [_tb_request("r0", deadline=10.0, tail=lambda x: max(0.0, 1 - x / 40))]
+    # R_defer = 0 → defer-safe, and nothing of their own to lose.
+    reqs += [_tb_request(f"r{i}", deadline=20.0 + i, tail=lambda x: 0.0)
+             for i in (1, 2)]
+    scheduler = make_scheduler(running=reqs, max_num_running_reqs=4, cfg=cfg)
+    scheduler._sslo_step_wall_ema = {3: {0: 1.0}, 2: {0: 0.5}}
+    return scheduler
+
+
+def test_token_budget_d_axis_defers_deepest_slack_request():
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True)
+    scheduler = _d_axis_scheduler(cfg)
+
+    scheduler._apply_sslo_policy(0.0)
+
+    # r2 holds the most slack (deadline 21) → it is the one that gives up its
+    # slot; r0 is under pressure (R_defer > eps) and is never a candidate.
+    assert request_ids(scheduler.running) == ["r0", "r1"]
+    assert request_ids(scheduler.sslo_pending) == ["r2"]
+    assert scheduler._sslo_step.token_budget_decode == 2
+    assert scheduler._sslo_step.token_budget_d_defers == 1
+
+
+def test_token_budget_d_axis_off_by_default():
+    # Same pressure, control off → the decode set is untouched and the D-axis
+    # diagnostics stay unset.
+    scheduler = _d_axis_scheduler()
+
+    scheduler._apply_sslo_policy(0.0)
+
+    assert request_ids(scheduler.running) == ["r0", "r1", "r2"]
+    assert scheduler.sslo_pending == []
+    assert scheduler._sslo_step.token_budget_decode is None
+    assert scheduler._sslo_step.token_budget_d_defers == 0
+
+
+def test_token_budget_d_axis_no_op_with_deadline_slack():
+    # Deadlines far away (read workload) → nobody's risk moves with the step
+    # time, so no defer lowers E_viol and D' = D_policy even with the control
+    # on.
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True)
+    scheduler = _d_axis_scheduler(cfg)
+    for req in scheduler.running:
+        req.slo_state.next_deadline_ts = 1e6
+
+    scheduler._apply_sslo_policy(0.0)
+
+    assert request_ids(scheduler.running) == ["r0", "r1", "r2"]
+    assert scheduler._sslo_step.token_budget_decode == 3
+    assert scheduler._sslo_step.token_budget_d_defers == 0
+
+
+def test_token_budget_p_axis_is_recorded_by_the_policy():
+    # Wiring: the policy computes TB*_pre at stage ⑤ — after the D axis fixed
+    # D' — and records it on the step state; schedule_sslo's running / waiting
+    # loops spend exactly what was recorded.
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True,
+                     token_budget_prefill_floor=64)
+    r = _tb_request("r0", deadline=2.0, tail=_TB_SENSITIVE)
+    scheduler = make_scheduler(running=[r], cfg=cfg)
+    _prep_token_budget_prefill(scheduler)
+
+    scheduler._apply_sslo_policy(0.0)
+
+    # r0 is itself at risk (R_defer > eps) → no D-axis defer, D' = 1.
+    assert scheduler._sslo_step.token_budget_decode == 1
+    assert 64 < scheduler._sslo_step.token_budget_prefill < 8192
+
+
+def test_step_stats_records_token_budget(monkeypatch, tmp_path):
     stats_path = tmp_path / "scheduler_stats.jsonl"
     monkeypatch.setenv("SSLO_STATS_LOG_PATH", str(stats_path))
     scheduler = make_scheduler(running=[])
     scheduler.kv_cache_manager.block_pool.num_gpu_blocks = 1_000_000
-    scheduler._sslo_step.prefill_budget = 920
+    scheduler._sslo_step.token_budget_prefill = 920
+    scheduler._sslo_step.token_budget_decode = 12
+    scheduler._sslo_step.token_budget_d_defers = 3
     scheduler._sslo_kappa_excess_ema = 1.0
     scheduler._sslo_kappa_tokens_ema = 1000.0
 
     scheduler._sslo_dump_step_stats(0.0)
 
     row = json.loads(stats_path.read_text().splitlines()[0])
-    assert row["prefill_budget"] == 920
+    assert row["token_budget_prefill"] == 920
+    assert row["token_budget_decode"] == 12
+    assert row["token_budget_d_defers"] == 3
     assert row["prefill_kappa_ms_per_tok"] == 1.0
 
 
@@ -1010,7 +1138,7 @@ def _kappa_sample(scheduler, *, prefill_tokens, delta, batch=4):
 
 
 def test_kappa_ema_updates_from_prefill_step():
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True,
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True,
                      tpot_ema_alpha=1.0)
     scheduler = make_scheduler(running=[], cfg=cfg)
     # Previous step: batch 4, 2 prefill reqs carrying 100 prefill tokens,
@@ -1028,7 +1156,7 @@ def test_kappa_ema_updates_from_prefill_step():
 
 
 def test_kappa_ema_skips_decode_only_steps():
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True,
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True,
                      tpot_ema_alpha=1.0)
     scheduler = make_scheduler(running=[], cfg=cfg)
     scheduler._sslo_step_wall_ema = {4: {0: 0.08}}
@@ -1047,7 +1175,7 @@ def test_kappa_keeps_negative_excess_unclipped():
     # A step that beat the decode-only baseline is noise like any other; the
     # old per-sample max(0, ·) clip dropped exactly these, so only positive
     # noise survived and κ drifted upward. Unclipped, it pulls κ back down.
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True)
     scheduler = make_scheduler(running=[], cfg=cfg)
     scheduler._sslo_step_wall_ema = {4: {0: 0.08}}
 
@@ -1068,7 +1196,7 @@ def test_kappa_ratio_of_sums_survives_small_denominator_samples():
     # by ten 8-token steps that each ran 5 ms long. As per-sample estimates
     # those are 0.625 ms/tok each and a κ EMA settles at ~0.46 ms/tok (~3x the
     # truth); weighting each step by its own token count keeps κ near 0.16.
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True)
     scheduler = make_scheduler(running=[], cfg=cfg)
     scheduler._sslo_step_wall_ema = {4: {0: 0.08}}
 
@@ -1088,7 +1216,7 @@ def test_kappa_sample_uses_batch_matched_decode_cell():
     # behaved this way pre-fix; the regression discriminators for the removed
     # global-mean fallback (which doubled κ under the offload tier) are the
     # two *_without_batch_matched_decode_cell tests below.
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True,
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True,
                      tpot_ema_alpha=1.0)
     scheduler = make_scheduler(running=[], cfg=cfg)
     scheduler._sslo_step_wall_ema = {8: {0: 0.006}, 40: {0: 0.072}}
@@ -1106,7 +1234,7 @@ def test_kappa_sample_uses_batch_matched_decode_cell():
 def test_kappa_sample_dropped_without_batch_matched_decode_cell():
     # Batch 40 has only a prefill-carrying cell; the only decode-only cell is
     # the low-occupancy one. The sample must be dropped, not fall back to it.
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True,
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True,
                      tpot_ema_alpha=1.0)
     scheduler = make_scheduler(running=[], cfg=cfg)
     scheduler._sslo_step_wall_ema = {8: {0: 0.006}, 40: {2: 0.15}}
@@ -1123,20 +1251,20 @@ def test_kappa_sample_dropped_without_batch_matched_decode_cell():
     assert scheduler._sslo_kappa_tokens_ema == 1000.0
 
 
-def test_prefill_budget_off_without_batch_matched_decode_cell():
-    # P*'s Δ_dec must come from the cell matching the current decode batch;
+def test_token_budget_prefill_off_without_batch_matched_decode_cell():
+    # TB*_pre's Δ_dec must come from the cell matching the current decode batch;
     # with no such cell the control stays off (base budget) instead of
     # borrowing a low-occupancy baseline.
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
-    r = make_request("r0", make_state(deadline=2.0))
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True)
+    r = _tb_request("r0", deadline=2.0, tail=_TB_SENSITIVE)
     scheduler = make_scheduler(running=[r], cfg=cfg)
-    _prep_prefill_budget(scheduler)
+    _prep_token_budget_prefill(scheduler)
     scheduler._sslo_step_wall_ema = {8: {0: 0.006}}
 
-    assert scheduler._sslo_prefill_token_budget(0.0) is None
+    assert _tb_prefill(scheduler) is None
 
 
-def test_prefill_budget_does_not_block_onload(monkeypatch):
+def test_token_budget_prefill_does_not_block_onload(monkeypatch):
     # Composition with the offload tier: an exhausted prefill budget must not
     # starve a deadline-forced onload; only normal admits are held back.
     cfg = SsloConfig(method="progress_serve", kv_offload=True)
@@ -1147,8 +1275,8 @@ def test_prefill_budget_does_not_block_onload(monkeypatch):
     scheduler.skipped_waiting = FakeWaitingQueue()
     scheduler._sslo_offload_conn = FakeOffloadConnector()
     scheduler._sslo_onloading = {"onloading": onloading}
-    _prep_schedule_sslo(scheduler, budget=2, cur_max=8, monkeypatch=monkeypatch)
-    scheduler._sslo_prefill_token_budget = lambda now: 0
+    _prep_schedule_sslo(scheduler, budget=2, cur_max=8,
+                        monkeypatch=monkeypatch, tb_prefill=0)
 
     output = scheduler.schedule_sslo()
 
@@ -1157,28 +1285,28 @@ def test_prefill_budget_does_not_block_onload(monkeypatch):
     assert request_ids(scheduler.skipped_waiting) == ["n0"]
 
 
-def test_prefill_budget_caps_running_loop_carryover(monkeypatch):
+def test_token_budget_prefill_caps_running_loop_carryover(monkeypatch):
     # (a) A chunked-prefill carry-over is scheduled by the RUNNING loop, not
     # the waiting loop. Without a clamp there it would take all 1488 remaining
-    # prompt tokens in one step; P* = 300 must bind it.
+    # prompt tokens in one step; TB*_pre = 300 must bind it.
     carryover = _carryover_request("c0", computed=512, prompt=2000)
     scheduler = make_scheduler(running=[carryover], max_num_running_reqs=8)
-    _prep_schedule_sslo(scheduler, budget=0, cur_max=8, monkeypatch=monkeypatch)
-    scheduler._sslo_prefill_token_budget = lambda now: 300
+    _prep_schedule_sslo(scheduler, budget=0, cur_max=8,
+                        monkeypatch=monkeypatch, tb_prefill=300)
 
     output = scheduler.schedule_sslo()
 
     assert output.num_scheduled_tokens == {"c0": 300}
 
 
-def test_prefill_budget_is_shared_by_running_and_waiting_loops(monkeypatch):
+def test_token_budget_prefill_is_shared_by_running_and_waiting_loops(monkeypatch):
     # (b) One budget for the whole step: the carry-over drains it first, the
-    # new admit gets only what is left, and the total equals P*.
+    # new admit gets only what is left, and the total equals TB*_pre.
     carryover = _carryover_request("c0", computed=512, prompt=612)
     scheduler = make_scheduler(running=[carryover], max_num_running_reqs=8)
     scheduler.waiting = FakeWaitingQueue([_waiting_request("n0", 800)])
-    _prep_schedule_sslo(scheduler, budget=1, cur_max=8, monkeypatch=monkeypatch)
-    scheduler._sslo_prefill_token_budget = lambda now: 600
+    _prep_schedule_sslo(scheduler, budget=1, cur_max=8,
+                        monkeypatch=monkeypatch, tb_prefill=600)
 
     output = scheduler.schedule_sslo()
 
@@ -1188,30 +1316,30 @@ def test_prefill_budget_is_shared_by_running_and_waiting_loops(monkeypatch):
     assert sum(output.num_scheduled_tokens.values()) == 600
 
 
-def test_prefill_budget_spares_decode_alongside_carryover(monkeypatch):
+def test_token_budget_prefill_spares_decode_alongside_carryover(monkeypatch):
     # (c) A decoding request in the same step keeps its token even though the
     # budget is fully spent by the carry-over next to it.
     decoding = _decoding_request("d0")
     carryover = _carryover_request("c0", computed=512, prompt=2000)
     scheduler = make_scheduler(
         running=[decoding, carryover], max_num_running_reqs=8)
-    _prep_schedule_sslo(scheduler, budget=0, cur_max=8, monkeypatch=monkeypatch)
-    scheduler._sslo_prefill_token_budget = lambda now: 50
+    _prep_schedule_sslo(scheduler, budget=0, cur_max=8,
+                        monkeypatch=monkeypatch, tb_prefill=50)
 
     output = scheduler.schedule_sslo()
 
     assert output.num_scheduled_tokens == {"d0": 1, "c0": 50}
 
 
-def test_prefill_budget_carryover_always_progresses(monkeypatch):
+def test_token_budget_prefill_carryover_always_progresses(monkeypatch):
     # (d) Even with the budget fully spent, a carry-over gets at least one
     # token so it can never stall permanently.
     first = _carryover_request("c0", computed=0, prompt=2000)
     second = _carryover_request("c1", computed=0, prompt=2000)
     scheduler = make_scheduler(
         running=[first, second], max_num_running_reqs=8)
-    _prep_schedule_sslo(scheduler, budget=0, cur_max=8, monkeypatch=monkeypatch)
-    scheduler._sslo_prefill_token_budget = lambda now: 10
+    _prep_schedule_sslo(scheduler, budget=0, cur_max=8,
+                        monkeypatch=monkeypatch, tb_prefill=10)
 
     output = scheduler.schedule_sslo()
 
@@ -1223,8 +1351,8 @@ def test_kappa_regressor_counts_resumed_admits():
     # A request resumed from preemption is admitted by this step's waiting
     # loop, so it is absent from the pre-step snapshot. Its recompute tokens
     # are charged to the prefill budget, so κ's denominator must count them
-    # too — otherwise κ is over-estimated and P* silently shrinks.
-    cfg = SsloConfig(method="progress_serve", prefill_budget_control=True)
+    # too — otherwise κ is over-estimated and TB*_pre silently shrinks.
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True)
     resumed = _carryover_request("r0", computed=0, prompt=300)
     scheduler = make_scheduler(running=[resumed], cfg=cfg)
     # Pre-step snapshot does NOT contain r0 (it was preempted before).

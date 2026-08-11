@@ -2665,3 +2665,94 @@ Modes are now exactly `{baseline, progress_serve}`.
   없음) — 로직은 단위 테스트로, 발동률은 GPU 런의 `token_budget_d_defers`
   stat으로만 확인. sslo-verifier: 로직 버그 0(7 케이스 손 트레이스),
   문서 정합 지적만 반영.
+
+## 2026-08-11 (phaseP2: κ 수정·TB* 실측 검증 + 결합 저하 원인 분리)
+
+- 실행: phaseP2 — 신 코드(κ ratio-of-sums + TB* D축)로 4모드
+  (baseline/offload/token_budget/offload+token_budget) × cap{32,64,128} ×
+  rate{0.5,1,2,4}, read. 38/48에서 사용자 지시로 종료
+  (`output_sweep_v2/phaseP2`; cap128·cap64 완결, cap32 부분).
+- 사전 예측 판정: ① κ 수렴 **적중** — o+tb κ 0.53~0.65 → 0.15
+  (ratio-of-sums 목표값). ② tput 회복 **적중** — cap128 o+tb r2/r4
+  517/531 (구 500, baseline 531 동률). ③ D축 read 비발동 **예측 실패**
+  — 과포화 read에서 D-defers 수백~1,384회 발동. 단 무해함이 실측됨
+  (tb 단독 cap64: 전 rate viol 0.8~1.4%, tput 406~508 = baseline의
+  96~99%, D 630회 발동에도 재적 45 유지) — 안전 가드(overdue 제외·
+  만족성 revert)가 의도대로 작동.
+- **핵심 결과: 이 워크로드에선 token_budget 단독이 최적.** cap64에서
+  offload 계열만 r4 저하 (offl 401/run28, o+tb 334/run13 vs tb
+  508/run45) — r4 저하의 범인은 offload이지 D축이 아님.
+- 결합(o+tb) 저하 원인 3중 결합 (LOW/HIGH 에피소드 분해, cap64 r4):
+  ① 1차 정지는 offload 몫 — offl 단독도 46% 저점유, 그동안 k*=13.9로
+  허가되는데 집행 안 됨 (허가-집행 괴리, 미해명·별도 조사 필요).
+  ② tb가 회복을 조임 — 정지 생존자(마감 임박)가 t_min을 눌러 P* floor
+  81% → 재적 4→45 회복에 필요한 ~5.6만 prefill 토큰이 4배 느리게 유입.
+  ③ D축 defer분의 R_defer가 E_viol에 계상(0.95)돼 k*가 2.0으로 붕괴
+  (offl 단독 13.9). 뿌리는 동일: t_min/E_viol이 in-flight만 보는
+  큐-블라인드 — ③축 잠금·구 adaptive 붕괴와 같은 계열의 세 번째 발현.
+- 수정 후보(기록): 회복 예외(재적≪허가 ∧ 대기 깊으면 admission prefill을
+  P* 면제 또는 floor 유휴도 비례 상향), D축 defer분 E_viol 분리,
+  offl 허가-집행 괴리 규명.
+
+## 2026-08-11 (TB* 개정: worst-case γ·t_min → 기대-위험 예산 도싱)
+
+- 배경: phaseP2 진단 ②③ — t_min 보유자 1명(대개 구제 불가)이 P축을 floor에
+  81% 고정, D축 defer분이 절대 E_viol을 눌러 k* 붕괴. 두 축의 화폐를
+  E_viol로 통일하면 doomed(R≈1)의 한계 기여가 ~0이라 매몰비용이 자동 해소.
+  캐노니컬 스펙: `paper/scheduling.md` §3⑤ (2026-08-11 개정).
+- 수정(`vllm/vllm/sslo/progress_serve.py`):
+  - 신규 `token_budget_prefill_risk(views_A, b, delta_dec, kappa_p,
+    base_budget, floor, eps_p, lead, share_includes_parked)`:
+    `TB*_pre = max{P∈[floor,base] : E_viol(Δ_dec+κ_p·P) − E_viol(Δ_dec) ≤ ε_p}`.
+    E(P)는 P에 단조 비감소(Δ↑→H_q↓→N↓→tail↑, 각 Δ에서 build_plan의
+    M-내림차순 배정이 위험 최소)이므로 정수 이분탐색. 비용 = 2 +
+    ⌈log2(base−floor)⌉ build_plan 호출(기본 512..8192에서 15회) —
+    schedule_step이 이미 스텝당 최대 k*+1회 쓰므로 상대적으로 저렴
+    (tail_prob는 정렬 히스토리 bisect 2회).
+    κ_p≤0 또는 views에 measurable 없음이면 base 반환(제어 비활성),
+    결과는 항상 [floor, base] 클램프.
+  - `select_decode_defer`: t_min/γ 입력 제거. 후보(자격 R_defer≤ε_d,
+    slack 깊은 순, self-limiting 유지)를 하나씩 가상 defer하며
+    `E_viol(Δ_dec(n−1)) < E_viol(Δ_dec(n))`인 동안만 채택, 개선 멈추면
+    중단(채택 안 함). overdue 특례·만족성 가드 삭제 — doomed 한계 기여
+    ~0이 같은 역할을 자연 수행. 셀 부재 시 보수적 중단(R5) 유지. 비용은
+    최대 2+채택수 build_plan 호출.
+  - 구 `token_budget_prefill()`(γ·t_min)은 **삭제하지 않고 deprecated**
+    (docstring에 기각 사유 + 대체 함수 명시). A/B 재현용, 라이브 호출 없음.
+- 수정(`vllm/vllm/v1/core/sched/scheduler.py`):
+  - `_sslo_prefill_token_budget(views_a, b, d_prime, lead, share_parked)` —
+    t_min 인자 소멸. 호출 위치를 `schedule_sslo` → 정책 내부(⑤단계,
+    D축 직후)로 이동: 위험 원장(views_a/b/lead/share)이 거기에만 있고
+    D′도 그 시점에 확정되므로 뷰 재구성이 불필요. 결과는
+    `_sslo_step.token_budget_prefill`에 기록, `schedule_sslo`의 running/
+    waiting 루프(⑥ 집행)는 그 값을 읽어 소비 — 공유 카운터·최소 1토큰·
+    floor 기아 가드는 변경 없음.
+  - `_sslo_min_time_to_deadline()` 삭제(P축이 유일 사용처였음),
+    `_sslo_apply_decode_budget`의 t_min 계산부 제거.
+- 수정(`vllm/vllm/sslo/config.py`): `token_budget_risk_eps: float = 0.01`
+  신설(>0 검증). `token_budget_gamma`는 deprecated 주석만 달아 보존
+  (구 함수가 참조). TB* 주석 블록을 2축 E_viol 서술로 교체.
+- 수정(exp): `run_test.py` env `SSLO_TOKEN_BUDGET_RISK_EPS` 추가
+  (GAMMA는 no-op으로 남김), `run_test.sh`/`exp/run_sslo/README.md`/
+  `vllm/vllm/sslo/README.md` 문구를 위험 도싱으로 정정.
+- 누적 거동(상상 실행): admission의 절대 예산 E_viol<1은 그대로이므로
+  A3식 총위험 폭주 경로 없음. ε_p는 한계량이라 E(0)이 커도(doomed 다수)
+  도싱이 저절로 조여지지 않고, savable 요청의 상승분만 ε_p에 계상된다 —
+  회복기 조임 해소의 메커니즘이 곧 이 성질.
+- 검증: 컨테이너 `sk-sslo`에서 `pytest tests/sslo/ -q` → 203 passed,
+  1 skipped, 1 failed(기존 `test_tts_consume_path` 1건, 본 변경과 무관).
+  신규/개정 테스트: P축 (a) doomed 전원→base(구 γ 판이면 floor임을 같은
+  입력으로 대조) (b) 여유→base (c) 민감 요청에서 ε_p 정지 + brute-force
+  오라클 일치 + 실현가능성 prefix(단조성) 검증 (d) κ/기준선 부재→base
+  (e) 클램프 범위; D축 개선 채택·정지, 무개선 3종(doomed/Δ이득 미미/
+  deadline 여유)→[], forced·at-risk 불가침(D′=D_floor), 셀 부재 2종,
+  self-limiting; 스케줄러 P축 배선(정책이 기록→루프가 소비) 1종;
+  config 기본값·ε_p>0 검증. `python3 -m py_compile`, `bash -n
+  run_test.sh`, `run_test.py --help`, SsloConfig ε_p 주입 확인. GPU 미실행.
+- (해결됨) 개발 라운드 시점에 `paper/scheduling.md` §3⑤에 구 P축 공식
+  블록이 개정 텍스트와 공존해 자기모순이었으나, 같은 세션에서 스펙 소유자가
+  잔여 블록을 제거해 정리 완료 (grep 잔재 0건). 구현은 개정 텍스트 준수.
+- 미증명 단순화 (기록): D축 E_viol 프로브의 원장은 decode-set 단독
+  (admits/parked 미포함, s는 자격 판정에만). 자기일관적 hill-climb이라
+  안전성은 훼손 없으나 "전체 원장 대비 defer가 덜 발동하는 보수 방향"이라는
+  방향성 주장은 수학적 증명·대조 테스트 없음 — 알려진 한계로 유지.

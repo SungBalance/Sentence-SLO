@@ -260,32 +260,39 @@ Defaults shown; validation in `__post_init__`.
 
 ### Deadline-aware Token Budget (TB*)
 
-One step-time constraint `Δ_dec(D) + κ_p·P ≤ γ·t_min`, solved on two axes and
-gated by the single `token_budget_control` flag.
+Both axes buy step time with the currency admission already spends — the
+expected violation count `E_viol` of the in-flight set, evaluated at the step
+time the choice implies — and are gated by the single `token_budget_control`
+flag. (Until 2026-08-11 both were priced off the worst-case constraint
+`Δ_dec(D) + κ_p·P ≤ γ·t_min`; one near-deadline survivor then held the whole
+step hostage — floor `TB*_pre` on 81% of recovery steps. Under `E_viol` a doomed
+request (`R ≈ 1` either way) has ~0 marginal weight, so sunk risk no longer
+blocks progress.)
 
-**D axis** (`progress_serve.select_decode_defer`). When the decode step time
-alone breaks the constraint (`P = 0` would already miss), the decode set is
-shrunk: defer-safe requests — GPU-resident, MEASURED, `R_defer ≤
-token_budget_decode_risk_eps` — are deferred deepest-slack-first until
-`Δ_dec(D')` fits. Forced (PREFILL/WARMUP), onloading and at-risk requests are
-never deferred, which is the natural floor `D_floor`. Eligibility is
-self-limiting — a deferred request keeps burning its deadline, so its `R_defer`
-rises until it exceeds `eps` — so no starvation counter is needed (unlike the P
-axis floor). `Δ_dec(n)` is the batch-matched decode-only wall-EMA cell; a missing
-cell stops the search rather than falling back to a cross-batch average (R5).
-Two guards keep the axis from paying throughput for nothing: **overdue
-requests** (`T_q ≤ 0`) are excluded from `t_min` — their current unit is already
-missed and no shrink saves it — and if **no reachable `D'` meets the budget**
-(the floor is still over, or a missing cell blocks the search) the axis reverts
-to zero defers instead of shrinking hopelessly. With deadlines far away (the read
-workload) `D' = D_policy`, i.e. the axis is a no-op.
+**D axis** (`progress_serve.select_decode_defer`). Defer-safe requests —
+GPU-resident, MEASURED, `R_defer ≤ token_budget_decode_risk_eps` — are deferred
+deepest-slack-first **while each defer strictly lowers `E_viol`** at the
+resulting `Δ_dec(D')`; the first non-improving defer stops the search and is not
+taken, so an unhelpful shrink costs nothing. Forced (PREFILL/WARMUP), onloading
+and at-risk requests are never deferred, which is the natural floor `D_floor`.
+Eligibility is self-limiting — a deferred request keeps burning its deadline, so
+its `R_defer` rises until it exceeds `eps` — so no starvation counter is needed
+(unlike the P axis floor). `Δ_dec(n)` is the batch-matched decode-only wall-EMA
+cell; a missing cell stops the search rather than falling back to a cross-batch
+average (R5). With deadlines far away (the read workload) `D' = D_policy`, i.e.
+the axis is a no-op.
 
-**P axis** (`progress_serve.token_budget_prefill`). Caps the **total** prefill
-tokens of one scheduler step at
-`TB*_pre = clamp((γ·t_min − Δ_dec(D'))/κ_p, floor, max_num_batched_tokens)`,
-where `D'` is what the D axis settled on. Motivated by the measurement that
-prefill-carrying steps are 6% of steps but 18.4% of wall clock (Δ p90 463 ms vs
-78 ms decode-only).
+**P axis** (`progress_serve.token_budget_prefill_risk`). Caps the **total**
+prefill tokens of one scheduler step at
+`TB*_pre = max{ P ∈ [floor, max_num_batched_tokens] : E_viol(Δ_dec(D') + κ_p·P)
+− E_viol(Δ_dec(D')) ≤ token_budget_risk_eps }`, where `D'` is what the D axis
+settled on — the largest prefill dose whose extra expected violations stay
+inside `ε_p`. `E_viol` is non-decreasing in `P`, so the maximum is found by
+bisection (2 + ⌈log2(base − floor)⌉ `build_plan` calls, ~15 at the defaults).
+Motivated by the measurement that prefill-carrying steps are 6% of steps but
+18.4% of wall clock (Δ p90 463 ms vs 78 ms decode-only). The absolute admission
+budget `E_viol < 1` is untouched (R3): `ε_p` doses prefill only, and prefill
+totals are conserved by arrivals rather than accumulating.
 
 Both prefill paths drain one shared per-step counter, in this order:
 
@@ -307,7 +314,8 @@ self-disables when chunked prefill is off).
 |---|---|---|
 | `token_budget_control` | `False` | Enable the Token Budget (both axes) |
 | `token_budget_prefill_floor` | 512 | Lower clamp on `TB*_pre` (tokens); must be > 0 so prefill always progresses |
-| `token_budget_gamma` | 0.5 | Safety factor γ on `t_min`, in `(0, 1]` |
+| `token_budget_risk_eps` | 0.01 | P axis: expected-violation budget `ε_p` the prefill dose may add; must be > 0 |
+| `token_budget_gamma` | 0.5 | **Deprecated** (2026-08-11) — γ of the rejected worst-case `token_budget_prefill()`, kept for A/B replay only |
 | `token_budget_decode_risk_eps` | 1e-3 | D axis: only `R_defer ≤ eps` requests may be dropped from the decode set |
 
 ### KV offload tier (see §9)

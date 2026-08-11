@@ -7,8 +7,8 @@
 # Required positional args:
 #   $1  run_kind   (baseline | progress_serve | progress_serve_adaptive |
 #                   progress_serve_offload | progress_serve_offload_adaptive |
-#                   progress_serve_prefill_budget |
-#                   progress_serve_offload_prefill_budget)
+#                   progress_serve_token_budget |
+#                   progress_serve_offload_token_budget)
 #   $2  max_num_seqs
 #   $3  model
 #
@@ -36,10 +36,12 @@
 #   SSLO_KV_OFFLOAD_RISK_EPS                offload/onload risk epsilon
 #   SSLO_KV_OFFLOAD_MIN_RESIDENCY_STEPS     anti-thrash guard (steps; 0 = off)
 #
-# Deadline-aware prefill budget (progress_serve[_offload]_prefill_budget
+# Deadline-aware Token Budget (progress_serve[_offload]_token_budget
 # run_kinds only; read by run_test.py):
-#   SSLO_PREFILL_BUDGET_FLOOR               min prefill tokens per step
-#   SSLO_PREFILL_BUDGET_GAMMA               safety factor on t_min (0 < g <= 1)
+#   SSLO_TOKEN_BUDGET_PREFILL_FLOOR         min prefill tokens per step
+#   SSLO_TOKEN_BUDGET_RISK_EPS              P-axis E_viol dosing budget (> 0)
+#   SSLO_TOKEN_BUDGET_GAMMA                 deprecated (rejected worst-case
+#                                           rule; no live path reads it)
 # Those run_kinds wire the SimpleCPUOffloadConnector and force
 # enable_prefix_caching in run_test.py — no extra env needed. Offload events
 # are recorded per-step in scheduler_stats.jsonl / decisions.jsonl (no

@@ -20,7 +20,7 @@ from lm_datasets import (
     load_prompts, load_dialogues, _load_wildchat, _load_lmsys)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from metrics_utils import MODES_DEFAULT
+from metrics_utils import MODES_DEFAULT, MODES_DEPRECATED
 from analysis.cpslo_names import classify_request
 
 
@@ -30,10 +30,10 @@ DIALOGUE_BUILD_SEED = 42
 # SSLO: run kinds that enable the KV offload tier.
 OFFLOAD_RUN_KINDS = ("progress_serve_offload",
                      "progress_serve_offload_adaptive",
-                     "progress_serve_offload_prefill_budget")
-# SSLO: run kinds that enable the deadline-aware prefill token budget.
-PREFILL_BUDGET_RUN_KINDS = ("progress_serve_prefill_budget",
-                            "progress_serve_offload_prefill_budget")
+                     "progress_serve_offload_token_budget")
+# SSLO: run kinds that enable the deadline-aware Token Budget (both axes).
+TOKEN_BUDGET_RUN_KINDS = ("progress_serve_token_budget",
+                          "progress_serve_offload_token_budget")
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,7 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-kind",
         required=True,
-        choices=list(MODES_DEFAULT),
+        # SSLO: deprecated aliases stay readable by the aggregators but are
+        # not launchable.
+        choices=[m for m in MODES_DEFAULT if m not in MODES_DEPRECATED],
     )
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--dataset-name", default="koala",
@@ -772,15 +774,17 @@ async def run_one(args: argparse.Namespace) -> None:
             v = os.environ.get(env_name)
             if v is not None:
                 sslo_params[key] = cast(v)
-    # SSLO: deadline-aware prefill token budget — cap the prefill tokens a
-    # step may schedule so a prefill spike can't blow the nearest in-flight
-    # chunk deadline. Request concurrency is untouched (no adaptive
-    # batching), so it composes with the offload tier.
-    if args.run_kind in PREFILL_BUDGET_RUN_KINDS:
-        sslo_params["prefill_budget_control"] = True
+    # SSLO: deadline-aware Token Budget — one expected-risk ledger dosing both
+    # the prefill tokens (P axis) and the decode set size (D axis) so neither
+    # can blow the in-flight chunk deadlines. It composes with the offload
+    # tier.
+    if args.run_kind in TOKEN_BUDGET_RUN_KINDS:
+        sslo_params["token_budget_control"] = True
         for env_name, key, cast in (
-            ("SSLO_PREFILL_BUDGET_FLOOR", "prefill_budget_floor", int),
-            ("SSLO_PREFILL_BUDGET_GAMMA", "prefill_budget_gamma", float),
+            ("SSLO_TOKEN_BUDGET_PREFILL_FLOOR",
+             "token_budget_prefill_floor", int),
+            ("SSLO_TOKEN_BUDGET_RISK_EPS", "token_budget_risk_eps", float),
+            ("SSLO_TOKEN_BUDGET_GAMMA", "token_budget_gamma", float),
         ):
             v = os.environ.get(env_name)
             if v is not None:

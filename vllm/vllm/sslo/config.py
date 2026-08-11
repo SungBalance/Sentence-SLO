@@ -118,27 +118,51 @@ class SsloConfig:
     # re-offloaded within this many scheduler steps. 0 disables. The step-count
     # check itself lives in the scheduler (stage 2); this is the knob only.
     kv_offload_min_residency_steps: int = 0
-    # Deadline-aware prefill token budget. Measured (cap128/rate2 baseline):
-    # prefill-carrying steps are only 6% of steps but 18.4% of the wall clock
-    # (Δ p90 463 ms vs 78 ms decode-only) — deadline misses come from the
-    # prefill spike, not decode concurrency. When True the scheduler caps the
-    # TOTAL prefill tokens of a step — chunked-prefill carry-over in the
-    # running loop plus new admits in the waiting loop, sharing one budget —
-    # at P* (progress_serve.prefill_budget). Decode tokens are never charged.
-    # Request concurrency and the service share s are left untouched, so this
-    # is throughput-neutral and does not interact with the offload tier.
-    # Requires method="progress_serve".
-    prefill_budget_control: bool = False
-    # Lower clamp on P* (tokens). Must be > 0 so prefill always makes
+    # Deadline-aware Token Budget TB*. Both axes buy step time with the same
+    # currency the admission rule spends — the expected violation count E_viol
+    # of the in-flight set, evaluated at the step time the choice implies:
+    #   [D axis] defer slack-deep defer-safe requests while each defer strictly
+    #            lowers E_viol at the resulting Δ_dec(D')
+    #            (progress_serve.select_decode_defer).
+    #   [P axis] TB*_pre caps the TOTAL prefill tokens of a step —
+    #            chunked-prefill carry-over in the running loop plus new admits
+    #            in the waiting loop, sharing one budget — at the largest P
+    #            whose E_viol(Δ_dec(D') + κ_p·P) stays within
+    #            token_budget_risk_eps of E_viol at P=0
+    #            (progress_serve.token_budget_prefill_risk). Measured
+    #            (cap128/rate2 baseline): prefill-carrying steps are only 6% of
+    #            steps but 18.4% of the wall clock (Δ p90 463 ms vs 78 ms
+    #            decode-only) — deadline misses come from the prefill spike,
+    #            not decode concurrency.
+    # Decode tokens are never charged to TB*_pre (the D axis works in whole
+    # requests, never in tokens). Requires method="progress_serve"; a single
+    # flag gates both axes because they share one ledger.
+    token_budget_control: bool = False
+    # Lower clamp on TB*_pre (tokens). Must be > 0 so prefill always makes
     # progress under chunked prefill (no prefill starvation). Keep it well
-    # below the engine's max_num_batched_tokens: prefill_budget() clamps the
-    # floor to that base budget, so a floor at or above it turns the control
-    # into a silent no-op. SsloConfig cannot cross-validate this — it does not
-    # see SchedulerConfig.
-    prefill_budget_floor: int = 512
-    # Safety factor on t_min: at most this fraction of the most urgent
-    # in-flight request's remaining time may be spent on this step.
-    prefill_budget_gamma: float = 0.5
+    # below the engine's max_num_batched_tokens: token_budget_prefill_risk()
+    # clamps the floor to that base budget, so a floor at or above it turns the
+    # control into a silent no-op. SsloConfig cannot cross-validate this — it
+    # does not see SchedulerConfig.
+    token_budget_prefill_floor: int = 512
+    # P-axis dosing budget ε_p, in expected-violation units: TB*_pre is the
+    # largest prefill allowance whose extra expected violations
+    # E_viol(Δ(P)) - E_viol(Δ(0)) stay within ε_p. Must be > 0 — at 0 any
+    # in-flight request whose risk moves at all would pin TB*_pre to the floor.
+    token_budget_risk_eps: float = 0.01
+    # DEPRECATED (2026-08-11): worst-case safety factor on t_min, the input of
+    # the rejected progress_serve.token_budget_prefill(). Kept (with that
+    # function) only to replay the old rule against the risk dosing above; no
+    # live scheduler path reads it. Rejected because one near-deadline survivor
+    # pinned TB*_pre to the floor on 81% of recovery steps (WORKLOG
+    # 2026-08-11).
+    token_budget_gamma: float = 0.5
+    # D-axis defer-safety epsilon (in tail-posterior probability units, same
+    # grammar as kv_offload_risk_eps): only a MEASURED request whose deferred
+    # risk R_defer <= eps may be dropped from the decode set to shrink Δ_dec.
+    # Forced / onloading / at-risk requests are never deferred — they are the
+    # natural floor D_floor.
+    token_budget_decode_risk_eps: float = 1e-3
 
     def __post_init__(self) -> None:
         if self.method not in ("baseline", "progress_serve"):
@@ -228,15 +252,23 @@ class SsloConfig:
             raise ValueError(
                 "kv_offload_min_residency_steps must be >= 0 (0 disables), "
                 f"got {self.kv_offload_min_residency_steps}")
-        if self.prefill_budget_control and self.method != "progress_serve":
+        if self.token_budget_control and self.method != "progress_serve":
             raise ValueError(
-                "prefill_budget_control requires method='progress_serve', "
+                "token_budget_control requires method='progress_serve', "
                 f"got method={self.method!r}")
-        if self.prefill_budget_floor < 1:
+        if self.token_budget_prefill_floor < 1:
             raise ValueError(
-                "prefill_budget_floor must be >= 1 (prefill starvation), "
-                f"got {self.prefill_budget_floor}")
-        if not (0 < self.prefill_budget_gamma <= 1):
+                "token_budget_prefill_floor must be >= 1 (prefill "
+                f"starvation), got {self.token_budget_prefill_floor}")
+        if self.token_budget_risk_eps <= 0:
             raise ValueError(
-                "prefill_budget_gamma must be in (0, 1], "
-                f"got {self.prefill_budget_gamma}")
+                "token_budget_risk_eps must be > 0, "
+                f"got {self.token_budget_risk_eps}")
+        if not (0 < self.token_budget_gamma <= 1):
+            raise ValueError(
+                "token_budget_gamma must be in (0, 1], "
+                f"got {self.token_budget_gamma}")
+        if self.token_budget_decode_risk_eps < 0:
+            raise ValueError(
+                "token_budget_decode_risk_eps must be >= 0, "
+                f"got {self.token_budget_decode_risk_eps}")

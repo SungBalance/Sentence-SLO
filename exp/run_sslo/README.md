@@ -39,7 +39,12 @@ sweeps `max_num_seqs`, `request_rate`, and `chunk_unit` (sentence / paragraph).
 Seven scheduling modes are supported (see `MODES_DEFAULT` in
 `metrics_utils.py`): `baseline`, `progress_serve`, `progress_serve_adaptive`,
 `progress_serve_offload`, `progress_serve_offload_adaptive`,
-`progress_serve_prefill_budget`, `progress_serve_offload_prefill_budget`.
+`progress_serve_token_budget`, `progress_serve_offload_token_budget`.
+
+The last two were named `progress_serve[_offload]_prefill_budget` before the
+P* → TB* rename. Those names live on in `MODES_DEPRECATED` so the aggregators
+keep reading the phaseP output directories written under them; they are not
+selectable as a `--run-kind`.
 
 `progress_serve_offload` runs `progress_serve` with the KV offload tier
 (`kv_offload=True`). It requires the CPU-offload connector — `run_test.py`
@@ -56,19 +61,31 @@ offload log file. The tier counts CPU-parked requests in the service share
 the pre-A1 semantics. `progress_serve_offload_adaptive` is the same mode with
 adaptive batching also enabled.
 
-`progress_serve_prefill_budget` runs `progress_serve` with the deadline-aware
-prefill token budget (`prefill_budget_control=True`): the **total** prefill
-tokens of a step — chunked-prefill carry-over in the running loop plus new
-admits in the waiting loop, sharing one counter — are capped at
-`P* = clamp((γ·t_min − Δ_decode)/κ, floor, max_num_batched_tokens)`, where
-`t_min` is the nearest in-flight chunk deadline and κ the online per-prefill-
-token step-time cost. Decode tokens are never capped. Request concurrency is
-untouched (no adaptive batching),
-so it is throughput-neutral and composes with the offload tier —
-`progress_serve_offload_prefill_budget` is both. `SSLO_PREFILL_BUDGET_FLOOR`
-(default 512 tokens) and `SSLO_PREFILL_BUDGET_GAMMA` (default 0.5) override the
-knobs. The applied budget and κ are logged per step in
-`scheduler_stats.jsonl` as `prefill_budget` / `prefill_kappa_ms_per_tok`.
+`progress_serve_token_budget` runs `progress_serve` with the deadline-aware
+Token Budget (`token_budget_control=True`), which doses both axes on the
+expected-violation ledger `E_viol` (since 2026-08-11; the worst-case
+`Δ_dec(D) + κ_p·P ≤ γ·t_min` form let one near-deadline survivor pin the step):
+
+- **P axis** — the **total** prefill tokens of a step (chunked-prefill
+  carry-over in the running loop plus new admits in the waiting loop, sharing
+  one counter) are capped at the largest `P ∈ [floor, max_num_batched_tokens]`
+  whose `E_viol(Δ_dec(D') + κ_p·P) − E_viol(Δ_dec(D'))` stays within
+  `token_budget_risk_eps`, with κ_p the online per-prefill-token step-time cost.
+- **D axis** — slack-deep defer-safe requests
+  (`R_defer ≤ token_budget_decode_risk_eps`) are deferred while each defer
+  strictly lowers `E_viol` at the resulting `Δ_dec(D')`. Forced / onloading /
+  at-risk requests are never deferred. With deadlines far away (the read
+  workload) this is a no-op.
+
+Decode tokens are never capped in token units. Both axes share one flag because
+they share one ledger, and the mode composes with the offload tier —
+`progress_serve_offload_token_budget` is both.
+`SSLO_TOKEN_BUDGET_PREFILL_FLOOR` (default 512 tokens) and
+`SSLO_TOKEN_BUDGET_RISK_EPS` (default 0.01) override the knobs
+(`SSLO_TOKEN_BUDGET_GAMMA` is deprecated with the rejected rule). Per step,
+`scheduler_stats.jsonl` records `token_budget_prefill` (TB*_pre),
+`token_budget_decode` (D'), `token_budget_d_defers` (D-axis defers this step)
+and `prefill_kappa_ms_per_tok` (κ_p).
 
 All aggregators default to all modes. Pass `--modes baseline,progress_serve` to restrict.
 

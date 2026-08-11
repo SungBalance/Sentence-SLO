@@ -42,25 +42,31 @@
      onload 먼저 — d−t ≤ ℓΔ+f̂ 인 offloaded를 복원 시작 (deadline 안전 우선)
      offload — pending 중 M_cpu ≤ ε ∧ residency ≥ ρ 를 slack 깊은 순으로,
                admission에 필요한 블록만큼만
-⑤ Token Budget TB* 계산 — 단일 스텝-시간 제약을 두 축으로 푼다:
-       Δ_dec(D) + κ_p·P  ≤  γ·T_min
-     [D축] Δ_dec(D_policy)만으로 초과하면(P=0에도 위협), slack 깊은 순으로
-           defer해 D' 축소.  하한 D_floor = forced + at-risk 요청 수 (자격
-           R_defer≤ε_d가 자연 하한 — defer된 요청은 T_q가 줄어 R_defer가
-           올라 자동으로 자격을 잃으므로 **P축식 카운터 불필요**, self-limiting).
-           overdue(T_q≤0)는 후보 제외; 도달 가능한 D'가 예산을 못 맞추면
-           defer 취소(만족성 가드 — 처리량만 잃는 무의미 defer 방지).
-           Δ_dec(·)은 배치-키 EMA/CUDA-graph 하이브리드의 직접 조회
-           (기울기 분해 불필요; 셀 부재 시 보수적 중단, R5).
-     [P축] 남는 시간으로 prefill 허용량:
-           TB*_pre = clamp( (γ·T_min − Δ_dec(D')) / κ_p,  P_floor,  P_base )
-           κ_p = ratio-of-sums: EMA[초과시간(무클리핑)]/EMA[P], 기준선은
-           배치-매칭 셀만 (부재 시 샘플 폐기 / 제어 비활성)
+⑤ Token Budget TB* 계산 — **기대-위험 예산 도싱** (2026-08-11 개정:
+     worst-case 제약 γ·T_min은 t_min 보유자 1명이 전체를 인질 잡는 근시안
+     — 회복기 P* floor 81% 실증 — 이라 기각. E_viol 화폐로 통일):
+       TB*_pre = max{ P : E_viol(Δ(P, D')) − E_viol(Δ(0, D')) ≤ ε_p }
+     E_viol(Δ)은 기존 build_plan을 Δ(P)=Δ_dec(D')+κ_p·P로 재평가한 값 —
+     in-flight(running+pending+offloaded) **전원**의 위험 합이므로:
+     · 한 명의 임박 마감이 아니라 총 기대 피해로 도싱을 정함
+     · doomed(R≈1) 요청은 한계 기여 ~0 → 회복기의 가망 없는 생존자가
+       prefill을 막지 못함 (매몰비용 자동 해소; overdue 특례 불필요)
+     [D축] 같은 장부로 재가격: slack 깊은 순 후보(자격 R_defer≤ε_d,
+           self-limiting은 종전과 동일)를 하나씩 defer해 보며
+           E_viol(Δ_dec(D−1)) < E_viol(Δ_dec(D))인 동안만 채택 (개선이
+           멈추면 중단·revert — 만족성 가드의 기대값 판). t_min 입력 소멸.
+     Δ_dec(·)은 배치-키 셀 직접 조회, 셀 부재 시 보수적 중단 (R5).
+     주의(A3 교훈): admission의 절대 예산 E_viol<1은 **그대로 유지** —
+     ε_p는 prefill '도싱'에만 걸리는 한계 예산이고 prefill 총량은 도착량으로
+     보존되므로 A3식 무한 누적 경로가 아님. 상상 실행으로 누적 거동 검증 필수.
+     κ_p = ratio-of-sums: EMA[초과시간(무클리핑)]/EMA[P], 기준선은
+     배치-매칭 셀만 (부재 시 샘플 폐기 / 제어 비활성 → base).
 ⑥ 집행:
      running 루프 — D'에 든 요청의 디코드 토큰은 무제한; 청킹된 프롬프트
                     캐리오버는 TB*_pre 공유 카운터에서 우선 차감 (최소 1토큰)
      waiting 루프 — k*·KV·TB*_pre 잔여 안에서 admit; onload는 클램프 면제(과금은 됨)
      P_floor 연속 클램프 + prefill 무진행 N스텝이면 1스텝 base 허용 (기아 방지)
+     ※ P_floor/base 클램프와 공유 카운터·기아 가드는 도싱 개정과 무관하게 유지
 ```
 
 ## 4. 지렛대 × regime 매핑
@@ -69,8 +75,8 @@
 |---|---|---|---|
 | slack 낭비 (기본) | ②③ run/defer + E_viol admission | 항상 | E_viol(0)≈0이면 baseline과 동일 admit |
 | KV-bound admission | ④ offload/onload | `kv_capped`일 때만 | KV 여유면 no-op (I4) |
-| prefill spike | ⑤⑥ TB* P축 | 급한 마감 ∧ prefill 작업 존재 | T_min 크면 TB*_pre=P_base (baseline 동일) |
-| decode-Δ-bound (촘촘한 마감) | ⑤ TB* D축 | γ·T_min이 Δ_dec(D)에 근접 | 마감 여유면 D'=D_policy (no-op) — 일반 워크로드 전제로 상시 탑재, read처럼 H_q≫1인 경우 자연 비발동 |
+| prefill spike | ⑤⑥ TB* P축 | prefill 작업 ∧ ΔE_viol이 ε_p에 닿음 | 위험 여유면 TB*_pre=P_base (baseline 동일) |
+| decode-Δ-bound | ⑤ TB* D축 | defer가 E_viol을 실제로 낮출 때 | 개선 없으면 D'=D_policy (no-op) |
 
 두 확장의 트리거는 실측상 **동시 발화 1~2%** (서로 다른 국면: "가득 참" vs "흡수 중") — 결합은 상호작용이 아니라 커버리지 합집합으로 동작한다.
 
@@ -101,4 +107,7 @@
 - ③축 self-lock: 소수 고위험 in-flight의 위험 합이 절대 예산을 소진하면 KV·연산이 남아도 k*≈0 (과포화 + 만기 경과 큐에서 발생; R3 트레이드오프의 대가).
 - o+pb cap64 저하: κ_p 오염(소분모 발산)으로 진단·수정 완료 — GPU 재실행으로 최종 확인 대기 (예측: κ→0.15 수렴, tput 392→~470).
 - `request_risk_cpu`에는 doomed guard($R_{defer}\ge1 \Rightarrow$ offload 부적격)가 없음 — §2의 run-side 가드와 비대칭. 현행 kv_capped 게이트 하에서 실해가 관측되지 않아 미구현 (후보 유지).
+- TB* D축 프로브의 원장은 decode-set 단독(admits/parked 미포함) — 자기일관적
+  hill-climb이라 안전성 문제는 없으나, 전체 원장 대비 방향성(defer 과소 발동
+  = 보수)은 미증명 (검증 라운드 2026-08-11 지적, 알려진 한계로 유지).
 - offload tier는 full-attention(MLA 포함) 모델 한정 — hybrid(mamba/linear-attn)는 upstream 비호환 (`kv_offload_model_compat.md`).

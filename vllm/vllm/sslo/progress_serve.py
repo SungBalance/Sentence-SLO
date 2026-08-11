@@ -408,44 +408,61 @@ def select_decode_defer(
     run_views: list[ProgressView],
     delta: float,
     s: float,
-    t_min: float | None,
-    gamma: float,
     eps: float,
     delta_decode_of: Callable[[int], float | None],
 ) -> list[str]:
-    """D axis of the Token Budget: shrink the decode set until the decode step
-    time alone fits the deadline budget.
+    """D axis of the Token Budget: shrink the decode set while shrinking it
+    lowers the expected violation count.
 
-    The unified constraint is Δ_dec(D) + κ_p·P <= γ·t_min. When Δ_dec(D_policy)
-    breaks it on its own (P = 0 would already miss), no prefill budget can
-    save the step — the decode set itself has to give. Requests are dropped
-    from D one at a time, deepest slack first, until Δ_dec(D') fits.
+    Priced in the same currency as admission — E_viol from ``build_plan`` over
+    the decode set itself, evaluated at that set's decode-only step time
+    Δ_dec(D). Dropping one request costs it its slot (R_run becomes R_defer)
+    and buys every remaining request a shorter step, i.e. a longer deadline
+    horizon. Candidates are dropped one at a time, deepest slack first, while
+    each drop STRICTLY lowers E_viol; the first non-improving drop stops the
+    search and is not taken (so a set where nothing improves yields []).
 
-    Eligibility ("defer-safe"): GPU-resident, MEASURED, and R_defer <= eps.
-    Forced (PREFILL / WARMUP) and onloading requests are structurally absent
-    from the candidate list and at-risk ones fail the eps test, so the search
-    cannot go below the natural floor D_floor = forced + at-risk. The rule is
-    self-limiting and needs no starvation counter: a deferred request keeps
-    consuming its deadline, so its R_defer rises with every step it sits out
-    until it exceeds eps and the request stops being defer-safe. This holds
-    only because R_defer is recomputed from the live T_q every step.
+    Replaces the worst-case rule Δ_dec(D) <= γ·t_min (2026-08-11): pricing the
+    whole decode set off ONE t_min holder is myopic, and it needed an explicit
+    overdue special case (t_min <= 0 ⇒ no-op) to stop oversaturated traces from
+    deferring for unreachable deadlines. In the expected-risk ledger a doomed
+    request (R_run ≈ R_defer ≈ 1) has ≈ 0 marginal benefit, so deferring for it
+    simply never improves E_viol — the special case is no longer needed.
+
+    Eligibility ("defer-safe"): GPU-resident, MEASURED, and R_defer <= eps at
+    the step's Δ / s (the same numbers the plan used). Forced (PREFILL /
+    WARMUP) and onloading requests are structurally absent from the candidate
+    list and at-risk ones fail the eps test, so the search cannot go below the
+    natural floor D_floor = forced + at-risk. The rule is self-limiting and
+    needs no starvation counter: a deferred request keeps consuming its
+    deadline, so its R_defer rises with every step it sits out until it exceeds
+    eps and the request stops being defer-safe. This holds only because
+    R_defer is recomputed from the live T_q every step.
+
+    The E_viol probe keeps the whole decode set in the ledger and shrinks only
+    the slot count b, so the dropped request still pays its R_defer. Inside
+    build_plan the slot goes to the largest-M requests, i.e. the one dropped is
+    the smallest-M one — the same deep-slack end of the set the candidate order
+    walks. The probe's ledger is the decode set alone (its service share is
+    b/|D|, not the step-wide s), which is what makes the comparison between
+    consecutive sizes self-consistent; ``s`` is used only for eligibility.
 
     ``delta_decode_of(n)`` is the batch-keyed decode-only Δ cell for a decode
     set of size n. A missing cell stops the search (conservative: no fallback
     average, R5) — with no measurement for the smaller batch there is no
     evidence that shrinking helps. A missing cell for the CURRENT size leaves
-    the axis off, as does ``t_min is None``.
+    the axis off.
+
+    Costs at most 2 + (accepted defers) build_plan calls: the D_policy
+    baseline, one probe per accepted defer, and one for the probe that stops
+    the search.
 
     Returns the request_ids to defer, in the order they were dropped.
     """
-    # t_min <= 0 means the tightest deadline is already being missed — a sunk
-    # unit no shrink can save. Deferring for it would trade throughput for
-    # nothing (oversaturated read traces spend ~60% of wall time with some
-    # request overdue), so the axis must not fire. Callers additionally
-    # exclude overdue requests from the t_min candidates for the same reason.
-    if t_min is None or t_min <= 0:
+    n = len(run_views)
+    cur_delta = delta_decode_of(n)
+    if cur_delta is None:
         return []
-    budget = gamma * t_min
     candidates = []
     for v in run_views:
         if v.location != LOC_GPU or not v.is_measurable():
@@ -458,31 +475,90 @@ def select_decode_defer(
     # risk, so what remains to order by is how much room each request has.
     candidates.sort(key=lambda t: -t[0])
 
+    cur_e = build_plan(run_views, [], n, cur_delta).e_viol
     selected: list[str] = []
-    n = len(run_views)
-    satisfied = False
     for _t_q, rid in candidates:
-        cur = delta_decode_of(n)
-        if cur is None:
+        nxt_delta = delta_decode_of(n - 1)
+        if nxt_delta is None:
             break
-        if cur <= budget:
-            satisfied = True
-            break
-        if delta_decode_of(n - 1) is None:
+        nxt_e = build_plan(run_views, [], n - 1, nxt_delta).e_viol
+        if nxt_e >= cur_e:
             break
         selected.append(rid)
-        n -= 1
-    else:
-        cur = delta_decode_of(n)
-        satisfied = cur is not None and cur <= budget
-    # Satisfiability guard: shrinking is only worth paying for if some
-    # reachable D' actually meets the budget. If the search exhausted its
-    # candidates (or hit a missing cell) while still over budget, the misses
-    # are not preventable by this axis — revert to no defers rather than
-    # paying the throughput cost for nothing.
-    if not satisfied:
-        return []
+        cur_e, n = nxt_e, n - 1
     return selected
+
+
+def token_budget_prefill_risk(
+    views_A: list[ProgressView],
+    b: int,
+    delta_dec: float,
+    kappa_p: float,
+    base_budget: int,
+    floor: int,
+    eps_p: float,
+    lead: int = 0,
+    share_includes_parked: bool = True,
+) -> int:
+    """Per-step prefill token budget TB*_pre (P axis), dosed on expected risk.
+
+        Δ(P)    = delta_dec + kappa_p·P     (step time carrying P prefill tokens)
+        E(P)    = build_plan(views_A, [], b, Δ(P)).e_viol
+        TB*_pre = max{ P ∈ [floor, base_budget] : E(P) - E(0) <= eps_p }
+
+    i.e. buy prefill tokens until the in-flight set's TOTAL expected violation
+    count has risen by ``eps_p`` — a marginal budget in the same currency the
+    admission rule spends (E_viol), not a worst-case deadline constraint.
+
+    Replaces the γ·t_min rule (``token_budget_prefill``, 2026-08-11): that one
+    priced the step off ONE request's remaining time, so a single near-deadline
+    survivor — typically one that cannot be saved at all — pinned TB*_pre to
+    the floor and stalled the refill. Here a doomed request (R ≈ 1 either way)
+    barely moves E(P), so its sunk risk stops holding prefill hostage.
+
+    Units: ``delta_dec`` seconds per decode-only step at the D axis' chosen
+    decode set size D' (see ``select_decode_defer``), ``kappa_p`` SECONDS of
+    extra step time per prefill token (``_sslo_kappa`` is a ratio of a seconds
+    EMA to a token EMA, so Δ(P) stays in seconds), ``base_budget`` / ``floor``
+    tokens, ``eps_p`` in expected-violation units.
+
+    E(P) is non-decreasing in P: Δ(P) grows with P, which shrinks every H_q,
+    hence every N_run / N_defer, hence raises every (non-increasing) tail
+    probability; build_plan's largest-M-first assignment is the risk-minimizing
+    one at each Δ. So the largest feasible P is found by bisection: 2 +
+    ceil(log2(base_budget - floor)) build_plan calls (15 over the default
+    512..8192 range) — small next to the up-to-k*+1 calls schedule_step already
+    spends per step.
+
+    ``floor`` is clamped to ``base_budget`` and the result is always in
+    [floor, base_budget]: the floor is granted unconditionally so prefill keeps
+    making progress even when no P is affordable. Control is disabled — returns
+    ``base_budget`` — when ``kappa_p <= 0`` (no usable estimate) or nothing in
+    ``views_A`` is measurable (no risk ledger to protect).
+    """
+    floor = min(floor, base_budget)
+    if kappa_p <= 0:
+        return base_budget
+    if not any(v.is_measurable() for v in views_A):
+        return base_budget
+
+    def e_viol(p: int) -> float:
+        return build_plan(views_A, [], b, delta_dec + kappa_p * p, lead,
+                          share_includes_parked).e_viol
+
+    baseline = e_viol(0)
+    if e_viol(base_budget) - baseline <= eps_p:
+        return base_budget
+    # Invariant: `hi` is known over budget, `lo` is the largest P known within
+    # it — or the floor, which is granted without being tested.
+    lo, hi = floor, base_budget
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if e_viol(mid) - baseline <= eps_p:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def token_budget_prefill(
@@ -493,7 +569,17 @@ def token_budget_prefill(
     floor: int,
     gamma: float,
 ) -> int:
-    """Deadline-aware per-step prefill token budget TB*_pre (P axis).
+    """DEPRECATED (2026-08-11) — the worst-case P axis, kept for A/B replay.
+
+    Rejected: γ·t_min prices the whole step off the single most urgent
+    in-flight request, so in a recovery burst one near-deadline survivor (often
+    one that cannot be saved at all) pinned TB*_pre to the floor on 81% of
+    steps and stretched the refill ~4x (WORKLOG 2026-08-11).
+    ``token_budget_prefill_risk`` replaces it — same clamp, but dosed on the
+    E_viol ledger, where a doomed request's marginal contribution is ~0. No
+    live caller; kept so the two rules stay replayable against each other.
+
+    Deadline-aware per-step prefill token budget TB*_pre (P axis).
 
     Rationale (measured, cap128 / rate 2 baseline): decode-only steps are
     extremely stable (Δ p50 74 ms / p90 78 ms), while the 6% of steps that

@@ -1301,28 +1301,23 @@ class Scheduler(SchedulerInterface):
         return sum(bucket.values()) / len(bucket)
 
     # SSLO
-    def _sslo_min_time_to_deadline(self, now: float) -> float | None:
-        """t_min — smallest remaining time-to-deadline (s) over the MEASURED
-        in-flight set. None when nothing measurable is in flight."""
-        t_min: float | None = None
-        for req in self.running:
-            state = req.slo_state
-            if state is None or state.phase != Phase.MEASURED:
-                continue
-            t_q = state.time_to_deadline(now)
-            if t_q is not None and (t_min is None or t_q < t_min):
-                t_min = t_q
-        return t_min
-
-    # SSLO
-    def _sslo_prefill_token_budget(self, now: float) -> int | None:
+    def _sslo_prefill_token_budget(
+        self,
+        views_a: list["ps.ProgressView"],
+        b: int,
+        d_prime: int,
+        lead: int,
+        share_parked: bool,
+    ) -> int | None:
         """Per-step prefill token cap TB*_pre, or None when the control is off.
 
         Off unless `token_budget_control` is set and chunked prefill is
         enabled (the cap only smooths the prefill spike if the remainder can
         carry over to the next step), and until both κ and a decode-only Δ
-        reference exist. The Δ reference is read at the CURRENT decode set
-        size, i.e. D' after the D axis already shrank it. After
+        reference exist. The Δ reference is read at ``d_prime`` — the decode
+        set size the D axis just settled on. ``views_a`` / ``b`` / ``lead`` /
+        ``share_parked`` are the same E_viol ledger inputs the admission search
+        used, so the dosing sees exactly the risk admission priced. After
         _SSLO_PREFILL_FLOOR_STARVE_STEPS consecutive floor-clamped steps with
         no prefill progress, one step gets the full base budget.
         """
@@ -1334,16 +1329,19 @@ class Scheduler(SchedulerInterface):
         kappa = self._sslo_kappa()
         if kappa is None:
             return None
-        delta_decode = self._sslo_decode_wall_ema(len(self.running))
+        delta_decode = self._sslo_decode_wall_ema(d_prime)
         if delta_decode is None:
             return None
-        budget = ps.token_budget_prefill(
-            t_min=self._sslo_min_time_to_deadline(now),
-            delta_decode=delta_decode,
-            kappa=kappa,
+        budget = ps.token_budget_prefill_risk(
+            views_A=views_a,
+            b=b,
+            delta_dec=delta_decode,
+            kappa_p=kappa,
             base_budget=self.max_num_scheduled_tokens,
             floor=cfg.token_budget_prefill_floor,
-            gamma=cfg.token_budget_gamma,
+            eps_p=cfg.token_budget_risk_eps,
+            lead=lead,
+            share_includes_parked=share_parked,
         )
         if (budget <= cfg.token_budget_prefill_floor
                 and self._sslo_prev_step_prefill_tokens == 0):
@@ -1840,13 +1838,18 @@ class Scheduler(SchedulerInterface):
             self._sslo_apply_offload(now, result, b, delta, admitted,
                                      new_pending)
 
-        # SSLO: Token Budget D axis — shrink the decode set to D' when the
-        # decode step time alone breaks γ·t_min. Runs before the budget's P
-        # axis (computed in schedule_sslo) so TB*_pre is derived from Δ_dec(D').
+        # SSLO: Token Budget D axis — shrink the decode set to D' while each
+        # defer lowers E_viol at the resulting Δ_dec. Runs before the P axis so
+        # TB*_pre is priced against Δ_dec(D').
         if self.sslo_config.token_budget_control:
             self._sslo_apply_decode_budget(
                 views_a, new_running, new_pending, b, delta, admitted,
                 result.k_star)
+            # SSLO: Token Budget P axis — TB*_pre on the same E_viol ledger.
+            # Recorded here; schedule_sslo's running / waiting loops spend it.
+            self._sslo_step.token_budget_prefill = (
+                self._sslo_prefill_token_budget(
+                    views_a, b, len(new_running), lead, share_parked))
 
         # Decision-log score: R_run for measurable, 1.0 for forced.
         plan = ps.build_plan(
@@ -1873,25 +1876,16 @@ class Scheduler(SchedulerInterface):
         admitted: list[Request],
         k_star: int,
     ) -> None:
-        """Token Budget D axis: defer slack-deep defer-safe requests until the
-        decode-only step time Δ_dec(D') fits γ·t_min.
+        """Token Budget D axis: defer slack-deep defer-safe requests while each
+        defer strictly lowers E_viol at the resulting Δ_dec(D').
 
         Mutates ``new_running`` / ``new_pending`` in place (the deferred
-        requests move from one to the other) so the P axis, which reads
-        Δ_dec(len(self.running)) after commit, prices prefill against D'.
+        requests move from one to the other) so the P axis, which prices
+        prefill against Δ_dec(len(new_running)), sees D'.
         """
         cfg = self.sslo_config
         run_ids = {req.request_id for req in new_running}
         run_views = [v for v in views_a if v.request_id in run_ids]
-        # SSLO: t_min over the decode set itself — the deadlines this step's
-        # decode time actually has to fit inside. Overdue requests (T_q <= 0)
-        # are excluded: their current unit is already missed and no shrink can
-        # save it, so only *preventable* deadlines may drive the D axis
-        # (oversaturated traces are otherwise overdue ~60% of wall time).
-        t_qs = [
-            v.T_q for v in run_views
-            if v.is_measurable() and v.T_q is not None and v.T_q > 0
-        ]
         # Mirror build_plan's |A+| so the R_defer gating the defer decision is
         # the same number the plan computed.
         n_aplus = len(admitted) + len(self._sslo_onloading) + k_star
@@ -1899,7 +1893,6 @@ class Scheduler(SchedulerInterface):
             n_aplus += len(self._sslo_offloaded)
         deferred = ps.select_decode_defer(
             run_views, delta, ps.service_share(b, n_aplus),
-            min(t_qs) if t_qs else None, cfg.token_budget_gamma,
             cfg.token_budget_decode_risk_eps, self._sslo_decode_wall_ema)
         if deferred:
             defer_ids = set(deferred)
@@ -2344,13 +2337,12 @@ class Scheduler(SchedulerInterface):
         sslo_scores = self._apply_sslo_policy(scheduled_timestamp)
 
         # SSLO: Token Budget P axis — TB*_pre for this step (None ⇒ control
-        # off). One shared counter bounds the TOTAL prefill tokens of the
-        # step: the running loop's chunked-prefill carry-over drains it first,
-        # then the waiting loop's new admits. Decode tokens are never charged
-        # and never capped.
-        sslo_token_budget_prefill = self._sslo_prefill_token_budget(
-            scheduled_timestamp)
-        self._sslo_step.token_budget_prefill = sslo_token_budget_prefill
+        # off), computed by the policy above once the D axis settled D'. One
+        # shared counter bounds the TOTAL prefill tokens of the step: the
+        # running loop's chunked-prefill carry-over drains it first, then the
+        # waiting loop's new admits. Decode tokens are never charged and never
+        # capped.
+        sslo_token_budget_prefill = self._sslo_step.token_budget_prefill
         sslo_prefill_remaining = sslo_token_budget_prefill or 0
 
         self.kv_cache_manager.new_step_starts()
