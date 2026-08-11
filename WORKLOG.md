@@ -2841,3 +2841,6 @@ cap128 r2 o+tb 18,789스텝 중 D축 발동 28.0%, 발동 시 defer p50=1개(max
   piecewise H_q·매몰비용 논거·E(P_floor) 기준점·ε_p 창 추가). 구 규칙에서 측정된
   정량 주장(처리량 중립 89-99%, 위반율 1.1-1.5%, 트리거 동시발화 1-2%)은
   draft note로 재측정 대기 표시 — 발동률 수치는 트리거 정의가 바뀌어 삭제.
+- 추가: `exp/run_sslo/analysis/method_table.py` — output_sweep_v2 레이아웃의
+  4-method 판정표 생성기 (cap × mode × rate로 viol/tput/TTFC/users/TB*/floor%/
+  κ/Ddef, run_N 복수 시 평균±반폭). phaseP2·phaseD 데이터로 기존 수치 재현 확인.
