@@ -2844,3 +2844,21 @@ cap128 r2 o+tb 18,789스텝 중 D축 발동 28.0%, 발동 시 defer p50=1개(max
 - 추가: `exp/run_sslo/analysis/method_table.py` — output_sweep_v2 레이아웃의
   4-method 판정표 생성기 (cap × mode × rate로 viol/tput/TTFC/users/TB*/floor%/
   κ/Ddef, run_N 복수 시 평균±반폭). phaseP2·phaseD 데이터로 기존 수치 재현 확인.
+
+### 2026-08-12 (이어서) — 미해명 항목 해명: offload 허가-집행 괴리
+기존 로그(phaseP2 cap64 r4 offload 단독, 28,231스텝)만으로 원인 규명, 계측 추가 불필요.
+- 배제: waiting 고갈 아님 (저점유 스텝의 waiting p50 = 3,169, waiting==0 비율 0%).
+- 관측: running==0 & k*>=5 스텝이 7.0%, 그 스텝의 pending p50=58,
+  num_handling_users p50=58(전체 41보다 높음), num_scheduled_tokens_total=0.
+  → **전체 스텝의 14.3%가 완전한 빈 스텝** (prefill 0, decode 0).
+- 원인: `kv_blocks_per_new_admit=8` vs 실측 요청당 KV 블록 p50 **141** (18배 과소).
+  free 525블록 → 정책은 66명 가능으로 판단(k*=64), 실제 수용 3.7명.
+  `kv_capped = k_star_unconstrained > best_k`는 정책 KV 모델이 스캔을 멈출 때만
+  참이므로 모델이 낙관적이면 영구 False → **offload tier 발동률 0%**
+  (KV 92.7% 점유인데 num_offloads=0).
+- 인과 사슬: 전원 deferred(슬랙 수확은 정상 동작)로 KV 점유 → 신규 admit은 실제
+  KV 부족으로 실패 → kv_capped 미발화로 vacate도 안 됨 → 빈 스텝.
+- 수정 방향(미착수): kv_capped를 실제 allocator 실패에서 세우고, 블록 수를
+  실측 프롬프트 길이 기반으로 산정. `paper/scheduling.md` §8에 기록.
+- 영향 범위: phaseP2/D/E 모두 동일 결함 → 세 실험 간 비교는 유효, offload
+  tier의 실효 수치만 수정 후 재측정 필요.

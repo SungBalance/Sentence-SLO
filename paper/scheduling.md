@@ -129,6 +129,21 @@
 - ③축 self-lock: 소수 고위험 in-flight의 위험 합이 절대 예산을 소진하면 KV·연산이 남아도 k*≈0 (과포화 + 만기 경과 큐에서 발생; R3 트레이드오프의 대가).
 - o+pb cap64 저하: κ_p 오염(소분모 발산)으로 진단·수정 완료 — GPU 재실행으로 최종 확인 대기 (예측: κ→0.15 수렴, tput 392→~470).
 - `request_risk_cpu`에는 doomed guard($R_{defer}\ge1 \Rightarrow$ offload 부적격)가 없음 — §2의 run-side 가드와 비대칭. 현행 kv_capped 게이트 하에서 실해가 관측되지 않아 미구현 (후보 유지).
+- **[해명됨 2026-08-12] offload 허가-집행 괴리 = KV 모델 18배 과소평가**:
+  `kv_blocks_per_new_admit=8`은 실측(멀티턴 wildchat, 요청당 KV 블록 p50 **141**)
+  대비 18배 과소평가다. 그 결과 free 525블록에서 정책은 66명 admit 가능으로 보고
+  k*=64를 허가하지만 실제로는 3.7명만 들어간다. 더 나쁜 것은 신호 경로다 —
+  `kv_capped = (k_star_unconstrained > best_k)`는 **정책의 KV 모델이 스캔을
+  멈췄을 때만** 참이므로, 모델이 낙관적이면 스캔이 KV에서 안 멈춰 kv_capped가
+  영구 False가 된다. offload tier는 kv_capped 게이트라 **한 번도 발동하지 않는다**
+  (실측 num_offloads=0, KV 92.7% 점유 상태에서).
+  귀결: in-flight 전원이 소비자보다 앞서 deferred(pending 58, running 0)로 KV만
+  붙들고, 신규 admit은 실제 KV 부족으로 막히며, **전체 스텝의 14.3%가 토큰을
+  하나도 스케줄하지 않는 빈 스텝**이 된다 (대기 3,169명 방치).
+  수정 방향: (a) kv_capped를 정책 추정이 아니라 **실제 allocator 실패**에서
+  세우고, (b) 요청당 블록 수를 상수가 아니라 실측 프롬프트 길이에서 산정.
+  ※ 이 결함은 phaseP2/phaseD/phaseE 전부에 동일하게 존재하므로 세 실험 간
+  비교는 유효하나, offload tier의 실효는 수정 후 재측정해야 한다.
 - **borderline 인질** (burst-horizon의 잔존 한계): floor에서는 살릴 수 있으나
   base에서는 doomed가 되는 요청(R 0.6→1.0)은 한계 기여가 ~0.4로 크다. 완전
   doomed(기여 0)와 마감 먼 요청(기여 0)은 해소됐지만 이 경계층은 남는다.
