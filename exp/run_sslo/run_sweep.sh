@@ -34,6 +34,8 @@
 #   TTS_PROFILE_PATH path to profile CSV              (default exp/run_sslo/profiles/word_count_duration_stats.csv)
 #   OUTPUT_ROOT      sweep destination dir            (default exp/run_sslo/output_sweep)
 #   NUM_GPUS         parallel workers                 (default 4)
+#   GPU_IDS          physical GPU ids to use          (default 0..NUM_GPUS-1)
+#                    e.g. GPU_IDS="1 3" on a shared node; sets NUM_GPUS itself
 set -euo pipefail
 cd /workspace/mlsys
 
@@ -52,6 +54,14 @@ RATES="${RATES:-8 12 16 20 24}"
 CONSUME_CELLS=(${CONSUME_CELLS:-read tts:hexgrad/Kokoro-82M tts:Supertone/supertonic-3})
 
 NUM_GPUS="${NUM_GPUS:-4}"
+# Worker g runs on physical GPU ${GPU_IDS[g]}; default is a dense 0..NUM_GPUS-1
+# range, but a shared node may only have scattered GPUs free.
+GPU_IDS=(${GPU_IDS:-})
+if (( ${#GPU_IDS[@]} > 0 )); then
+  NUM_GPUS=${#GPU_IDS[@]}
+else
+  for ((g=0; g<NUM_GPUS; g++)); do GPU_IDS+=("$g"); done
+fi
 TTS_PROFILE_PATH="${TTS_PROFILE_PATH:-exp/run_sslo/profiles/word_count_duration_stats.csv}"
 
 NUM_PROMPTS="${NUM_PROMPTS:-4000}"
@@ -180,7 +190,7 @@ run_phase() {
   for ((g=0; g<NUM_GPUS; g++)); do
     local n_cells=0
     [[ -n "${gpu_queue[g]}" ]] && n_cells=$(printf '%s\n' "${gpu_queue[g]}" | grep -c .)
-    echo "  GPU${g}: cost=${gpu_cost[g]} cells=${n_cells}"
+    echo "  GPU${GPU_IDS[g]}: cost=${gpu_cost[g]} cells=${n_cells}"
   done
   worker() {
     local gpu=$1
@@ -192,7 +202,7 @@ run_phase() {
   }
   local pids=()
   for ((g=0; g<NUM_GPUS; g++)); do
-    printf '%s\n' "${gpu_queue[g]}" | worker "$g" &
+    printf '%s\n' "${gpu_queue[g]}" | worker "${GPU_IDS[g]}" &
     pids+=($!)
   done
   local any_failed=0

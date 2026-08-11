@@ -2828,3 +2828,16 @@ cap128 r2 o+tb 18,789스텝 중 D축 발동 28.0%, 발동 시 defer p50=1개(max
 - GPU 재실행 대기(승인 필요): burst-horizon + ε_p=0.5로 phaseD 재수행.
 - `paper/method.md`는 여전히 TB* 개정 미반영.
 - offload 허가-집행 괴리(k*=13.9인데 미집행)는 이 개정과 무관하게 미해명.
+
+### 2026-08-12 (이어서) — phaseE 실행 + method.md 갱신
+- 실행: `output_sweep_v2/phaseE`, Qwen3-32B/wildchat 멀티턴/GEN 8K, 4모드 ×
+  RATES{0.5,1,2,4} × CAPS{32,64,128} = 48 rate-run. 공용 노드 경합으로 GPU가
+  0/1/3에 흩어져 비어 cap별로 3개 스윕 인스턴스를 병렬 기동.
+- `run_sweep.sh`에 `GPU_IDS` 추가 (기존 `NUM_GPUS`는 0..N-1 조밀 배정만 가능해
+  흩어진 빈 GPU 사용 불가). 지정 시 NUM_GPUS는 개수에서 자동 결정.
+- cap32를 사다리에 추가: borderline 인질이 "재적↑ ⇒ 조임↑"을 예측하므로
+  floor 체류율의 cap 단조성 검증에 3점이 필요 (2점은 추세/잡음 구분 불가).
+- `paper/method.md` §4.3을 burst-horizon TB*로 재작성 (구 γ·T_min 수식 제거,
+  piecewise H_q·매몰비용 논거·E(P_floor) 기준점·ε_p 창 추가). 구 규칙에서 측정된
+  정량 주장(처리량 중립 89-99%, 위반율 1.1-1.5%, 트리거 동시발화 1-2%)은
+  draft note로 재측정 대기 표시 — 발동률 수치는 트리거 정의가 바뀌어 삭제.

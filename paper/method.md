@@ -235,40 +235,82 @@ address this: the spike is caused by prefill *tokens*, not by the number of conc
 requests, and reducing concurrency taxes throughput without flattening the tail. The
 correct control variable is the *token composition of the step*.
 
-**Mechanism.** ProgressServe bounds the prefill tokens per step with a deadline-aware
-budget. Model the step time as $\Delta(P) \approx \Delta_{dec} + \kappa P$, where $P$ is
-the step's prefill token count, $\Delta_{dec}$ is the decode-only baseline (from the
-scheduler's step-time EMA) and $\kappa$ (ms/token) is estimated online from observed
-prefill-carrying steps. Given the tightest deadline among measured in-flight requests,
-$T_{min}$, the step's budget is
+**Mechanism.** ProgressServe bounds the prefill tokens per step with a *token budget*
+$TB^{*}$ priced in the same currency as admission: expected violations. Model the step
+time as $\Delta(P) \approx \Delta_{dec} + \kappa_p P$, where $P$ is the step's prefill
+token count, $\Delta_{dec}$ is the decode-only baseline (read from a batch-matched
+step-time table) and $\kappa_p$ (s/token) is estimated online from prefill-carrying steps
+as a ratio of sums (EMA of excess step time over EMA of prefill tokens), so that the
+estimator cannot be biased by its own clamping decisions.
 
-$$P^{*} \;=\; \mathrm{clamp}\!\Big(\frac{\gamma\, T_{min} - \Delta_{dec}}{\kappa},\;
-P_{floor},\; P_{base}\Big),$$
+The key modelling question is *what a prefill choice actually costs*. Charging
+$\Delta(P)$ to every step until every deadline — the natural reading of a per-step step
+time — is badly wrong: the budget is recomputed every step, prefill-carrying steps are a
+minority (8.9% in our traces), and the one-step cost $\kappa_p P$ would be priced as a
+permanent slowdown, over-charging by roughly $20\times$ at measured $\kappa_p$. We
+instead price the *burst*. Let $W$ be the committed prefill work — the residual prompt
+tokens of in-flight prefills plus those of the prefix of the queue this step admits.
+Choosing $P$ makes the burst $W/P$ steps long at $\Delta_b(P) = \Delta_{dec} + \kappa_p P$
+each, i.e. a wall-clock window
+$\mathrm{wall}(P) = (W/P)\,\Delta_{dec} + \kappa_p W$ after which the step time returns to
+$\Delta_{dec}$. A request's deadline horizon is then piecewise:
 
-with safety factor $\gamma \le 1$: *take as much prefill as fits before the most urgent
-consumer would notice*. The budget is enforced over the step's total prefill — chunked
-carry-over of already-admitted prompts and newly admitted prompts drain a single shared
-counter (in-flight prefills first) — while decode tokens are never limited. Two guards
-complete the design: a positive floor $P_{floor}$ with a starvation counter ensures
-prefill always progresses (bounding TTFC inflation), and when no measured request exists
-($T_{min}$ undefined) or the estimator is cold, the budget rests at $P_{base}$ —
+$$H_q \;=\;
+\begin{cases}
+\lfloor T_q / \Delta_b(P) \rfloor, & T_q \le \mathrm{wall}(P) \\[2pt]
+\lfloor (T_q - \kappa_p W) / \Delta_{dec} \rfloor, & T_q > \mathrm{wall}(P)
+\end{cases}$$
+
+Two properties follow, and they are what make the budget well-posed. First, the total
+delay $\kappa_p W$ is *sunk*: it does not depend on $P$, so $P$ prices only the
+**concentration** of that delay, and requests whose deadlines fall outside the burst
+window pay exactly nothing. Second, a request that will miss regardless
+($R \approx 1$ at every $P$) contributes no marginal risk, so it cannot hold the budget
+hostage. Re-evaluating $E_{viol}$ of §4.1 under this horizon gives
+
+$$TB^{*} \;=\; \max\{\, P \in [P_{floor}, P_{base}] \;:\;
+E_{viol}(P) - E_{viol}(P_{floor}) \le \varepsilon_p \,\},$$
+
+found by bisection since $E_{viol}(P)$ is non-decreasing in $P$. The reference point is
+$E_{viol}(P_{floor})$ — the always-available alternative — rather than a burst-free
+baseline, so the unavoidable part of the sunk cost is not charged against the margin
+$\varepsilon_p$. In words: *buy prefill tokens until the in-flight set's total expected
+violation count has risen by $\varepsilon_p$ over what the floor already costs.* The
+budget is enforced over the step's total prefill — chunked carry-over of already-admitted
+prompts and newly admitted prompts drain a single shared counter (in-flight prefills
+first) — while decode tokens are never limited; the decode side is controlled only by
+whole-request deferral, which the same $E_{viol}$ ledger accepts while it strictly
+improves. Two guards complete the design: a positive floor $P_{floor}$ with a starvation
+counter ensures prefill always progresses (bounding TTFC inflation), and when the
+estimator is cold or no measured request exists, the budget rests at $P_{base}$ —
 i.e., the control degrades to the baseline scheduler, never below it.
 
 **What it improves — and when it does nothing.** The control is *smoothing, not
 reduction*: total prefill work is conserved and spread across steps that were going to
-run anyway, so it is throughput-neutral by construction (measured: 89–99% of baseline
-tokens/s, versus 20–40% losses for request-level batch shrinking). It engages only when
-prefill work and a tight deadline coexist — on our multi-turn workload this is 22–54% of
-steps; on short-prompt workloads the lever is proportionally smaller, and on steps with
-no pending prefill the scheduler is unmodified. In the same evaluation setting it matches
-offloading's violation reductions (1.1–1.5% vs baseline 5.4–6.2%) through an entirely
-disjoint mechanism.
+run anyway, so it is throughput-neutral by construction (89–99% of baseline tokens/s in
+our measurements, versus 20–40% losses for request-level batch shrinking, which we
+report as a rejected alternative). It engages only when prefill work and a genuinely
+at-risk in-flight set coexist; on steps with no pending prefill, or when every deadline
+lies outside the burst window, the scheduler is unmodified by construction. In the same
+evaluation setting it matches offloading's violation reductions (1.1–1.5% vs baseline
+5.4–6.2%) through an entirely disjoint mechanism.
+
+> **Draft note (2026-08-12).** The quantitative claims in this paragraph were measured
+> under the earlier worst-case budget $P^{*} = (\gamma T_{min} - \Delta_{dec})/\kappa_p$,
+> which the burst-horizon formulation above replaces. Throughput neutrality and the
+> violation-reduction range are being re-measured on the shipped rule (sweep `phaseE`,
+> caps 32/64/128); the engagement-rate figure is deliberately omitted until then, since
+> the trigger condition itself changed. The tolerance $\varepsilon_p$ is calibrated
+> against the separation between the marginal cost under normal load and under genuine
+> deadline pressure — measured at 0.41 vs 4.54 expected violations on our workload, an
+> $11\times$ window.
 
 **Composability.** The two extensions bind on different resources in different phases:
 offloading acts when the system is *full* (KV blocks admission; prefill work is scarce
 because little is being admitted), adaptive token batching acts when the system is
 *absorbing* (prompts queued or in flight; KV still has room). Empirically the triggers
-co-fire on only 1–2% of steps — far below the product of their individual rates — so the
+co-fire on only 1–2% of steps under the earlier budget rule — far below the product of
+their individual rates, and pending re-measurement with the rest of §4.3 — so the
 combination behaves as coverage union rather than interaction: each mechanism handles the
 failure phase the other cannot see, on a shared risk model and without contending for the
 same control variable. The composed scheduler (ProgressServe + offload + token batching)
