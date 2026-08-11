@@ -25,8 +25,8 @@
 #                    selectable: baseline, progress_serve,
 #                    progress_serve_adaptive, progress_serve_offload,
 #                    progress_serve_offload_adaptive,
-#                    progress_serve_prefill_budget,
-#                    progress_serve_offload_prefill_budget
+#                    progress_serve_token_budget,
+#                    progress_serve_offload_token_budget
 #                    (e.g. MODES=baseline,progress_serve_offload)
 #   REPEATS          number of repeats                (default 3)
 #   RATES            rate ladder (space-sep)          (default "8 12 16 20 24")

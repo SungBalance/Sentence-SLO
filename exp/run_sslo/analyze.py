@@ -20,6 +20,10 @@ MAX_NUM_SEQS = 64
 DEFAULT_OUTPUT_DIR = "exp/run_sslo/output"
 SSLO_MODES = ("progress_serve", "progress_serve_adaptive",
               "progress_serve_offload", "progress_serve_offload_adaptive",
+              "progress_serve_token_budget",
+              "progress_serve_offload_token_budget",
+              # SSLO: deprecated aliases — phaseP output dirs use the old
+              # P* names, so path-based mode inference must still match them.
               "progress_serve_prefill_budget",
               "progress_serve_offload_prefill_budget")
 ALL_MODES = ("baseline",) + SSLO_MODES

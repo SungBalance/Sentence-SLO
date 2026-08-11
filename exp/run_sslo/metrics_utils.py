@@ -6,6 +6,14 @@ from dataclasses import dataclass
 from typing import Any
 
 
+# SSLO: run kinds retired by the P* → TB* rename. Kept selectable in the mode
+# lists (never in the run_test.py CLI) so path-based mode inference keeps
+# reading the phaseP output directories written under the old names.
+MODES_DEPRECATED = (
+    "progress_serve_prefill_budget",
+    "progress_serve_offload_prefill_budget",
+)
+
 MODES_DEFAULT = (
     "baseline",
     # SSLO
@@ -17,10 +25,10 @@ MODES_DEFAULT = (
     # SSLO
     "progress_serve_offload_adaptive",
     # SSLO
-    "progress_serve_prefill_budget",
+    "progress_serve_token_budget",
     # SSLO
-    "progress_serve_offload_prefill_budget",
-)
+    "progress_serve_offload_token_budget",
+) + MODES_DEPRECATED
 
 
 @dataclass(frozen=True)
