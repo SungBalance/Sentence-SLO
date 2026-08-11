@@ -136,9 +136,18 @@
      허가하나 실제 수용은 3.7명 — 관측된 "허가-집행 괴리"의 직접 원인.
      수정 방향: 요청당 블록 수를 상수가 아니라 실측 프롬프트 길이에서 산정.
   2. **offload tier가 신호는 받되 거의 집행되지 않음**: `kv_capped`는 정상
-     발화(12.8%)하는데 전체 런에서 실제 offload는 **20회**뿐. 자격 조건
-     (M_cpu ≤ ε ∧ residency ≥ ρ)이 사실상 전부 기각하는 것으로 보이나,
-     기각 사유별 카운터가 없어 원인 미확정 — **계측 추가 필요**.
+     발화(12.8%)하는데 전체 런에서 실제 offload는 **20회**뿐. 후보 게이트는
+     순서대로 ① `min_residency`(기본 0 — no-op이므로 배제) ②
+     `is_fully_mirrored` ③ `is_measurable` ④ `M_cpu ≤ ε`. 여기에 더해
+     `blocks_needed = (k*_unconstrained − k*) × per_admit`이 결함 1의
+     per_admit=8을 그대로 쓰므로 **요구량 자체가 18배 과소** — 결함 1과 2는
+     독립이 아니라 같은 상수를 공유한다.
+     **선행 가설(미확정)**: `is_fully_mirrored`는 in-flight store가 있으면
+     False인데(`manager.py:676`), 디코딩 중에는 매 토큰이 새 블록을 만들어
+     미러링이 계속 밀린다. deferred로 내려가야 블록이 안정되어 미러링이
+     완료되는 구조라, 미러링 완료 전에 run/defer 재평가가 요청을 다시
+     promote하면 영구히 자격 미달이 된다. 확인하려면 게이트별 기각 카운터가
+     필요 — **계측 추가 필요**.
   귀결(SSLO 고유): in-flight 전원이 소비자보다 앞서 deferred되어 KV만 붙들고
   (running 0 / pending 58), 신규 admit은 실제 KV 부족으로 막히며, **전체 스텝의
   7.0%가 대기 3,006명을 둔 채 유휴**가 된다. baseline에는 이 상태가 0%다.
