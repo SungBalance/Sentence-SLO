@@ -1301,6 +1301,21 @@ class Scheduler(SchedulerInterface):
         return sum(bucket.values()) / len(bucket)
 
     # SSLO
+    def _sslo_is_onloading(self, req: Request) -> bool:
+        """True for a request sitting in ``self.waiting`` only because its
+        CPU->GPU KV restore is in flight.
+
+        Such a request is already represented by its LOC_ONLOADING view, and
+        what it will replay is a KV restore, not prefill work — yet
+        ``_preempt_request`` reset its ``num_computed_tokens`` to 0 and the
+        onload prologue prepends it to the queue head. Every waiting-queue scan
+        that feeds the risk math must therefore skip it, or it gets
+        double-counted AND pushes the real head out of the k* prefix.
+        """
+        return (self._sslo_offload_conn is not None
+                and req.request_id in self._sslo_onloading)
+
+    # SSLO
     def _sslo_prefill_token_budget(
         self,
         views_a: list["ps.ProgressView"],
@@ -1308,6 +1323,7 @@ class Scheduler(SchedulerInterface):
         d_prime: int,
         lead: int,
         share_parked: bool,
+        k_star: int,
     ) -> int | None:
         """Per-step prefill token cap TB*_pre, or None when the control is off.
 
@@ -1320,6 +1336,11 @@ class Scheduler(SchedulerInterface):
         used, so the dosing sees exactly the risk admission priced. After
         _SSLO_PREFILL_FLOOR_STARVE_STEPS consecutive floor-clamped steps with
         no prefill progress, one step gets the full base budget.
+
+        W (``prefill_work``) is this burst's remaining prefill work: the
+        chunked-prefill carry-over the in-flight set still owes plus the
+        prompts of the ``k_star`` queue heads this step is allowed to admit.
+        It sets how long the burst lasts, hence which deadlines fall inside it.
         """
         cfg = self.sslo_config
         if not cfg.token_budget_control:
@@ -1332,6 +1353,23 @@ class Scheduler(SchedulerInterface):
         delta_decode = self._sslo_decode_wall_ema(d_prime)
         if delta_decode is None:
             return None
+        # SSLO: W — the burst this step prices. self.running / self.sslo_pending
+        # are still the pre-commit in-flight set here, so this is the whole
+        # chunked-prefill carry-over; decode-only requests contribute 0.
+        prefill_work = sum(
+            max(0, req.num_prompt_tokens - req.num_computed_tokens)
+            for req in self.running + self.sslo_pending)
+        n_heads = 0
+        for req in self.waiting:
+            if n_heads >= k_star:
+                break
+            # SSLO: same exclusion the waiting_views scan applies — an onload
+            # is a KV restore, not prefill work (spec §3⑤).
+            if self._sslo_is_onloading(req):
+                continue
+            prefill_work += max(
+                0, req.num_prompt_tokens - req.num_computed_tokens)
+            n_heads += 1
         budget = ps.token_budget_prefill_risk(
             views_A=views_a,
             b=b,
@@ -1340,6 +1378,7 @@ class Scheduler(SchedulerInterface):
             base_budget=self.max_num_scheduled_tokens,
             floor=cfg.token_budget_prefill_floor,
             eps_p=cfg.token_budget_risk_eps,
+            prefill_work=prefill_work,
             lead=lead,
             share_includes_parked=share_parked,
         )
@@ -1779,12 +1818,9 @@ class Scheduler(SchedulerInterface):
         for req in self.waiting:
             if len(waiting_views) >= b:
                 break
-            # SSLO: an onloading req may still be sitting in self.waiting
-            # before its CPU->GPU load starts; it is already represented by its
-            # LOC_ONLOADING view, so skip it here to avoid double-counting the
-            # same request as a new admit (inflates the slot / |A+| budget).
-            if (self._sslo_offload_conn is not None
-                    and req.request_id in self._sslo_onloading):
+            # SSLO: skip onloading reqs so the same request is not counted
+            # again as a new admit (inflates the slot / |A+| budget).
+            if self._sslo_is_onloading(req):
                 continue
             waiting_views.append(ps.ProgressView(
                 request_id=req.request_id, c_q=0, T_q=None,
@@ -1849,7 +1885,8 @@ class Scheduler(SchedulerInterface):
             # Recorded here; schedule_sslo's running / waiting loops spend it.
             self._sslo_step.token_budget_prefill = (
                 self._sslo_prefill_token_budget(
-                    views_a, b, len(new_running), lead, share_parked))
+                    views_a, b, len(new_running), lead, share_parked,
+                    result.k_star))
 
         # Decision-log score: R_run for measurable, 1.0 for forced.
         plan = ps.build_plan(

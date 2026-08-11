@@ -116,6 +116,41 @@ def horizon(t_q: float, delta: float) -> int:
     return max(0, math.floor(t_q / delta))
 
 
+def burst_horizon(
+    t_q: float, delta_dec: float, delta_burst: float, burst_steps: float
+) -> int:
+    """H_q when a prefill burst runs first, then the step time returns to Δ_dec.
+
+    The burst is ``burst_steps`` = W/P steps of ``delta_burst`` = Δ_dec + κ_p·P
+    each, i.e. it ends at wall(P) = burst_steps·delta_burst; after that every
+    step costs Δ_dec again:
+
+        T_q <= wall:  H_q = floor(T_q / delta_burst)
+        T_q >  wall:  H_q = floor(burst_steps + (T_q - wall) / delta_dec)
+
+    The two branches agree at T_q == wall, so H_q is continuous in T_q. The
+    second branch simplifies to floor((T_q - κ_p·W) / Δ_dec) — independent of
+    P: past the burst only the burst's TOTAL added time κ_p·W is felt, and that
+    is fixed by the arrival W, not by the budget. Only requests whose deadline
+    falls INSIDE the burst window pay for P.
+    """
+    if delta_burst <= 0 or delta_dec <= 0:
+        return 0
+    wall = burst_steps * delta_burst
+    if t_q <= wall:
+        return max(0, math.floor(t_q / delta_burst))
+    return max(0, math.floor(burst_steps + (t_q - wall) / delta_dec))
+
+
+def _deadline_horizon(
+    t_q: float, delta: float, delta_burst: float | None, burst_steps: float
+) -> int:
+    """H_q under the plain (``delta_burst is None``) or burst step-time model."""
+    if delta_burst is None:
+        return horizon(t_q, delta)
+    return burst_horizon(t_q, delta, delta_burst, burst_steps)
+
+
 def service_share(b: int, n_aplus: int) -> float:
     """s = min(1, B / |A+|). Returns 1.0 when |A+| == 0."""
     if n_aplus <= 0:
@@ -135,16 +170,24 @@ def n_run_defer(h_q: int, s: float) -> tuple[int, int]:
 
 
 def request_risk(
-    view: ProgressView, delta: float, s: float
+    view: ProgressView,
+    delta: float,
+    s: float,
+    delta_burst: float | None = None,
+    burst_steps: float = 0.0,
 ) -> tuple[float, float, float]:
     """(R_run, R_defer, M) for a measurable request.
 
     R_run = P(L > c_q + N_run | L > c_q); R_defer likewise with N_defer.
     M = R_defer - R_run >= 0 (since N_run >= N_defer and tail is
     non-increasing).
+
+    ``delta_burst`` / ``burst_steps`` switch H_q to the burst-horizon model
+    (see ``burst_horizon``), in which ``delta`` is the POST-burst Δ_dec.
+    ``delta_burst is None`` (the default) keeps the plain H_q = T_q/Δ.
     """
     assert view.T_q is not None
-    h_q = horizon(view.T_q, delta)
+    h_q = _deadline_horizon(view.T_q, delta, delta_burst, burst_steps)
     n_run, n_defer = n_run_defer(h_q, s)
     r_run = view.tail_prob(view.c_q + n_run)
     r_defer = view.tail_prob(view.c_q + n_defer)
@@ -172,7 +215,12 @@ def n_defer_cpu(h_q: int, s: float, lead: int) -> int:
 
 
 def request_risk_cpu(
-    view: ProgressView, delta: float, s: float, lead: int
+    view: ProgressView,
+    delta: float,
+    s: float,
+    lead: int,
+    delta_burst: float | None = None,
+    burst_steps: float = 0.0,
 ) -> tuple[float, float, float]:
     """(R_defer, R_defer_cpu, M_cpu) for a measurable request.
 
@@ -180,9 +228,12 @@ def request_risk_cpu(
     N_defer_cpu. Since N_defer_cpu <= N_defer and the tail is non-increasing,
     R_defer <= R_defer_cpu, so M_cpu = R_defer_cpu - R_defer >= 0 — the risk
     penalty of the request staying on CPU (losing ``lead`` iterations).
+
+    ``delta_burst`` / ``burst_steps`` switch H_q to the burst-horizon model,
+    exactly as in ``request_risk``.
     """
     assert view.T_q is not None
-    h_q = horizon(view.T_q, delta)
+    h_q = _deadline_horizon(view.T_q, delta, delta_burst, burst_steps)
     _n_run, n_defer = n_run_defer(h_q, s)
     n_dc = n_defer_cpu(h_q, s, lead)
     r_defer = view.tail_prob(view.c_q + n_defer)
@@ -197,6 +248,8 @@ def build_plan(
     delta: float,
     lead: int = 0,
     share_includes_parked: bool = True,
+    delta_burst: float | None = None,
+    burst_steps: float = 0.0,
 ) -> Plan:
     """Partition existing in-flight A into scheduled / deferred under a fixed
     batch size ``b`` and candidate in-flight set A+ = A ∪ A_new.
@@ -220,6 +273,12 @@ def build_plan(
 
     E_viol = Σ_{scheduled measurable} R_run + Σ_{deferred measurable} R_defer
              + Σ_{CPU measurable} R_defer_cpu.
+
+    ``delta_burst`` / ``burst_steps`` are passed straight through to
+    ``request_risk`` / ``request_risk_cpu``, so the whole ledger is evaluated
+    against the burst-horizon step-time model instead of a constant Δ. They
+    change only H_q — the service share, the slot budget and the assignment
+    rule are unaffected.
     """
     gpu_views = [v for v in views_A if v.location == LOC_GPU]
     cpu_views = [v for v in views_A if v.location == LOC_CPU]
@@ -239,7 +298,7 @@ def build_plan(
     risks: dict[str, tuple[float, float, float]] = {}
     scored = []
     for v in measurable:
-        r_run, r_defer, m = request_risk(v, delta, s)
+        r_run, r_defer, m = request_risk(v, delta, s, delta_burst, burst_steps)
         risks[v.request_id] = (r_run, r_defer, m)
         scored.append((m, r_run, r_defer, v))
     # Largest marginal benefit first; reduces E_viol the most per slot.
@@ -265,7 +324,8 @@ def build_plan(
     for v in cpu_views:
         offloaded_ids.append(v.request_id)
         if v.is_measurable():
-            r_defer, r_defer_cpu, m_cpu = request_risk_cpu(v, delta, s, lead)
+            r_defer, r_defer_cpu, m_cpu = request_risk_cpu(
+                v, delta, s, lead, delta_burst, burst_steps)
             e_viol += r_defer_cpu
             cpu_risks[v.request_id] = (r_defer, r_defer_cpu, m_cpu)
     return Plan(
@@ -497,60 +557,96 @@ def token_budget_prefill_risk(
     base_budget: int,
     floor: int,
     eps_p: float,
+    prefill_work: int,
     lead: int = 0,
     share_includes_parked: bool = True,
 ) -> int:
     """Per-step prefill token budget TB*_pre (P axis), dosed on expected risk.
 
-        Δ(P)    = delta_dec + kappa_p·P     (step time carrying P prefill tokens)
-        E(P)    = build_plan(views_A, [], b, Δ(P)).e_viol
-        TB*_pre = max{ P ∈ [floor, base_budget] : E(P) - E(0) <= eps_p }
+    ``prefill_work`` = W, this burst's remaining prefill work in tokens (the
+    chunked-prefill carry-over plus the prompts this step may admit). Choosing
+    P spreads W over
 
-    i.e. buy prefill tokens until the in-flight set's TOTAL expected violation
-    count has risen by ``eps_p`` — a marginal budget in the same currency the
-    admission rule spends (E_viol), not a worst-case deadline constraint.
+        n_b(P)   = W / P                    burst steps
+        Δ_b(P)   = delta_dec + kappa_p·P    seconds each
+        wall(P)  = n_b·Δ_b = (W/P)·Δ_dec + kappa_p·W
 
-    Replaces the γ·t_min rule (``token_budget_prefill``, 2026-08-11): that one
-    priced the step off ONE request's remaining time, so a single near-deadline
-    survivor — typically one that cannot be saved at all — pinned TB*_pre to
-    the floor and stalled the refill. Here a doomed request (R ≈ 1 either way)
-    barely moves E(P), so its sunk risk stops holding prefill hostage.
+    after which the step time returns to ``delta_dec`` (``burst_horizon``):
+
+        E(P)    = build_plan(..., delta_burst=Δ_b(P), burst_steps=n_b(P)).e_viol
+        TB*_pre = max{ P ∈ [floor, base_budget] : E(P) - E(floor) <= eps_p }
+
+    i.e. buy prefill tokens until the in-flight set's expected violation count
+    has risen by ``eps_p`` over what the SMALLEST allowed budget would already
+    cost — a marginal budget in the same currency the admission rule spends
+    (E_viol).
+
+    Why the reference is E(floor) and not a burst-free E: the floor is granted
+    unconditionally, so it is the only always-reachable operating point, and
+    every P pays the same unavoidable share of the burst. Referencing E(floor)
+    cancels that share out. A burst-free reference would instead charge the
+    sunk kappa_p·W to every candidate, and once that fixed offset alone exceeds
+    ``eps_p`` NO P clears the test and the rule pins to the floor forever —
+    the same floor-residency failure this axis exists to remove.
+
+    What P actually buys: the burst's TOTAL added time kappa_p·W is sunk (it is
+    fixed by the arrival W, not by the budget), so past wall(P) the horizon is
+    P-independent. P therefore sets the burst's CONCENTRATION, not its cost —
+    only requests whose deadline falls INSIDE the burst window are priced for
+    it. Two consequences: a far-deadline request contributes the same E(P) at
+    every P, so it costs exactly 0 against the E(floor) reference, and a doomed
+    one (R ≈ 1 either way) barely moves E(P); neither holds prefill hostage.
+    This replaces the recurring-price rule (2026-08-11), which applied
+    Δ(P) = Δ_dec + kappa_p·P to EVERY step until each deadline and so charged a
+    one-step cost as a permanent slowdown (~20x overprice; floor residency
+    43-83%, -23% throughput — see paper/scheduling.md §6).
 
     Units: ``delta_dec`` seconds per decode-only step at the D axis' chosen
     decode set size D' (see ``select_decode_defer``), ``kappa_p`` SECONDS of
     extra step time per prefill token (``_sslo_kappa`` is a ratio of a seconds
-    EMA to a token EMA, so Δ(P) stays in seconds), ``base_budget`` / ``floor``
-    tokens, ``eps_p`` in expected-violation units.
+    EMA to a token EMA, so Δ_b(P) stays in seconds), ``base_budget`` / ``floor``
+    / ``prefill_work`` tokens, ``eps_p`` in expected-violation units.
 
-    E(P) is non-decreasing in P: Δ(P) grows with P, which shrinks every H_q,
-    hence every N_run / N_defer, hence raises every (non-increasing) tail
-    probability; build_plan's largest-M-first assignment is the risk-minimizing
-    one at each Δ. So the largest feasible P is found by bisection: 2 +
+    E(P) is non-decreasing in P: H_q is floor(T_q/Δ_b) inside the burst window
+    (falling in P) and P-independent outside it, and wall(P) shrinks with P so
+    requests only ever move from the first branch to the second — where the two
+    agree at the crossing. Every H_q is therefore non-increasing in P, hence
+    every N_run / N_defer, hence every (non-increasing) tail probability is
+    non-decreasing. So the largest feasible P is found by bisection: 2 +
     ceil(log2(base_budget - floor)) build_plan calls (15 over the default
     512..8192 range) — small next to the up-to-k*+1 calls schedule_step already
-    spends per step.
+    spends per step. P = floor scores 0 by construction, so the search always
+    has a feasible point and never has to test one.
 
-    ``floor`` is clamped to ``base_budget`` and the result is always in
+    ``floor`` is clamped into [1, ``base_budget``] and the result is always in
     [floor, base_budget]: the floor is granted unconditionally so prefill keeps
-    making progress even when no P is affordable. Control is disabled — returns
-    ``base_budget`` — when ``kappa_p <= 0`` (no usable estimate) or nothing in
-    ``views_A`` is measurable (no risk ledger to protect).
+    making progress even when no P is affordable, and it must stay >= 1 both
+    because a zero dose would stall prefill outright and because it is the
+    reference point E(floor) — a burst of W/0 steps is undefined. Control is
+    disabled — returns
+    ``base_budget`` — when ``kappa_p <= 0`` (no usable estimate), when
+    ``prefill_work <= 0`` (no burst to price) or when nothing in ``views_A`` is
+    measurable (no risk ledger to protect).
     """
-    floor = min(floor, base_budget)
+    floor = max(1, min(floor, base_budget))
     if kappa_p <= 0:
+        return base_budget
+    if prefill_work <= 0:
         return base_budget
     if not any(v.is_measurable() for v in views_A):
         return base_budget
 
     def e_viol(p: int) -> float:
-        return build_plan(views_A, [], b, delta_dec + kappa_p * p, lead,
-                          share_includes_parked).e_viol
+        return build_plan(views_A, [], b, delta_dec, lead,
+                          share_includes_parked,
+                          delta_burst=delta_dec + kappa_p * p,
+                          burst_steps=prefill_work / p).e_viol
 
-    baseline = e_viol(0)
+    baseline = e_viol(floor)
     if e_viol(base_budget) - baseline <= eps_p:
         return base_budget
     # Invariant: `hi` is known over budget, `lo` is the largest P known within
-    # it — or the floor, which is granted without being tested.
+    # it — starting at the floor, which scores 0 against itself.
     lo, hi = floor, base_budget
     while hi - lo > 1:
         mid = (lo + hi) // 2

@@ -60,6 +60,10 @@ def make_request(request_id: str, state: RequestSLOState):
         slo_state=state,
         status=None,
         has_encoder_inputs=False,
+        # Prompt progress: the P axis sums the in-flight set's remaining prompt
+        # tokens into W. Default = prefill already done (contributes 0 to W).
+        num_prompt_tokens=0,
+        num_computed_tokens=0,
     )
 
 
@@ -878,9 +882,15 @@ def _prep_token_budget_prefill(scheduler, *, kappa=0.001, delta_decode=0.08):
     scheduler._sslo_step_wall_ema = {len(scheduler.running): {0: delta_decode}}
 
 
-def _tb_prefill(scheduler):
+def _tb_prefill(scheduler, prefill_work=4096):
     """Call the P axis with the ledger the policy hands it: ProgressViews over
-    the in-flight set, the step's batch size, and D' = len(running)."""
+    the in-flight set, the step's batch size, and D' = len(running).
+
+    The axis prices THIS step's prefill burst, so the in-flight set needs
+    chunked-prefill carry-over to make W > 0 (W = 0 ⇒ nothing to dose). With
+    κ_p = 1 ms/token the 4096-token burst's window is ≥ 4.1 s, so every
+    sub-second deadline below falls inside it and is priced.
+    """
     views = [
         ps.ProgressView(
             request_id=req.request_id,
@@ -890,8 +900,12 @@ def _tb_prefill(scheduler):
             tail_prob=req.slo_state.length_tail_prob)
         for req in scheduler.running
     ]
+    for req in scheduler.running:
+        req.num_prompt_tokens = prefill_work
+        req.num_computed_tokens = 0
     return scheduler._sslo_prefill_token_budget(
-        views, scheduler.max_num_running_reqs, len(scheduler.running), 0, True)
+        views, scheduler.max_num_running_reqs, len(scheduler.running), 0, True,
+        0)
 
 
 def _tb_request(request_id, *, deadline, tail):
@@ -902,8 +916,11 @@ def _tb_request(request_id, *, deadline, tail):
 
 # A request whose risk actually moves with the step time (the cold-start tail
 # make_state ships is a step function at 2048 tokens, i.e. flat R = 1 for any
-# realistic horizon, which would read as "doomed" and never dose).
-_TB_SENSITIVE = lambda x: max(0.0, 1.0 - x / 2000.0)
+# realistic horizon, which would read as "doomed" and never dose). The scale is
+# the sub-second horizons the P axis works with: TB*_pre is priced against what
+# the FLOOR already delivers, so a tail that only moves over thousands of tokens
+# reads as flat between floor and base and never binds.
+_TB_SENSITIVE = lambda x: max(0.0, 1.0 - x / 20.0)
 
 
 def test_token_budget_prefill_off_by_default(monkeypatch):
@@ -943,8 +960,13 @@ def test_token_budget_prefill_requires_kappa_and_decode_reference():
 
 
 def test_token_budget_prefill_doses_by_risk():
+    # ε_p is pinned here rather than taken from the default: this fixture is
+    # about WHERE the dose lands, so the budget it is dosed against has to be
+    # part of the fixture (the shipped default is calibrated for measured load,
+    # not for these synthetic tails).
     cfg = SsloConfig(method="progress_serve", token_budget_control=True,
-                     token_budget_prefill_floor=64)
+                     token_budget_prefill_floor=64,
+                     token_budget_risk_eps=0.01)
     # Nothing at risk → the dosing does not bind (full base budget).
     relaxed = _tb_request("relaxed", deadline=1e6, tail=_TB_SENSITIVE)
     scheduler = make_scheduler(running=[relaxed], cfg=cfg)
@@ -976,10 +998,77 @@ def test_token_budget_prefill_doses_by_risk():
     assert _tb_prefill(scheduler) > tight
 
 
-def test_token_budget_prefill_starvation_guard_releases_base_budget():
+def _spy_prefill_work(scheduler, monkeypatch, *, k_star):
+    """Run the P axis and return the W it handed to the pure dosing rule."""
+    seen = {}
+    real = ps.token_budget_prefill_risk
+
+    def spy(**kw):
+        seen.update(kw)
+        return real(**kw)
+
+    monkeypatch.setattr(ps, "token_budget_prefill_risk", spy)
+    views = [
+        ps.ProgressView(
+            request_id=req.request_id,
+            c_q=req.slo_state.current_chunk_generated_len,
+            T_q=req.slo_state.time_to_deadline(0.0),
+            phase=int(req.slo_state.phase), is_new_admit=False,
+            tail_prob=req.slo_state.length_tail_prob)
+        for req in scheduler.running
+    ]
+    scheduler._sslo_prefill_token_budget(
+        views, scheduler.max_num_running_reqs, len(scheduler.running), 0, True,
+        k_star)
+    return seen["prefill_work"]
+
+
+def test_token_budget_prefill_work_counts_carry_over_and_k_star_heads(
+        monkeypatch):
+    # W = in-flight chunked-prefill carry-over + the prompts of the k* heads the
+    # admission search cleared. The head past k* is next step's work, not this
+    # burst's.
     cfg = SsloConfig(method="progress_serve", token_budget_control=True)
-    # Under pressure the dose lands below the 512-token floor, so every step
-    # is floor-clamped.
+    r = _tb_request("r0", deadline=2.0, tail=_TB_SENSITIVE)
+    r.num_prompt_tokens, r.num_computed_tokens = 100, 40  # 60 still owed
+    scheduler = make_scheduler(running=[r], cfg=cfg)
+    _prep_token_budget_prefill(scheduler)
+    scheduler.waiting = FakeWaitingQueue(
+        [_waiting_request("n0", 10), _waiting_request("n1", 7),
+         _waiting_request("n2", 5000)])
+
+    assert _spy_prefill_work(scheduler, monkeypatch, k_star=2) == 60 + 10 + 7
+
+
+def test_token_budget_prefill_work_excludes_onloading_head(monkeypatch):
+    # An onloading request sits at the queue head (the onload prologue prepends
+    # it) with num_computed_tokens reset to 0 by the offload preempt. It is a KV
+    # restore, not prefill work, and the waiting_views scan already skips it —
+    # so W must skip it too. Counting it would both charge its whole prompt and
+    # push the real head out of the k* prefix.
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True,
+                     kv_offload=True)
+    r = _tb_request("r0", deadline=2.0, tail=_TB_SENSITIVE)
+    scheduler = make_scheduler(running=[r], cfg=cfg)
+    _prep_token_budget_prefill(scheduler)
+    onloading = _waiting_request("onloading", 5000)
+    scheduler.waiting = FakeWaitingQueue(
+        [onloading, _waiting_request("n0", 10)])
+    scheduler._sslo_offload_conn = FakeOffloadConnector()
+    scheduler._sslo_onloading = {"onloading": onloading}
+
+    # r0's prefill is done → W is n0's prompt alone, not the onload's 5000.
+    assert _spy_prefill_work(scheduler, monkeypatch, k_star=1) == 10
+
+
+def test_token_budget_prefill_starvation_guard_releases_base_budget():
+    # The floor is priced at Δ_b = 0.08 + 0.001*920 = 1.0 s, which leaves the
+    # urgent request a horizon of 2; one more prefill token stretches the step
+    # past 1 s and drops it to 1, which costs more than eps_p. So no P above
+    # the floor is affordable and every step is floor-clamped.
+    cfg = SsloConfig(method="progress_serve", token_budget_control=True,
+                     token_budget_prefill_floor=920,
+                     token_budget_risk_eps=0.01)
     urgent = _tb_request("urgent", deadline=2.0, tail=_TB_SENSITIVE)
     scheduler = make_scheduler(running=[urgent], cfg=cfg)
     _prep_token_budget_prefill(scheduler)
@@ -1095,8 +1184,11 @@ def test_token_budget_p_axis_is_recorded_by_the_policy():
     # D' — and records it on the step state; schedule_sslo's running / waiting
     # loops spend exactly what was recorded.
     cfg = SsloConfig(method="progress_serve", token_budget_control=True,
-                     token_budget_prefill_floor=64)
+                     token_budget_prefill_floor=64,
+                     token_budget_risk_eps=0.01)
     r = _tb_request("r0", deadline=2.0, tail=_TB_SENSITIVE)
+    # Chunked-prefill carry-over: the burst W the P axis prices this step.
+    r.num_prompt_tokens = 4096
     scheduler = make_scheduler(running=[r], cfg=cfg)
     _prep_token_budget_prefill(scheduler)
 

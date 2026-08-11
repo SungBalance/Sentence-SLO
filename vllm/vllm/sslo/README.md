@@ -284,11 +284,20 @@ the axis is a no-op.
 
 **P axis** (`progress_serve.token_budget_prefill_risk`). Caps the **total**
 prefill tokens of one scheduler step at
-`TB*_pre = max{ P ∈ [floor, max_num_batched_tokens] : E_viol(Δ_dec(D') + κ_p·P)
-− E_viol(Δ_dec(D')) ≤ token_budget_risk_eps }`, where `D'` is what the D axis
-settled on — the largest prefill dose whose extra expected violations stay
-inside `ε_p`. `E_viol` is non-decreasing in `P`, so the maximum is found by
-bisection (2 + ⌈log2(base − floor)⌉ `build_plan` calls, ~15 at the defaults).
+`TB*_pre = max{ P ∈ [floor, max_num_batched_tokens] : E(P) − E(floor) ≤
+token_budget_risk_eps }`. `E(P)` re-prices the ledger under a **burst horizon**:
+`W` (this step's remaining prefill work — in-flight carry-over plus the prompts
+of the `k*` queue heads, onloading requests excluded) is spread over `W/P` steps
+of `Δ_dec(D') + κ_p·P`, after which the step time returns to `Δ_dec(D')`, where
+`D'` is what the D axis settled on. So a request whose deadline falls past the
+burst window sees a horizon set only by the sunk total delay `κ_p·W` and is not
+charged for `P` at all; `P` prices the burst's *concentration*, not its cost.
+The reference is `E(floor)` — the floor is granted unconditionally, so it is the
+only always-reachable alternative, and referencing it cancels the unavoidable
+sunk share (a burst-free reference would charge `κ_p·W` to every candidate and
+pin the dose to the floor forever). `E(P)` is non-decreasing in `P`, so the
+maximum is found by bisection (2 + ⌈log2(base − floor)⌉ `build_plan` calls, ~15
+at the defaults).
 Motivated by the measurement that prefill-carrying steps are 6% of steps but
 18.4% of wall clock (Δ p90 463 ms vs 78 ms decode-only). The absolute admission
 budget `E_viol < 1` is untouched (R3): `ε_p` doses prefill only, and prefill
@@ -314,7 +323,7 @@ self-disables when chunked prefill is off).
 |---|---|---|
 | `token_budget_control` | `False` | Enable the Token Budget (both axes) |
 | `token_budget_prefill_floor` | 512 | Lower clamp on `TB*_pre` (tokens); must be > 0 so prefill always progresses |
-| `token_budget_risk_eps` | 0.01 | P axis: expected-violation budget `ε_p` the prefill dose may add; must be > 0 |
+| `token_budget_risk_eps` | 0.5 | P axis: expected-violation budget `ε_p` the prefill dose may add over `E(floor)`; must be > 0 |
 | `token_budget_gamma` | 0.5 | **Deprecated** (2026-08-11) — γ of the rejected worst-case `token_budget_prefill()`, kept for A/B replay only |
 | `token_budget_decode_risk_eps` | 1e-3 | D axis: only `R_defer ≤ eps` requests may be dropped from the decode set |
 

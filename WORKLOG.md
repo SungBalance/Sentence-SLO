@@ -2756,3 +2756,75 @@ Modes are now exactly `{baseline, progress_serve}`.
   (admits/parked 미포함, s는 자격 판정에만). 자기일관적 hill-climb이라
   안전성은 훼손 없으나 "전체 원장 대비 defer가 덜 발동하는 보수 방향"이라는
   방향성 주장은 수학적 증명·대조 테스트 없음 — 알려진 한계로 유지.
+
+## 2026-08-12 — TB* P축 가격 모델: 무한-지평 → burst-horizon 교체
+
+### 실증: 무한-지평 재발 가격(2026-08-11 초판)의 기각
+- phaseD 스윕(GPU 2,3, cap128, Qwen3-32B/wildchat/GEN 8K)으로 신판 TB*를
+  구판(γ·T_min)과 동일 축에서 대조. baseline 교차 확인으로 GPU 0,1(phaseP2) 대비
+  하드웨어 동등성 확보(tput 차 3~6%).
+- 결과(cap128 o+tb, 구판→신판): floor 체류 6.9/22.2/18.3/15.7% →
+  42.5/47.2/77.9/82.7%, r1 tput 507→391, TTFC p50 256→668s, 위반율 이득 없음.
+- 원인: `Δ(P)=Δ_dec+κ_p·P`를 `build_plan`에 넘기면 `horizon(T_q,Δ)=T_q/Δ`가
+  이를 **마감까지 모든 스텝**의 시간으로 사용 → 1스텝 비용 κ_p·P(0.1~0.4s)를
+  영구 감속으로 계산. 실측 κ_p=0.198ms/tok·Δ_dec=74ms에서 P=2048이 모든 미래
+  스텝 6.5배 감속으로 가격됨(~20× 과대). 실측 prefill 포함 스텝은 8.9%뿐.
+  매 스텝 재결정되는 비용을 전지평에 물리는 이중과금.
+
+### 수정 내용
+- `paper/scheduling.md` §3⑤ 재작성(burst-horizon), §6에 초판 기각 근거,
+  §8에 borderline 인질 한계 신규 기재.
+- `progress_serve.py`: `burst_horizon()` piecewise 지평 + `request_risk`/
+  `request_risk_cpu`/`build_plan`에 선택적 `delta_burst`/`burst_steps`
+  (None이면 기존 경로 bit-동일). `token_budget_prefill_risk(..., prefill_work=W)`,
+  기준점 `E_ref = E(P_floor)`, `floor = max(1, min(floor, base_budget))`.
+- `scheduler.py`: W = PREFILL 캐리오버 잔여 + k* 이내 waiting 헤드 프롬프트.
+  `_sslo_is_onloading()` 술어 추출로 W 루프와 `waiting_views` 스캔이 동일
+  필터를 공유(조건식 복제 금지 — 어긋남 재발 방지).
+- `config.py`: `token_budget_risk_eps` 0.01 → **0.5** (근거는 아래 상상 실행).
+
+### 상상 실행 (실측 분포 기반 3모델 대조, GPU 미실행)
+phaseD chunks.jsonl 31,596청크의 실측 tail/slack, κ_p=1.98e-4, Δ_dec=0.074s.
+M0=무한지평(기각) / M1=1회성 T_q 잠식(A안) / M2=burst-horizon(채택).
+
+| 시나리오 | M0 | M1 | M2 | 정답 |
+|---|---|---|---|---|
+| S1 평시 고부하(재적 47) | 512 | 512 | 538 | 개방 |
+| S2 회복-정지(doomed 2) | 2656 | 8192 | 8192 | 개방 ✓ |
+| S3 진짜 위험 | 512 | 512 | 512 | 클램프 ✓ |
+| S4 마감 먼 요청만 | 8192 | 8192 | 8192 | base ✓ |
+
+- M1 기각 사유: κ_p·**P**를 과금하나 실제 burst 지연은 κ_p·**W** — W<P면
+  6.5× 과금, W≫P면 3× 과소과금.
+- ε_p 창 측정: 평시 dE=0.413 vs 위험 국면 dE=4.537 (11× 분리). 구판 0.01은
+  창보다 40× 아래라 평시에도 floor 강제 → **0.5 채택**(S1 8192 / S3 558).
+  S2·S4는 dE≡0이라 ε_p 무관.
+- 잔존 한계: floor에서 살고 base에서 doomed가 되는 **borderline** 요청의
+  한계 기여 ~0.4. 요청당 발생률 1.75% → 재적 47이면 스텝의 56.5%에 최소 1명
+  (재적 5면 8.5%). cap이 클수록 조임이 강해지는 방향성 잔존 — 스윕에서 cap별
+  floor 체류율 대조 필요.
+
+### 검증 (개발↔검증 agent 2라운드, 종료조건 "이슈 없음" 충족)
+- 라운드 1 Critical: W 루프가 `self.waiting`을 raw 순회해 onload 요청을 이중계상.
+  onload는 `_sslo_apply_offload`에서 waiting에 prepend되고 offload preempt가
+  `num_computed_tokens=0`으로 리셋하므로, KV 복원 요청의 전체 프롬프트가 W에
+  실리고 진짜 헤드가 k* prefix 밖으로 밀려남(재현: 기대 10 → 실제 5000).
+  기존 테스트는 `_tb_prefill`이 `k_star=0` 고정이라 헤드 루프가 dead였음.
+- 라운드 1 Minor: `prefill_work/p` 0-division 방어 부재(순수 API 관점).
+- 라운드 2: 이슈 없음. 검증 agent가 필터를 임시 제거해 신규 테스트가 회귀를
+  실제로 포착함을 재현 확인 후 원상 복구 대조.
+- 테스트: `pytest tests/sslo/ -q` → 209 passed, 1 skipped, 1 failed
+  (기존 `test_tts_consume_path` 1건, 본 변경과 무관 — base 커밋에서도 동일 실패 확인).
+- 신규: W 회계 2종(캐리오버+k* 헤드 합산 / onloading 제외), 매몰비용이 floor를
+  고정하지 않음(W=200K에서 TB*=base), 마감-먼 요청 불변성, burst-안 클램프
+  strict interior + 오라클 일치, doomed 비인질, W=0→base.
+
+### 관측: phaseD D축 발동 특성 (과다 발동 가설 기각)
+cap128 r2 o+tb 18,789스텝 중 D축 발동 28.0%, 발동 시 defer p50=1개(max 4),
+발동 스텝의 재적 47.6 vs 비발동 39.0 — 배치가 클 때 한 명씩 덜어내는 설계
+의도대로 동작. 누적 7,427회는 폭주가 아님.
+
+### 미결
+- GPU 재실행 대기(승인 필요): burst-horizon + ε_p=0.5로 phaseD 재수행.
+- `paper/method.md`는 여전히 TB* 개정 미반영.
+- offload 허가-집행 괴리(k*=13.9인데 미집행)는 이 개정과 무관하게 미해명.

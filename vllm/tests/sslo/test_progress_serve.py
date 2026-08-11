@@ -677,20 +677,26 @@ def test_select_decode_defer_eligibility_is_self_limiting():
 # Token Budget — P axis (TB*_pre, risk dosing)
 # ---------------------------------------------------------------------------
 
-# Δ_dec(D') 80 ms, κ_p 1 ms/prefill-token, base 8192 tokens, floor 512.
+# Δ_dec(D') 80 ms, κ_p 1 ms/prefill-token, base 8192 tokens, floor 512, and a
+# 4096-token burst W → the burst's sunk delay κ_p·W is 4.096 s and its window
+# wall(P) = 327.68/P + 4.096 s spans 4.14 s (at P = base) to 4.74 s (at floor).
 _PBR = dict(b=8, delta_dec=0.08, kappa_p=0.001, base_budget=8192, floor=512,
-            eps_p=0.01)
+            eps_p=0.01, prefill_work=4096)
+
+
+def _tb_e_viol(views, p, **kw):
+    """E(P): the ledger re-priced under a burst of W/P steps at Δ_dec + κ_p·P."""
+    return build_plan(views, [], kw["b"], kw["delta_dec"],
+                      delta_burst=kw["delta_dec"] + kw["kappa_p"] * p,
+                      burst_steps=kw["prefill_work"] / p).e_viol
 
 
 def _tb_oracle(views, **kw):
-    """Brute-force max{P in [floor, base] : E(P) - E(0) <= eps_p}, plus the
+    """Brute-force max{P in [floor, base] : E(P) - E(floor) <= eps_p}, plus the
     feasibility sequence so the test can assert the monotonicity the bisection
     relies on."""
-    def e_at(p):
-        return build_plan(views, [], kw["b"],
-                          kw["delta_dec"] + kw["kappa_p"] * p).e_viol
-    base_e = e_at(0)
-    feasible = [e_at(p) - base_e <= kw["eps_p"]
+    ref = _tb_e_viol(views, kw["floor"], **kw)
+    feasible = [_tb_e_viol(views, p, **kw) - ref <= kw["eps_p"]
                 for p in range(kw["floor"], kw["base_budget"] + 1)]
     best = kw["floor"]
     for i, ok in enumerate(feasible):
@@ -735,11 +741,63 @@ def test_token_budget_prefill_risk_stops_at_eps_and_matches_brute_force():
     assert feasible == sorted(feasible, reverse=True)
 
 
+def test_token_budget_prefill_risk_e_viol_is_monotone_in_p():
+    # The premise the bisection stands on, over a mixed ledger: one request
+    # whose deadline falls inside the burst window (priced), one past it
+    # (flat), one doomed (flat at R = 1). H_q is non-increasing in P for each,
+    # so the sum only ever climbs.
+    views = [_measurable("near", 0, 2.0, lambda x: max(0.0, 1 - x / 2000.0)),
+             _measurable("far", 0, 20.0, lambda x: max(0.0, 1 - x / 20000.0)),
+             _measurable("doomed", 0, 0.1, _ATRISK)]
+    evals = [_tb_e_viol(views, p, **_PBR)
+             for p in (512, 700, 1024, 2048, 4096, 6000, 8192)]
+    assert evals == sorted(evals)
+    assert evals[0] < evals[-1]  # the ledger really does move with P
+
+
+def test_token_budget_prefill_risk_far_deadlines_are_not_priced():
+    # Every deadline sits past wall(floor) = 4.74 s, so the horizon is
+    # (T_q - κ_p·W)/Δ_dec — set by the burst's sunk total delay, not by P.
+    # E(P) is flat, shrinking the budget buys nothing, and base is released.
+    views = [_measurable("f", 0, 20.0, lambda x: max(0.0, 1 - x / 20000.0))]
+    evals = [_tb_e_viol(views, p, **_PBR) for p in (512, 1024, 4096, 8192)]
+    assert evals == [evals[0]] * len(evals)
+    assert 0.0 < evals[0] < 1.0  # non-degenerate: the request does carry risk
+    assert token_budget_prefill_risk(views, **_PBR) == 8192
+
+
+def test_token_budget_prefill_risk_sunk_burst_cost_does_not_pin_to_floor():
+    # Regression guard on the reference point: E_ref is E(floor), NOT a
+    # burst-free E. Here the burst's unavoidable delay κ_p·W is 200 s, but every
+    # deadline sits past wall(floor) = 231 s, so no P is any better than another
+    # and the whole base budget must still be released. Priced against a
+    # burst-free reference the fixed sunk term alone blows eps_p at EVERY P,
+    # which would pin the dose to the floor on every step.
+    kw = {**_PBR, "prefill_work": 200_000}
+    views = [_measurable("f", 0, 401.0, lambda x: max(0.0, 1 - x / 5000.0))]
+    assert token_budget_prefill_risk(views, **kw) == 8192
+    burst_free = build_plan(views, [], kw["b"], kw["delta_dec"]).e_viol
+    assert _tb_e_viol(views, kw["base_budget"], **kw) - burst_free > kw["eps_p"]
+
+
+def test_token_budget_prefill_risk_clamps_for_in_burst_deadline():
+    # A deadline INSIDE the burst window (4 s vs wall(P) >= 4.14 s): its token
+    # rate is 1/Δ_b(P), so P is priced against what the floor already delivers
+    # and the dose stops strictly inside [floor, base].
+    views = [_measurable("n", 0, 4.0, lambda x: max(0.0, 1 - x / 10.0))]
+    got = token_budget_prefill_risk(views, **_PBR)
+    assert 512 < got < 8192
+    assert got == _tb_oracle(views, **_PBR)[0]
+
+
 def test_token_budget_prefill_risk_disabled_returns_base():
     views = [_measurable("u", 0, 2.0, _URGENT)]
     # No κ estimate yet / degenerate κ → control off.
     assert token_budget_prefill_risk(views, **{**_PBR, "kappa_p": 0.0}) == 8192
     assert token_budget_prefill_risk(views, **{**_PBR, "kappa_p": -1.0}) == 8192
+    # No prefill work → no burst to price → nothing to dose.
+    assert token_budget_prefill_risk(
+        views, **{**_PBR, "prefill_work": 0}) == 8192
     # Nothing measurable in flight → no ledger to protect → control off.
     assert token_budget_prefill_risk([_forced("f0")], **_PBR) == 8192
 

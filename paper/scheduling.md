@@ -42,15 +42,36 @@
      onload 먼저 — d−t ≤ ℓΔ+f̂ 인 offloaded를 복원 시작 (deadline 안전 우선)
      offload — pending 중 M_cpu ≤ ε ∧ residency ≥ ρ 를 slack 깊은 순으로,
                admission에 필요한 블록만큼만
-⑤ Token Budget TB* 계산 — **기대-위험 예산 도싱** (2026-08-11 개정:
-     worst-case 제약 γ·T_min은 t_min 보유자 1명이 전체를 인질 잡는 근시안
-     — 회복기 P* floor 81% 실증 — 이라 기각. E_viol 화폐로 통일):
-       TB*_pre = max{ P : E_viol(Δ(P, D')) − E_viol(Δ(0, D')) ≤ ε_p }
-     E_viol(Δ)은 기존 build_plan을 Δ(P)=Δ_dec(D')+κ_p·P로 재평가한 값 —
-     in-flight(running+pending+offloaded) **전원**의 위험 합이므로:
-     · 한 명의 임박 마감이 아니라 총 기대 피해로 도싱을 정함
-     · doomed(R≈1) 요청은 한계 기여 ~0 → 회복기의 가망 없는 생존자가
-       prefill을 막지 못함 (매몰비용 자동 해소; overdue 특례 불필요)
+⑤ Token Budget TB* 계산 — **burst-horizon 기대-위험 예산** (2026-08-12 개정.
+     이력: γ·T_min worst-case → 기각(t_min 인질, 회복기 floor 81%);
+     무한-지평 재발 가격 Δ(P) 전지평 적용 → 기각(§6, phaseD 실증) → 현행):
+     W = 이번 burst의 잔여 prefill 작업량 — PREFILL 캐리오버의 잔여 프롬프트
+         토큰 + k* 안의 큐 헤드 프롬프트. 사실값(추정 아님 — R5 무관).
+     P를 고르면 burst는 W/P 스텝 × Δ_b(P)=Δ_dec(D')+κ_p·P,
+     벽시계 wall(P) = (W/P)·Δ_dec + κ_p·W. burst 종료 후 Δ_dec 복귀.
+     요청별 마감까지 얻는 토큰 수 (piecewise horizon):
+       T_q ≤ wall(P):  H_q = T_q / Δ_b(P)            — burst 안 마감, P에 민감
+       T_q > wall(P):  H_q = (T_q − κ_p·W) / Δ_dec   — P와 무관
+       TB*_pre = max{ P ∈ [P_floor, P_base] : E_viol(P) − E_viol(P_floor) ≤ ε_p }
+     E_viol(P)는 build_plan을 piecewise horizon으로 재평가한 값. 기준점은
+     **E_viol(P_floor)** — floor는 무조건 부여되므로 항상 실현 가능한 대안이고,
+     매몰비용 κ_p·W 중 어떤 P로도 피할 수 없는 흡수분이 P 선택에 과금되지
+     않는다 (순수 Δ_dec 기준을 쓰면 P-무관 오프셋이 ε_p를 잠식해 floor 체류가
+     다른 경로로 재발 — 구현 검증에서 발견). P↑ ⇒ burst 안 마감 요청의
+     토큰율만 ↓ 이므로 E_viol(P) 단조 비감소 → bisection 유효, 기준점에서
+     좌변=0이라 floor는 항상 통과.
+     · 총 지연 κ_p·W는 P와 무관한 매몰비용 — 가격되는 것은 **집중도**뿐
+       (burst 창 안에 마감이 걸린 요청의 한계 위험). 마감 먼 요청 과금 0.
+     · doomed(R≈1)는 한계 기여 ~0 → 인질 없음 (γ·T_min 결함 비재발).
+     · burst는 커밋된 작업(PREFILL은 forced 슬롯)이므로 열린-루프 선반영은
+       이중과금이 아님. 정상성 가정: 선택 P가 burst 종료까지 유지된다고
+       보고 가격 (매 스텝 재결정으로 자기수정).
+     W에서 onloading 요청은 제외 — waiting에 prepend되지만 KV 복원이지
+     prefill 작업이 아니고, waiting_views 루프의 제외와 대칭 (이중계산 방지).
+     ε_p 보정: 상상 실행(2026-08-12, 실측 tail/slack 분포) 기준 평시 고부하의
+     한계 비용이 0.41, 진짜 위험 국면이 4.54 — 11배 분리 창이 존재한다.
+     ε_p=0.5로 설정 (평시 base 개방, 위험 국면 floor 클램프 유지).
+     구판의 0.01은 창보다 40배 아래라 상시 floor를 강제했다.
      [D축] 같은 장부로 재가격: slack 깊은 순 후보(자격 R_defer≤ε_d,
            self-limiting은 종전과 동일)를 하나씩 defer해 보며
            E_viol(Δ_dec(D−1)) < E_viol(Δ_dec(D))인 동안만 채택 (개선이
@@ -95,6 +116,7 @@
 | request-level adaptive (`max_num_seqs` 축소) | 축이 틀림 — Δ 변동의 주범은 prefill 토큰(스텝 6%가 벽시계 18%, p90 463ms)이지 요청 수가 아님. 큐-블라인드 목적함수와 결합해 배치 1까지 붕괴 (대기 2,691명 방치). TB*(P축)로 대체 |
 | admission 한계 기준 (ΔE_viol) | R3 참조 — 총위험 무한 누적 |
 | 원시 P+D 토큰 캡 | 두 토큰의 단가가 다를 수 있고(KV-읽기 상각 비대칭) 교환비가 regime·컨텍스트 의존 — 시간 단위 예산(§7)으로 일반화해야 함 |
+| TB* 무한-지평 재발 가격 (2026-08-11 초판) | Δ(P)=Δ_dec+κ_p·P를 마감까지 **모든** 미래 스텝에 적용 — 1스텝 κ_p·P(~0.1–0.4s) 비용을 영구 감속으로 ~20× 과대가격 (실측 prefill 포함 스텝은 8.9%뿐). phaseD 실증: cap128 floor 체류 7~22%→43~83%, r1 tput 507→391, TTFC 2.6×, 위반율 이득 없음. 매 스텝 재결정되는 비용을 전지평에 물리는 이중과금 — burst-horizon(§3⑤)으로 대체 |
 
 ## 7. Staged 확장 (미구현 — TODO, SWEEP_PLAN_v2.md와 동기)
 
@@ -107,6 +129,12 @@
 - ③축 self-lock: 소수 고위험 in-flight의 위험 합이 절대 예산을 소진하면 KV·연산이 남아도 k*≈0 (과포화 + 만기 경과 큐에서 발생; R3 트레이드오프의 대가).
 - o+pb cap64 저하: κ_p 오염(소분모 발산)으로 진단·수정 완료 — GPU 재실행으로 최종 확인 대기 (예측: κ→0.15 수렴, tput 392→~470).
 - `request_risk_cpu`에는 doomed guard($R_{defer}\ge1 \Rightarrow$ offload 부적격)가 없음 — §2의 run-side 가드와 비대칭. 현행 kv_capped 게이트 하에서 실해가 관측되지 않아 미구현 (후보 유지).
+- **borderline 인질** (burst-horizon의 잔존 한계): floor에서는 살릴 수 있으나
+  base에서는 doomed가 되는 요청(R 0.6→1.0)은 한계 기여가 ~0.4로 크다. 완전
+  doomed(기여 0)와 마감 먼 요청(기여 0)은 해소됐지만 이 경계층은 남는다.
+  상상 실행 실측: 요청당 발생률 1.75% → 재적 47명이면 스텝의 56.5%에 최소
+  1명 존재(재적 5명이면 8.5%). ε_p=0.5 보정으로 실효는 억제되나 원리적으로는
+  잔존 — regime별 재보정 없이 ε_p 하나로 두는 한 cap이 클수록 조임이 강해진다.
 - TB* D축 프로브의 원장은 decode-set 단독(admits/parked 미포함) — 자기일관적
   hill-climb이라 안전성 문제는 없으나, 전체 원장 대비 방향성(defer 과소 발동
   = 보수)은 미증명 (검증 라운드 2026-08-11 지적, 알려진 한계로 유지).

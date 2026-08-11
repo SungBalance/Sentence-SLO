@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git config *)",
+      "Bash(env)",
+      "Bash(gh auth *)",
+      "Bash(grep -o -E '[sp]k\\\\.[A-Za-z0-9._-]{5,}')"
+    ]
+  }
+}

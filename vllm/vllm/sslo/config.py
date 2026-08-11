@@ -127,8 +127,9 @@ class SsloConfig:
     #   [P axis] TB*_pre caps the TOTAL prefill tokens of a step —
     #            chunked-prefill carry-over in the running loop plus new admits
     #            in the waiting loop, sharing one budget — at the largest P
-    #            whose E_viol(Δ_dec(D') + κ_p·P) stays within
-    #            token_budget_risk_eps of E_viol at P=0
+    #            whose burst-horizon E_viol (the burst runs W/P steps of
+    #            Δ_dec(D') + κ_p·P, then Δ_dec resumes) stays within
+    #            token_budget_risk_eps of E_viol at the floor
     #            (progress_serve.token_budget_prefill_risk). Measured
     #            (cap128/rate2 baseline): prefill-carrying steps are only 6% of
     #            steps but 18.4% of the wall clock (Δ p90 463 ms vs 78 ms
@@ -147,9 +148,17 @@ class SsloConfig:
     token_budget_prefill_floor: int = 512
     # P-axis dosing budget ε_p, in expected-violation units: TB*_pre is the
     # largest prefill allowance whose extra expected violations
-    # E_viol(Δ(P)) - E_viol(Δ(0)) stay within ε_p. Must be > 0 — at 0 any
+    # E(P) - E(floor) stay within ε_p. Must be > 0 — at 0 any
     # in-flight request whose risk moves at all would pin TB*_pre to the floor.
-    token_budget_risk_eps: float = 0.01
+    # Calibrated 2026-08-12 against the measured tail / slack distributions
+    # (κ_p 1.98e-4, Δ_dec 74 ms): the marginal cost dE(floor→base) is 0.41 under
+    # ordinary high load (47 resident) but 4.54 when many deadlines actually
+    # fall inside the burst window — an 11x separated operating window. 0.5 sits
+    # just above the first and far below the second, so ordinary load opens to
+    # the base budget while a genuinely at-risk step still clamps. (The previous
+    # 0.01 was 40x below the window and forced the floor even under ordinary
+    # load.) Same currency as the admission budget E_viol < 1, so keep it < 1.
+    token_budget_risk_eps: float = 0.5
     # DEPRECATED (2026-08-11): worst-case safety factor on t_min, the input of
     # the rejected progress_serve.token_budget_prefill(). Kept (with that
     # function) only to replay the old rule against the risk dosing above; no

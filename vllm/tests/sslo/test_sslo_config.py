@@ -140,7 +140,7 @@ def test_token_budget_defaults():
     cfg = SsloConfig()
     assert cfg.token_budget_control is False
     assert cfg.token_budget_prefill_floor == 512
-    assert cfg.token_budget_risk_eps == 0.01
+    assert cfg.token_budget_risk_eps == 0.5
     assert cfg.token_budget_gamma == 0.5
     assert cfg.token_budget_decode_risk_eps == 1e-3
 
