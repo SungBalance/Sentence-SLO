@@ -113,6 +113,25 @@ extend it along the two resource axes identified in §2: KV memory and step-time
 Each extension is gated so that it acts only in the regime it targets and provably (or
 measurably) leaves other regimes untouched.
 
+**The four configurations we evaluate.** The two extensions are independent and
+separately switchable, giving four schedulers. We evaluate all four against the vanilla
+engine, because the interesting question is not "does the full system win" but *which
+lever pays for itself, in which regime, and do they compose*.
+
+| Configuration | Lever added | Binding resource it relieves | Acts when |
+|---|---|---|---|
+| **ProgressServe** (§4.1) | run/defer + $E_{viol}$-budgeted admission | none — it *harvests* slack and spends it on concurrency | always |
+| **+ Offload** (§4.2) | park deferred requests' KV on CPU, restore before the deadline | **KV memory** — deferred requests keep their blocks | `kv-capped` steps only |
+| **+ Adaptive** (§4.3) | per-step prefill token budget $TB^{*}$ (+ whole-request decode deferral) | **step-time compute** — prefill spikes freeze every consumer | prefill work coexists with at-risk in-flight requests |
+| **+ Both** | both of the above | either | union of the two triggers |
+
+Throughout, *ProgressServe* names the §4.1 core that all four share; *Offload* and
+*Adaptive* name the increments. The four differ only in which increments are enabled —
+the risk model, the deadline recurrence, and the admission budget are identical across
+them, which is what makes the comparison an ablation rather than four separate systems.
+The composed configuration is our full system; §4.4 reports when composing helps and
+when it does not.
+
 ### 4.1 CU-SLO-aware Scheduling
 
 **Why the baseline is not enough.** A vanilla continuous-batching scheduler admits
@@ -214,12 +233,25 @@ requests keep contributing $R_{defer\_cpu}$ to $E_{viol}$: risk parked on the CP
 still risk.
 
 **What it improves.** Offloading targets exactly the KV-bound regime: large concurrency
-caps, long prompts, long generations. There it converts stranded slack into admissions —
-in our evaluation setting (32B model, multi-turn prompts averaging ~1.3K tokens, 8K
-generation cap), it cuts CU-SLO violation rates from ~6% (baseline) to 0.7–2.0% at
-96–99% of baseline throughput, while sustaining comparable concurrent users. Where KV is
-not binding (small caps), the trigger simply never fires; the correct behavior there is
-to do nothing, and the gating guarantees it.
+caps, long prompts, long generations. There it converts stranded slack into admissions.
+In our evaluation setting (32B model, multi-turn prompts averaging ~1.3K tokens, 8K
+generation cap) it cuts CU-SLO violation rates from ~6% (baseline) to 1.4–2.0%. Where KV
+is not binding, the trigger never fires; the correct behavior there is to do nothing, and
+the gating guarantees it.
+
+> **Draft note (2026-08-12) — the throughput claim is currently unsupported.** Measured
+> throughput for this configuration is regime-dependent and, at the smaller concurrency
+> cap, clearly below the §4.1 core: at cap 64 / rate 1 it reaches 411 tok/s against a
+> 519 baseline (79%), while at cap 128 it matches baseline (503 vs 500). We traced the
+> deficit to an implementation defect rather than the mechanism: the admission KV model
+> assumes a fixed 8 blocks per new admit, whereas the measured footprint on this workload
+> is ~141 blocks (an 18$\times$ underestimate). The same constant sizes
+> `blocks_needed` for the offload search, so the tier is also asked to free ~1/18 of what
+> admission actually requires — over one full run it executed only 20 offloads. Until
+> that constant is derived from the real prompt length, the numbers here characterise a
+> largely inert tier, and the violation reductions above should be attributed mostly to
+> the §4.1 core it sits on. Re-measurement is required before this section makes a
+> throughput claim.
 
 ### 4.3 Adaptive Token Batching
 
@@ -305,13 +337,36 @@ evaluation setting it matches offloading's violation reductions (1.1–1.5% vs b
 > deadline pressure — measured at 0.41 vs 4.54 expected violations on our workload, an
 > $11\times$ window.
 
-**Composability.** The two extensions bind on different resources in different phases:
-offloading acts when the system is *full* (KV blocks admission; prefill work is scarce
-because little is being admitted), adaptive token batching acts when the system is
+### 4.4 Composition: when the two levers add up
+
+**Why they should compose.** The extensions bind on different resources in different
+phases: offloading acts when the system is *full* (KV blocks admission; prefill work is
+scarce because little is being admitted), adaptive token batching acts when the system is
 *absorbing* (prompts queued or in flight; KV still has room). Empirically the triggers
 co-fire on only 1–2% of steps under the earlier budget rule — far below the product of
-their individual rates, and pending re-measurement with the rest of §4.3 — so the
-combination behaves as coverage union rather than interaction: each mechanism handles the
-failure phase the other cannot see, on a shared risk model and without contending for the
-same control variable. The composed scheduler (ProgressServe + offload + token batching)
-is the configuration we evaluate as our full system.
+their individual rates, and pending re-measurement with the rest of §4.3. On that basis
+the combination should behave as a coverage *union* rather than an interaction: each
+mechanism handles the failure phase the other cannot see, on a shared risk model and
+without contending for the same control variable.
+
+**What the four-way ablation actually shows.** Disjoint triggers make composition safe,
+not automatically profitable — a lever that costs throughput in its own regime still
+costs it when combined. One representative operating point (cap 64, rate 1; throughput in
+tokens/s, violation rate at $\tau=1$s):
+
+| Configuration | Throughput | vs. vanilla | Violation rate |
+|---|---|---|---|
+| vanilla engine | 519 | 100% | 5.6% |
+| ProgressServe + Adaptive | 499 | 96% | **1.3%** |
+| ProgressServe + Offload | 411 | 79% | 2.0% |
+| ProgressServe + Both | 352 | 68% | 1.8% |
+
+Every configuration achieves the headline result — violations fall from ~6% to under 2%
+— so the differentiator is what each pays for it. Adaptive is nearly free (96% of
+baseline throughput); Offload is not, and composing inherits Offload's cost rather than
+cancelling it. Given the §4.2 draft note, we read this as a property of the current
+*implementation* of the KV tier, not evidence against parking KV as a mechanism: the same
+underestimated block constant that makes the tier nearly inert also makes it clamp
+admission. The honest summary at this stage is that **the adaptive token budget is the
+increment that pays for itself**, and the composed system should be re-evaluated once the
+KV accounting is corrected.

@@ -2900,3 +2900,9 @@ floor 체류 **0.0%**, TB*가 상한 2048 유지. 개정의 원래 동기였던 
 - D-defers가 구판 대비 11~150× 증가(예: cap128 r0.5 65→9,682). 원인은 P축이
   아니라 phaseD에서 함께 들어간 D축 개정(E_viol 개선 hill-climb). 처리량 손상
   여부는 tb 단독 셀이 나와야 분리 가능 — 미완.
+- `paper/method.md` 개정: §4 도입부에 **4 configuration 표**(ProgressServe /
+  +Offload / +Adaptive / +Both — 추가 레버·완화 자원·발동 조건) 신설,
+  §4.4 "Composition"를 독립 절로 승격하고 cap64 r1 4방향 ablation 표 수록.
+  §4.2 "What it improves"의 처리량 주장(96-99%)은 phaseE 실측과 배치되어
+  draft note로 근거 미비 명시 (cap64 r1 411 vs baseline 519 = 79%,
+  원인은 KV 블록 상수 8 vs 실측 141).
