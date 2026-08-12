@@ -362,11 +362,19 @@ tokens/s, violation rate at $\tau=1$s):
 | ProgressServe + Both | 352 | 68% | 1.8% |
 
 Every configuration achieves the headline result — violations fall from ~6% to under 2%
-— so the differentiator is what each pays for it. Adaptive is nearly free (96% of
-baseline throughput); Offload is not, and composing inherits Offload's cost rather than
-cancelling it. Given the §4.2 draft note, we read this as a property of the current
-*implementation* of the KV tier, not evidence against parking KV as a mechanism: the same
-underestimated block constant that makes the tier nearly inert also makes it clamp
-admission. The honest summary at this stage is that **the adaptive token budget is the
-increment that pays for itself**, and the composed system should be re-evaluated once the
-KV accounting is corrected.
+— so the differentiator is what each pays for it. At this operating point Adaptive is
+nearly free (96% of baseline throughput) while Offload is not, and composing inherits
+Offload's cost rather than cancelling it.
+
+**The ordering is regime-dependent, and one operating point does not settle it.** At the
+larger cap the two levers swap roles: cap 128 / rate 1 gives Offload 489 (98% of a 500
+baseline) against Adaptive's 410 (82%). The same split appears in an earlier sweep of the
+identical cell (449 vs 430 against a 530 baseline), so it is a property of the mechanisms
+rather than run-to-run noise. A plausible reading is that each lever is cheap exactly
+where its target resource is the binding one — Offload where KV binds (large caps, deep
+in-flight sets), Adaptive where step time binds — and pays overhead where it is not.
+Establishing that claim requires the full cap $\times$ rate grid, which is still in
+flight; until then §4.4 reports the split rather than a winner. Note also that the
+composed configuration carries markedly wider run-to-run spread than either single lever
+($\pm$49 vs $\pm$13 tokens/s at cap 128), which is itself evidence that the two controls
+interact more than their 1–2% trigger overlap suggests.
