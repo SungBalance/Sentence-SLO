@@ -2912,3 +2912,22 @@ floor 체류 **0.0%**, TB*가 상한 2048 유지. 개정의 원래 동기였던 
   패턴이라 회귀가 아니라 원래 성질. method.md §4.4에 한정 문구 추가.
   가설: 각 레버는 자기 목표 자원이 실제 병목인 regime에서 싸고, 아닌 곳에서
   오버헤드를 낸다 (offload↔KV, adaptive↔스텝시간). 전체 grid 완주 후 확정.
+- **재정정**: "cap에 따른 레버 비용 역전"도 기각. tb 단독은 cap64 전 rate 95-100%,
+  cap128도 r0.5 99% / r2 96%이고 **cap128 r1만 82%**. cap 축 추세가 아니라 rate
+  특이 현상이며, 구판 phaseP2에서도 같은 셀이 81%(이웃 rate는 93-94%)로 재현됨.
+  원인 미상. method.md §4.4는 인과 서술을 빼고 관측만 남김.
+- **설계 구멍 발견 (사용자 지적)**: +offload/+adaptive/+both는 불필요할 때
+  ProgressServe로 수렴해야 하는데 (a) 그것을 검증할 **bare progress_serve arm이
+  phaseE에 없었고** (모든 비교가 "코어+증분 vs vanilla"였음), (b) 수렴이 깨지는
+  경로가 코드에 둘 있다:
+  · offload 모드는 `SimpleCPUOffloadConnector` + `lazy_offload:False`로 **KV를
+    상시 CPU 미러링**하고 `enable_prefix_caching`을 강제로 켠다(run_test.py:822).
+    발동 여부와 무관한 per-step 비용 + 다른 모드와 엔진 구성 자체가 다름.
+    실제 offload는 런당 20회뿐이므로 관측 비용은 대부분 미러링.
+  · D축 게이트는 "E_viol이 개선되는 동안 채택"인데, 디코드 집합 축소는 스텝을
+    빠르게 해 거의 항상 E_viol을 개선한다 → 구조적 상시 발동 편향(스텝의 28%,
+    런당 8-11K회). P축의 무개입 보장은 지켜지나 D축은 아님.
+    (반증: 이 논리면 배치 큰 cap128에서 더 많아야 하나 실측은 cap64 8,290 >
+     cap128 6,781 — 편향은 확실하나 처리량 손실과의 연결은 미증명.)
+- 조치: GPU 여유 발생 즉시 **bare progress_serve arm**(cap 64/128 × 4 rate)을
+  cap64 반복보다 우선 투입 — 진행 중.
