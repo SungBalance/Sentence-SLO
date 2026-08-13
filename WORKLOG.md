@@ -2931,3 +2931,9 @@ floor 체류 **0.0%**, TB*가 상한 2048 유지. 개정의 원래 동기였던 
      cap128 6,781 — 편향은 확실하나 처리량 손실과의 연결은 미증명.)
 - 조치: GPU 여유 발생 즉시 **bare progress_serve arm**(cap 64/128 × 4 rate)을
   cap64 반복보다 우선 투입 — 진행 중.
+- 도구 보강: `method_table.py`에 `progress_serve`(코어) 모드 행 추가 —
+  arm 자체가 실험에 없었으므로 분석기에도 빠져 있었음.
+  `run_test.py`에 `SSLO_TOKEN_BUDGET_DECODE_RISK_EPS` env 훅 추가
+  (D축 자격 임계 ε_d 주입 — adaptive 비수렴의 D축 귀속 실험용).
+- phaseE 중단(사용자 지시, 2026-08-12 말): 73 rate-run 확보 후 정지. GPU 전면 반납.
+  미완: cap64/cap32 코어, cap128 코어 run_2, D축 ε_d=0 ablation, cap64 run_2.

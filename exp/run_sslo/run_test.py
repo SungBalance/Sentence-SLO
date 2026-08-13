@@ -785,6 +785,8 @@ async def run_one(args: argparse.Namespace) -> None:
              "token_budget_prefill_floor", int),
             ("SSLO_TOKEN_BUDGET_RISK_EPS", "token_budget_risk_eps", float),
             ("SSLO_TOKEN_BUDGET_GAMMA", "token_budget_gamma", float),
+            ("SSLO_TOKEN_BUDGET_DECODE_RISK_EPS",
+             "token_budget_decode_risk_eps", float),
         ):
             v = os.environ.get(env_name)
             if v is not None:

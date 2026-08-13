@@ -20,6 +20,7 @@ from pathlib import Path
 
 MODES = [
     ("baseline", "baseline"),
+    ("progress_serve", "core"),
     ("progress_serve_offload", "offload"),
     ("progress_serve_token_budget", "tb"),
     ("progress_serve_offload_token_budget", "offl+tb"),
