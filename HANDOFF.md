@@ -8,8 +8,7 @@
 ## 0. 코드 상태 (main @ `018482032`)
 
 - **스케줄러**: ProgressServe + offload/onload tier + **TB\* 기대-위험 도싱**
-  (P축 `token_budget_prefill_risk` 이분탐색 + D축 `select_decode_defer`
-  E_viol-개선 채택). 용어 통일: `pending/promote/offload/onload`,
+  (P축 `token_budget_prefill_risk` 이분탐색. D축은 2026-08-13 폐기). 용어 통일: `pending/promote/offload/onload`,
   `progress_serve_token_budget[/offload]` run kinds.
 - **채택**: `kv_offload_share_includes_parked=True`, κ ratio-of-sums(배치-매칭
   기준선, 폴백 금지), `token_budget_risk_eps=0.01`.
@@ -77,15 +76,15 @@ TI1의 CAPS{32,64,128}·RATES{0.5,1,2,4}는 **그 GPU의 산물**이다. 순서:
 1. **TB\* 도싱 회복 거동**: 정지 회복기에 P\* floor 체류가 사라지는지
    (TI1 구판: floor 81% — 도싱 개정은 상상 실행으로만 검증됨, **실측 미완**).
    per-step `token_budget_prefill` 분포로 판정.
-2. **D축 발동률·무해성**: `token_budget_d_defers` — 발동해도 tput이 baseline의
-   ~95%+ 유지되는지 (TI1: tb 단독이 96-99%로 최적이었음).
+2. (해결됨 → 폐기) D축 발동률·무해성: 구조적 상시 발동으로 무개입 보장이 없고
+   코어 대비 순손실(−44/−45 tput, 위반율 이득 0)이라 축 자체를 제거했다.
 3. **κ 수렴**: `prefill_kappa_ms_per_tok`이 안정값으로 수렴하는지 (TI1: 0.15).
 4. **offload 허가-집행 괴리 (미해명 최우선 조사)**: offl 모드 저점유 구간에서
    k\*는 큰데(TI1: 13.9) 재적이 안 차는 현상 — E_viol도 KV도 안 막는데 admission
    집행이 안 됨. 스텝 로그로 waiting 루프의 실제 skip 사유 추적 필요
    (계측 추가 권장: per-step 실제 admit 수 vs k\*).
 5. **결합(o+tb) vs 단독**: TI1에선 tb 단독 우세 — 새 HW에서 재확인.
-6. **TTS 축**: 미실행. read보다 마감이 촘촘해 D축·offload의 실효가 다를 것.
+6. **TTS 축**: 미실행. read보다 마감이 촘촘해 P축·offload의 실효가 다를 것.
 
 ## 4. 문서 맵
 

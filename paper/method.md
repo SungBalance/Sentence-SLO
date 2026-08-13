@@ -122,7 +122,7 @@ lever pays for itself, in which regime, and do they compose*.
 |---|---|---|---|
 | **ProgressServe** (§4.1) | run/defer + $E_{viol}$-budgeted admission | none — it *harvests* slack and spends it on concurrency | always |
 | **+ Offload** (§4.2) | park deferred requests' KV on CPU, restore before the deadline | **KV memory** — deferred requests keep their blocks | `kv-capped` steps only |
-| **+ Adaptive** (§4.3) | per-step prefill token budget $TB^{*}$ (+ whole-request decode deferral) | **step-time compute** — prefill spikes freeze every consumer | prefill work coexists with at-risk in-flight requests |
+| **+ Adaptive** (§4.3) | per-step prefill token budget $TB^{*}$ | **step-time compute** — prefill spikes freeze every consumer | prefill work coexists with at-risk in-flight requests |
 | **+ Both** | both of the above | either | union of the two triggers |
 
 Throughout, *ProgressServe* names the §4.1 core that all four share; *Offload* and
@@ -310,9 +310,8 @@ $\varepsilon_p$. In words: *buy prefill tokens until the in-flight set's total e
 violation count has risen by $\varepsilon_p$ over what the floor already costs.* The
 budget is enforced over the step's total prefill — chunked carry-over of already-admitted
 prompts and newly admitted prompts drain a single shared counter (in-flight prefills
-first) — while decode tokens are never limited; the decode side is controlled only by
-whole-request deferral, which the same $E_{viol}$ ledger accepts while it strictly
-improves. Two guards complete the design: a positive floor $P_{floor}$ with a starvation
+first) — while decode tokens are never limited by any budget: the decode set is settled
+entirely by the run/defer partition of §4.1. Two guards complete the design: a positive floor $P_{floor}$ with a starvation
 counter ensures prefill always progresses (bounding TTFC inflation), and when the
 estimator is cold or no measured request exists, the budget rests at $P_{base}$ —
 i.e., the control degrades to the baseline scheduler, never below it.
@@ -379,9 +378,13 @@ tokens/s at cap 128), which suggests the two controls interact more than their 1
 trigger overlap implies. Second, and more fundamentally, **every row above is measured
 against the vanilla engine, not against the §4.1 core**, so it reports the cost of
 "core + increment" rather than of the increment. By design each increment should collapse
-to the core outside its target regime; two implementation details are known to break that
-(§4.2's connector mirrors KV eagerly and forces prefix caching on, both paid per step
-regardless of whether an offload fires; §4.3's decode-deferral gate accepts any strictly
-positive $E_{viol}$ improvement, which shrinking the decode set almost always produces).
-The core-only arm needed to separate these effects is in flight; the attribution in this
-section is provisional until it lands.
+to the core outside its target regime, and the measurements above exposed two
+implementation details that broke it. §4.2's connector mirrored KV eagerly and forced
+prefix caching on for that configuration alone, both paid per step regardless of whether
+an offload ever fired. §4.3 additionally carried a decode-deferral axis whose gate
+accepted any strictly positive $E_{viol}$ improvement — which shrinking the decode set
+almost always produces — so it fired on 28% of steps with no off switch, at a measured
+44–45 tokens/s against the core arm for no violation gain. We have since removed that
+axis (§4.3 is now the prefill budget alone) and made prefix caching uniform across
+configurations; the numbers in this section predate both changes and are being
+re-measured against a core-only arm.
