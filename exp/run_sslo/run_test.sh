@@ -146,8 +146,9 @@ else
 fi
 MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-0}"
 
+# HF_HUB_CACHE is intentionally unset: HF derives $HF_HOME/hub, which is where
+# the model and dataset caches already live.
 export HF_HOME=/cache
-export HF_HUB_CACHE=/cache/hub
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export CHUNK_UNIT
 export CUDA_VISIBLE_DEVICES

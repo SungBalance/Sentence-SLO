@@ -2972,3 +2972,10 @@ offload 모드만 커넥터 요구로 켜던 것을 모든 run kind로. 이제 o
   §4.3 메커니즘 문단을 "decode set은 §4.1 run/defer 분할이 전적으로 결정"으로 정정,
   §4.4 한계 문단을 "두 결함을 발견해 이미 수정했고 이 절 수치는 그 이전"으로 갱신.
   `HANDOFF.md` 11/79/88행의 D축 언급 정리(판정 항목 2는 해결→폐기로 대체).
+- 캐시 경로 정리: `/cache/hub`의 Qwen3-32B가 소실돼 phaseF 첫 두 셀이 65G 재다운로드로
+  약 35분 지연(코드 문제 아님 — py-spy로 `snapshot_download` 대기 확인). 경로 후보 조사:
+  `/cache/models`의 대용량 모델들(Llama-3.1-70B 263G, Mixtral 178G 등)은 **HF 캐시 형식이
+  아니라 평범한 디렉터리**라 HF_HUB_CACHE를 그리로 돌려도 이름 기반 재사용이 안 된다
+  (HF 형식은 Qwen1.5-MoE 27G, Qwen3-14B 103M 부분본뿐). 공유 이득 없이 공용 디렉터리
+  오염 위험만 남으므로 `$HF_HOME/hub` 기본값을 쓰기로 하고 `run_test.sh`의 명시적
+  `HF_HUB_CACHE` 줄을 제거(HF_HOME=/cache만 유지).
