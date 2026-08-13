@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 os.environ.setdefault("HF_HOME", "/cache")
-os.environ.setdefault("HF_HUB_CACHE", "/cache/hub")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -42,7 +41,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 # SSLO: Supertonic-3 ONNX TTS. `auto_download=True` fetches the model
-# files into HF_HUB_CACHE on first run.
+# files into the HF cache on first run.
 SUPERTONIC_MODEL_ID = "Supertone/supertonic-3"
 
 

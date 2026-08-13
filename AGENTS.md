@@ -39,7 +39,7 @@ These instructions apply to AI-assisted work in this workspace.
   managers, or host test runners for verification.
 - The container mounts this repo at `/workspace/mlsys/`; use that path for container-side commands.
 - `run_docker.sh` mounts host `/data` to container `/cache`.
-- Every experiment execution script must set the Hugging Face model cache inside the container to `/cache/`, for example with `HF_HOME=/cache` and `HF_HUB_CACHE=/cache/hub`.
+- Every experiment execution script must set the Hugging Face model cache inside the container to `/cache/` with `export HF_HOME=/cache`. Do not also set `HF_HUB_CACHE`: Hugging Face derives `$HF_HOME/hub`, which is where the model and dataset caches already live, and a second knob only creates a way for the two to disagree.
 - Every experiment execution `.sh` script should live next to its Python
   script, e.g. `exp/run_foo.py` and `exp/run_foo.sh`.
 - Put experiment run options directly in the `.sh` script as constants. If a

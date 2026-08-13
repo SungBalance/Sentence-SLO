@@ -11,7 +11,7 @@ OUTPUT_ROOT="exp/run_sslo/output_noabatch"
 ROOT="${OUTPUT_ROOT}/sentence"
 mkdir -p "$ROOT"
 
-export HF_HOME=/cache HF_HUB_CACHE=/cache/hub
+export HF_HOME=/cache
 export TTS_PROFILE_PATH="exp/run_sslo/profiles/word_count_duration_stats.csv"
 export NUM_PROMPTS=4000
 export GENERATION_MAX_TOKENS=2048

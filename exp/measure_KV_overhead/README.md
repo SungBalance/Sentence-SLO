@@ -28,7 +28,7 @@ bash exp/measure_KV_overhead/run_experiment.sh
 To profile a different model or custom sweep:
 
 ```bash
-docker exec -e HF_HOME=/cache -e HF_HUB_CACHE=/cache/hub sk-sslo \
+docker exec -e HF_HOME=/cache sk-sslo \
     python3 /workspace/mlsys/exp/measure_KV_overhead/measure_kv_overhead.py \
     --model meta-llama/Llama-3.1-8B \
     --block-size 32 \

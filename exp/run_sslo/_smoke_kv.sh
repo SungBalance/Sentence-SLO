@@ -7,7 +7,7 @@ OUTDIR="exp/run_sslo/output_smoke_kv/sslo_mlp/run_1"
 rm -rf exp/run_sslo/output_smoke_kv
 mkdir -p "$OUTDIR"
 
-export HF_HOME=/cache HF_HUB_CACHE=/cache/hub
+export HF_HOME=/cache
 export TTS_PROFILE_PATH="exp/run_sslo/profiles/word_count_duration_stats.csv"
 export NUM_PROMPTS=512
 export GENERATION_MAX_TOKENS=2048

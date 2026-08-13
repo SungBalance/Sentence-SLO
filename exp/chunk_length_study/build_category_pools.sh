@@ -4,7 +4,7 @@
 set -euo pipefail
 cd /workspace/mlsys
 
-export HF_HOME=/cache HF_HUB_CACHE=/cache/hub
+export HF_HOME=/cache
 
 LOAD_PER_DATASET="${LOAD_PER_DATASET:-6000}"
 TARGET_PER_CATEGORY="${TARGET_PER_CATEGORY:-512}"

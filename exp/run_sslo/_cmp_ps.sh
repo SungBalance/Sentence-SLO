@@ -8,7 +8,7 @@ OUTDIR="exp/run_sslo/output_cmp_ps/${run_kind}/run_1"
 rm -rf "exp/run_sslo/output_cmp_ps/${run_kind}"
 mkdir -p "$OUTDIR"
 
-export HF_HOME=/cache HF_HUB_CACHE=/cache/hub
+export HF_HOME=/cache
 export NUM_PROMPTS=1600
 export GENERATION_MAX_TOKENS=2048
 export MAX_MODEL_LEN=0

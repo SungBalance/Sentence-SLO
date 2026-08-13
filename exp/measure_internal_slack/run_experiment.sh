@@ -2,7 +2,6 @@
 set -euo pipefail
 
 export HF_HOME=/cache
-export HF_HUB_CACHE=/cache/hub
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 
 # Run this launcher on the host; all project commands execute inside containers.
@@ -57,7 +56,6 @@ run_on_gpu() {
     set -euo pipefail
     cd /workspace/mlsys
     export HF_HOME=/cache
-    export HF_HUB_CACHE=/cache/hub
     "$@"
   ' bash "$@"
 }
@@ -69,7 +67,6 @@ run_in_container() {
     set -euo pipefail
     cd /workspace/mlsys
     export HF_HOME=/cache
-    export HF_HUB_CACHE=/cache/hub
     "$@"
   ' bash "$@"
 }

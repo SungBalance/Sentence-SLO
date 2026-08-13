@@ -2979,3 +2979,9 @@ offload 모드만 커넥터 요구로 켜던 것을 모든 run kind로. 이제 o
   (HF 형식은 Qwen1.5-MoE 27G, Qwen3-14B 103M 부분본뿐). 공유 이득 없이 공용 디렉터리
   오염 위험만 남으므로 `$HF_HOME/hub` 기본값을 쓰기로 하고 `run_test.sh`의 명시적
   `HF_HUB_CACHE` 줄을 제거(HF_HOME=/cache만 유지).
+- 일괄 정리: `exp/` 전체에서 명시적 `HF_HUB_CACHE` 제거(21개 파일). 모든 대상이
+  `HF_HOME=/cache`를 이미 함께 설정하고 있어 동작 동일($HF_HOME/hub 유도).
+  포함: docker `-e` 전달 1건, python `os.environ.setdefault` 1건, 문서 2건.
+  `AGENTS.md`의 규칙 문구도 "HF_HOME만 설정, HF_HUB_CACHE 설정 금지"로 개정 —
+  예시가 두 손잡이를 함께 못 박고 있어 그대로 두면 재도입된다.
+  검증: 변경 셸 17개 `bash -n` 통과, python compileall 통과, 각 파일에 HF_HOME 잔존 확인.

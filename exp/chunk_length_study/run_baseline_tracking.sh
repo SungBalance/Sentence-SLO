@@ -18,7 +18,7 @@ POOLS_DIR="${STUDY_DIR}/output/pools"
 RUNS_DIR="${STUDY_DIR}/output/runs"
 mkdir -p "$RUNS_DIR"
 
-export HF_HOME=/cache HF_HUB_CACHE=/cache/hub
+export HF_HOME=/cache
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 
 MODEL="${MODEL:-Qwen/Qwen3.5-9B}"

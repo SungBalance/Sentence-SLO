@@ -40,7 +40,7 @@ for batch in "${BATCHES[@]}"; do
   mkdir -p "$out"
   echo "=== ${MODEL_SLUG} bsz=${batch} ==="
   CUDA_VISIBLE_DEVICES="$GPUS" \
-    HF_HOME=/cache HF_HUB_CACHE=/cache/hub \
+    HF_HOME=/cache \
     python3 exp/measure_batch/run_batch.py \
       --model "$MODEL" \
       --tensor-parallel-size "$TP_SIZE" \

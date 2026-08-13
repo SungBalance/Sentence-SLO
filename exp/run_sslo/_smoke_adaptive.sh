@@ -3,7 +3,7 @@ set -euo pipefail
 cd /workspace/mlsys
 OUTDIR="exp/run_sslo/output_smoke_adaptive/progress_serve_adaptive/run_1"
 rm -rf exp/run_sslo/output_smoke_adaptive; mkdir -p "$OUTDIR"
-export HF_HOME=/cache HF_HUB_CACHE=/cache/hub
+export HF_HOME=/cache
 export NUM_PROMPTS=800 GENERATION_MAX_TOKENS=2048 MAX_MODEL_LEN=0
 export CHUNK_UNIT=sentence DATASET_NAME=koala DATASET_SEED=42
 export EXCLUDE_CODE=1 CONVERSATION_ONLY=1 ENGLISH_ONLY=1

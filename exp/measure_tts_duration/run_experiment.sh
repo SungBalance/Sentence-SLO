@@ -52,7 +52,6 @@ run_in_container() {
     set -euo pipefail
     cd ${CONTAINER_REPO}
     export HF_HOME=/cache
-    export HF_HUB_CACHE=/cache/hub
     $*
   "
 }
@@ -61,7 +60,6 @@ ensure_dependencies() {
   docker exec "${CONTAINER_NAME}" bash -lc '
     set -euo pipefail
     export HF_HOME=/cache
-    export HF_HUB_CACHE=/cache/hub
     python3 -m pip install -q "kokoro==0.9.4" "supertonic" soundfile huggingface_hub
     if ! command -v espeak-ng >/dev/null 2>&1; then
       apt-get update -qq
@@ -123,7 +121,6 @@ run_shard_async() {
       set -euo pipefail
       cd ${CONTAINER_REPO}
       export HF_HOME=/cache
-      export HF_HUB_CACHE=/cache/hub
       mkdir -p \$(dirname '${log_path}')
       python3 ${EXP_ROOT}/measure_audio_duration.py \
         --input-jsonl ${INPUT_JSONL} \

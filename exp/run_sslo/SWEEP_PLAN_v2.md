@@ -234,6 +234,6 @@ phaseP 산출물 경로 호환용 deprecated alias로만 잔존. TB*는 P축+D�
 
 - [x] Qwen3-32B 다운로드 완료 (2026-08-04, `/cache/hub`, 17/17 샤드 62GB
       검증). sweep에서는 `MODEL_SPECS="Qwen3-32B:Qwen/Qwen3-32B"`로 참조
-      (run_test.sh가 `HF_HUB_CACHE=/cache/hub`를 설정하므로 HF id로 캐시 히트)
+      (run_test.sh가 `HF_HOME=/cache`를 설정하므로($HF_HOME/hub 유도) HF id로 캐시 히트)
 - [ ] run_sweep.sh 단일 모델/gen 축 조정
 - flashinfer jit-cache 이슈는 dense 모델이라 무관 (MoE 추가 시에만 `pip uninstall flashinfer-jit-cache`)

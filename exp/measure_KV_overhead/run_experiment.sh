@@ -5,7 +5,6 @@ set -euo pipefail
 # Edit constants below to change model or sweep.
 
 export HF_HOME=/cache
-export HF_HUB_CACHE=/cache/hub
 
 CONTAINER="sk-sslo"
 CONTAINER_REPO="/workspace/mlsys"
@@ -21,7 +20,6 @@ OUTPUT_DIR="${CONTAINER_REPO}/exp/measure_KV_overhead/outputs"
 
 docker exec \
     -e HF_HOME="${HF_HOME}" \
-    -e HF_HUB_CACHE="${HF_HUB_CACHE}" \
     "${CONTAINER}" \
     python3 "${SCRIPT}" \
         --model "${MODEL}" \
