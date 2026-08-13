@@ -171,6 +171,8 @@ def make_scheduler(
     scheduler.encoder_cache_manager = FakeEncoderCacheManager()
     scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
     scheduler.cache_config = SimpleNamespace(block_size=16)
+    # SSLO: _sslo_request_kv_blocks converts prompt tokens into KV blocks.
+    scheduler.block_size = 16
     scheduler.lora_config = None
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.waiting = []
@@ -532,10 +534,12 @@ def make_offload_request(request_id, state, *, status):
     return req
 
 
-def _result(*, deferred, k_star, k_star_unconstrained, kv_capped):
+def _result(*, deferred, k_star, k_star_unconstrained, kv_capped,
+            kv_blocks_needed=64):
     return ps.ScheduleResult(
         scheduled_A=[], deferred_A=list(deferred), k_star=k_star, e_viol=0.0,
-        k_star_unconstrained=k_star_unconstrained, kv_capped=kv_capped)
+        k_star_unconstrained=k_star_unconstrained, kv_capped=kv_capped,
+        kv_blocks_needed=kv_blocks_needed)
 
 
 def test_kv_offload_disabled_leaves_offload_state_empty():
@@ -821,13 +825,14 @@ def test_onloading_req_excluded_from_waiting_views(monkeypatch):
     captured = {}
     real_schedule_step = ps.schedule_step
 
-    def spy(views_A, waiting_views, b, delta, kv_feasible, lead=0,
-            share_includes_parked=True, admission_delta_criterion=False):
+    def spy(views_A, waiting_views, b, delta, free_kv_blocks, blocks_of,
+            lead=0, share_includes_parked=True,
+            admission_delta_criterion=False):
         captured["waiting_ids"] = [v.request_id for v in waiting_views]
         captured["onloading_locs"] = [
             v.location for v in views_A if v.request_id == "o0"]
         return real_schedule_step(
-            views_A, waiting_views, b, delta, kv_feasible, lead,
+            views_A, waiting_views, b, delta, free_kv_blocks, blocks_of, lead,
             share_includes_parked, admission_delta_criterion)
 
     monkeypatch.setattr(ps, "schedule_step", spy)
@@ -1119,70 +1124,11 @@ def test_token_budget_prefill_does_not_cap_decode(monkeypatch):
     assert request_ids(scheduler.waiting) == ["n0"]  # prefill fully blocked
 
 
-def _d_axis_scheduler(cfg=None):
-    """One savable-but-pressed request + two deep-slack ones, with Δ_dec cells
-    for batch 3 and 2.
-
-    Deferring one request halves the decode step (1.0 s → 0.5 s), which buys r0
-    a longer horizon: E_viol 0.75 → 0.675. So a control that is on defers
-    exactly one request, then stops (no Δ_dec cell for 1).
-    """
-    reqs = [_tb_request("r0", deadline=10.0, tail=lambda x: max(0.0, 1 - x / 40))]
-    # R_defer = 0 → defer-safe, and nothing of their own to lose.
-    reqs += [_tb_request(f"r{i}", deadline=20.0 + i, tail=lambda x: 0.0)
-             for i in (1, 2)]
-    scheduler = make_scheduler(running=reqs, max_num_running_reqs=4, cfg=cfg)
-    scheduler._sslo_step_wall_ema = {3: {0: 1.0}, 2: {0: 0.5}}
-    return scheduler
-
-
-def test_token_budget_d_axis_defers_deepest_slack_request():
-    cfg = SsloConfig(method="progress_serve", token_budget_control=True)
-    scheduler = _d_axis_scheduler(cfg)
-
-    scheduler._apply_sslo_policy(0.0)
-
-    # r2 holds the most slack (deadline 21) → it is the one that gives up its
-    # slot; r0 is under pressure (R_defer > eps) and is never a candidate.
-    assert request_ids(scheduler.running) == ["r0", "r1"]
-    assert request_ids(scheduler.sslo_pending) == ["r2"]
-    assert scheduler._sslo_step.token_budget_decode == 2
-    assert scheduler._sslo_step.token_budget_d_defers == 1
-
-
-def test_token_budget_d_axis_off_by_default():
-    # Same pressure, control off → the decode set is untouched and the D-axis
-    # diagnostics stay unset.
-    scheduler = _d_axis_scheduler()
-
-    scheduler._apply_sslo_policy(0.0)
-
-    assert request_ids(scheduler.running) == ["r0", "r1", "r2"]
-    assert scheduler.sslo_pending == []
-    assert scheduler._sslo_step.token_budget_decode is None
-    assert scheduler._sslo_step.token_budget_d_defers == 0
-
-
-def test_token_budget_d_axis_no_op_with_deadline_slack():
-    # Deadlines far away (read workload) → nobody's risk moves with the step
-    # time, so no defer lowers E_viol and D' = D_policy even with the control
-    # on.
-    cfg = SsloConfig(method="progress_serve", token_budget_control=True)
-    scheduler = _d_axis_scheduler(cfg)
-    for req in scheduler.running:
-        req.slo_state.next_deadline_ts = 1e6
-
-    scheduler._apply_sslo_policy(0.0)
-
-    assert request_ids(scheduler.running) == ["r0", "r1", "r2"]
-    assert scheduler._sslo_step.token_budget_decode == 3
-    assert scheduler._sslo_step.token_budget_d_defers == 0
-
-
 def test_token_budget_p_axis_is_recorded_by_the_policy():
-    # Wiring: the policy computes TB*_pre at stage ⑤ — after the D axis fixed
-    # D' — and records it on the step state; schedule_sslo's running / waiting
-    # loops spend exactly what was recorded.
+    # Wiring: the policy computes TB*_pre at stage ⑤ — priced against Δ_dec
+    # at the decode set the run/defer split settled — and records it on the
+    # step state; schedule_sslo's running / waiting loops spend exactly what
+    # was recorded.
     cfg = SsloConfig(method="progress_serve", token_budget_control=True,
                      token_budget_prefill_floor=64,
                      token_budget_risk_eps=0.01)
@@ -1194,8 +1140,6 @@ def test_token_budget_p_axis_is_recorded_by_the_policy():
 
     scheduler._apply_sslo_policy(0.0)
 
-    # r0 is itself at risk (R_defer > eps) → no D-axis defer, D' = 1.
-    assert scheduler._sslo_step.token_budget_decode == 1
     assert 64 < scheduler._sslo_step.token_budget_prefill < 8192
 
 
@@ -1205,8 +1149,6 @@ def test_step_stats_records_token_budget(monkeypatch, tmp_path):
     scheduler = make_scheduler(running=[])
     scheduler.kv_cache_manager.block_pool.num_gpu_blocks = 1_000_000
     scheduler._sslo_step.token_budget_prefill = 920
-    scheduler._sslo_step.token_budget_decode = 12
-    scheduler._sslo_step.token_budget_d_defers = 3
     scheduler._sslo_kappa_excess_ema = 1.0
     scheduler._sslo_kappa_tokens_ema = 1000.0
 
@@ -1214,8 +1156,6 @@ def test_step_stats_records_token_budget(monkeypatch, tmp_path):
 
     row = json.loads(stats_path.read_text().splitlines()[0])
     assert row["token_budget_prefill"] == 920
-    assert row["token_budget_decode"] == 12
-    assert row["token_budget_d_defers"] == 3
     assert row["prefill_kappa_ms_per_tok"] == 1.0
 
 

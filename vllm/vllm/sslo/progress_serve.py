@@ -104,6 +104,10 @@ class ScheduleResult:
     # True when KV admission — not E_viol — bounded k* (k_star_unconstrained
     # > k_star). The offload trigger fires only under this condition.
     kv_capped: bool = False
+    # Measured KV blocks the offload tier must free for the admits KV blocked:
+    # max(0, demand of the k_star_unconstrained prefix - free_kv_blocks).
+    # 0 when not kv_capped.
+    kv_blocks_needed: int = 0
     offloaded_A: list[str] = field(default_factory=list)
     cpu_risks: dict[str, tuple[float, float, float]] = field(
         default_factory=dict)
@@ -343,7 +347,8 @@ def schedule_step(
     waiting_views: list[ProgressView],
     b: int,
     delta: float,
-    kv_feasible: Callable[[int], bool],
+    free_kv_blocks: int,
+    blocks_of: Callable[[str], int],
     lead: int = 0,
     share_includes_parked: bool = True,
     admission_delta_criterion: bool = False,
@@ -355,6 +360,15 @@ def schedule_step(
     infeasible k or when KV admission is exhausted. Returns the scheduled /
     deferred partition at k* and k* itself (an upper bound on admits; the
     engine's allocate_slots is the hard KV backstop).
+
+    KV feasibility is judged on the MEASURED block demand of the candidates
+    themselves: ``blocks_of(request_id)`` = ceil(remaining prompt tokens /
+    block_size) (injected like ``select_offload``'s ``blocks_of`` so this
+    module stays engine-import-free), and admitting k is feasible iff
+    Σ_{i<k} blocks(q_i) <= ``free_kv_blocks``. A per-admit CONSTANT was used
+    until 2026-08-13 and underestimated the real demand ~18x, so the scan
+    never stopped on KV and ``kv_capped`` — the offload tier's trigger — was
+    permanently False even at 99% KV occupancy (paper/scheduling.md §3③).
 
     With ``admission_delta_criterion`` the feasibility test becomes the
     MARGINAL one, E_viol(k) - E_viol(0) < 1: the risk the in-flight set
@@ -376,6 +390,16 @@ def schedule_step(
     best_k = 0
     kv_break_k: int | None = None
     n = len(waiting_views)
+    # cum_blocks[k-1] = blocks the first k candidates need together.
+    cum_blocks: list[int] = []
+    acc = 0
+    for v in waiting_views:
+        acc += blocks_of(v.request_id)
+        cum_blocks.append(acc)
+
+    def kv_feasible(k: int) -> bool:
+        return cum_blocks[k - 1] <= free_kv_blocks
+
     baseline_e = best.e_viol if admission_delta_criterion else 0.0
     # If even admitting nobody is already over budget, defer-only at k=0.
     if best.e_viol - baseline_e < E_VIOL_FEASIBLE:
@@ -400,6 +424,15 @@ def schedule_step(
                 k_star_unconstrained = k
             else:
                 break
+    # What the offload tier has to free: the DEFICIT between the demand of the
+    # whole k*_unconstrained prefix and the blocks already free — "only as many
+    # blocks as the admission needs" (spec §3④). Charging the full incremental
+    # demand instead would ignore the free space left over at k* and vacate up
+    # to one extra pending request every capped step.
+    blocks_needed = 0
+    if k_star_unconstrained > best_k:
+        blocks_needed = max(
+            0, cum_blocks[k_star_unconstrained - 1] - free_kv_blocks)
     return ScheduleResult(
         scheduled_A=best.scheduled_A,
         deferred_A=best.deferred_A,
@@ -407,6 +440,7 @@ def schedule_step(
         e_viol=best.e_viol,
         k_star_unconstrained=k_star_unconstrained,
         kv_capped=k_star_unconstrained > best_k,
+        kv_blocks_needed=blocks_needed,
         offloaded_A=best.offloaded_A,
         cpu_risks=best.cpu_risks,
     )
@@ -464,91 +498,6 @@ def pick_adaptive_batch(
     return best_b, best_plan
 
 
-def select_decode_defer(
-    run_views: list[ProgressView],
-    delta: float,
-    s: float,
-    eps: float,
-    delta_decode_of: Callable[[int], float | None],
-) -> list[str]:
-    """D axis of the Token Budget: shrink the decode set while shrinking it
-    lowers the expected violation count.
-
-    Priced in the same currency as admission — E_viol from ``build_plan`` over
-    the decode set itself, evaluated at that set's decode-only step time
-    Δ_dec(D). Dropping one request costs it its slot (R_run becomes R_defer)
-    and buys every remaining request a shorter step, i.e. a longer deadline
-    horizon. Candidates are dropped one at a time, deepest slack first, while
-    each drop STRICTLY lowers E_viol; the first non-improving drop stops the
-    search and is not taken (so a set where nothing improves yields []).
-
-    Replaces the worst-case rule Δ_dec(D) <= γ·t_min (2026-08-11): pricing the
-    whole decode set off ONE t_min holder is myopic, and it needed an explicit
-    overdue special case (t_min <= 0 ⇒ no-op) to stop oversaturated traces from
-    deferring for unreachable deadlines. In the expected-risk ledger a doomed
-    request (R_run ≈ R_defer ≈ 1) has ≈ 0 marginal benefit, so deferring for it
-    simply never improves E_viol — the special case is no longer needed.
-
-    Eligibility ("defer-safe"): GPU-resident, MEASURED, and R_defer <= eps at
-    the step's Δ / s (the same numbers the plan used). Forced (PREFILL /
-    WARMUP) and onloading requests are structurally absent from the candidate
-    list and at-risk ones fail the eps test, so the search cannot go below the
-    natural floor D_floor = forced + at-risk. The rule is self-limiting and
-    needs no starvation counter: a deferred request keeps consuming its
-    deadline, so its R_defer rises with every step it sits out until it exceeds
-    eps and the request stops being defer-safe. This holds only because
-    R_defer is recomputed from the live T_q every step.
-
-    The E_viol probe keeps the whole decode set in the ledger and shrinks only
-    the slot count b, so the dropped request still pays its R_defer. Inside
-    build_plan the slot goes to the largest-M requests, i.e. the one dropped is
-    the smallest-M one — the same deep-slack end of the set the candidate order
-    walks. The probe's ledger is the decode set alone (its service share is
-    b/|D|, not the step-wide s), which is what makes the comparison between
-    consecutive sizes self-consistent; ``s`` is used only for eligibility.
-
-    ``delta_decode_of(n)`` is the batch-keyed decode-only Δ cell for a decode
-    set of size n. A missing cell stops the search (conservative: no fallback
-    average, R5) — with no measurement for the smaller batch there is no
-    evidence that shrinking helps. A missing cell for the CURRENT size leaves
-    the axis off.
-
-    Costs at most 2 + (accepted defers) build_plan calls: the D_policy
-    baseline, one probe per accepted defer, and one for the probe that stops
-    the search.
-
-    Returns the request_ids to defer, in the order they were dropped.
-    """
-    n = len(run_views)
-    cur_delta = delta_decode_of(n)
-    if cur_delta is None:
-        return []
-    candidates = []
-    for v in run_views:
-        if v.location != LOC_GPU or not v.is_measurable():
-            continue
-        _r_run, r_defer, _m = request_risk(v, delta, s)
-        if r_defer <= eps:
-            assert v.T_q is not None
-            candidates.append((v.T_q, v.request_id))
-    # Deepest slack (largest time-to-deadline) first: eps already gated on
-    # risk, so what remains to order by is how much room each request has.
-    candidates.sort(key=lambda t: -t[0])
-
-    cur_e = build_plan(run_views, [], n, cur_delta).e_viol
-    selected: list[str] = []
-    for _t_q, rid in candidates:
-        nxt_delta = delta_decode_of(n - 1)
-        if nxt_delta is None:
-            break
-        nxt_e = build_plan(run_views, [], n - 1, nxt_delta).e_viol
-        if nxt_e >= cur_e:
-            break
-        selected.append(rid)
-        cur_e, n = nxt_e, n - 1
-    return selected
-
-
 def token_budget_prefill_risk(
     views_A: list[ProgressView],
     b: int,
@@ -601,8 +550,8 @@ def token_budget_prefill_risk(
     one-step cost as a permanent slowdown (~20x overprice; floor residency
     43-83%, -23% throughput — see paper/scheduling.md §6).
 
-    Units: ``delta_dec`` seconds per decode-only step at the D axis' chosen
-    decode set size D' (see ``select_decode_defer``), ``kappa_p`` SECONDS of
+    Units: ``delta_dec`` seconds per decode-only step at the CURRENT decode set
+    size (the run/defer split's outcome), ``kappa_p`` SECONDS of
     extra step time per prefill token (``_sslo_kappa`` is a ratio of a seconds
     EMA to a token EMA, so Δ_b(P) stays in seconds), ``base_budget`` / ``floor``
     / ``prefill_work`` tokens, ``eps_p`` in expected-violation units.
@@ -692,7 +641,7 @@ def token_budget_prefill(
 
     Units: ``t_min`` seconds to the nearest in-flight chunk deadline (None ⇒
     no measurable request in flight), ``delta_decode`` seconds per decode-only
-    step at the D axis' chosen decode set size D' (see ``select_decode_defer``),
+    step at the current decode set size,
     ``kappa`` seconds of extra step time per prefill token,
     ``base_budget`` / ``floor`` tokens, ``gamma`` dimensionless in (0, 1].
 

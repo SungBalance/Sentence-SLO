@@ -94,12 +94,8 @@ class SsloStepState:
     num_offloads: int = 0
     num_onloads: int = 0
     # SSLO: deadline-aware Token Budget applied this step (None ⇒ the control
-    # is off / not yet armed). `token_budget_prefill` is TB*_pre (P axis);
-    # `token_budget_decode` is D' — the decode set size the D axis settled on
-    # — and `token_budget_d_defers` the requests it deferred this step.
+    # is off / not yet armed). `token_budget_prefill` is TB*_pre (P axis).
     token_budget_prefill: int | None = None
-    token_budget_decode: int | None = None
-    token_budget_d_defers: int = 0
 
 
 # SSLO: starvation release for the deadline-aware prefill budget. After this
@@ -1320,7 +1316,7 @@ class Scheduler(SchedulerInterface):
         self,
         views_a: list["ps.ProgressView"],
         b: int,
-        d_prime: int,
+        decode_size: int,
         lead: int,
         share_parked: bool,
         k_star: int,
@@ -1330,9 +1326,10 @@ class Scheduler(SchedulerInterface):
         Off unless `token_budget_control` is set and chunked prefill is
         enabled (the cap only smooths the prefill spike if the remainder can
         carry over to the next step), and until both κ and a decode-only Δ
-        reference exist. The Δ reference is read at ``d_prime`` — the decode
-        set size the D axis just settled on. ``views_a`` / ``b`` / ``lead`` /
-        ``share_parked`` are the same E_viol ledger inputs the admission search
+        reference exist. The Δ reference is read at ``decode_size`` — the
+        current decode set size, i.e. what the run/defer split settled on.
+        ``views_a`` / ``b`` / ``lead`` / ``share_parked`` are the same E_viol
+        ledger inputs the admission search
         used, so the dosing sees exactly the risk admission priced. After
         _SSLO_PREFILL_FLOOR_STARVE_STEPS consecutive floor-clamped steps with
         no prefill progress, one step gets the full base budget.
@@ -1350,7 +1347,7 @@ class Scheduler(SchedulerInterface):
         kappa = self._sslo_kappa()
         if kappa is None:
             return None
-        delta_decode = self._sslo_decode_wall_ema(d_prime)
+        delta_decode = self._sslo_decode_wall_ema(decode_size)
         if delta_decode is None:
             return None
         # SSLO: W — the burst this step prices. self.running / self.sslo_pending
@@ -1815,6 +1812,9 @@ class Scheduler(SchedulerInterface):
         # than the batch holds). Only the count matters to build_plan — new
         # admits are excluded from E_viol and admitted by the wait loop.
         waiting_views: list[ps.ProgressView] = []
+        # SSLO: measured KV block demand of each waiting candidate — the
+        # cumulative sum is what bounds admission (spec §3③).
+        waiting_blocks: dict[str, int] = {}
         for req in self.waiting:
             if len(waiting_views) >= b:
                 break
@@ -1826,15 +1826,10 @@ class Scheduler(SchedulerInterface):
                 request_id=req.request_id, c_q=0, T_q=None,
                 phase=int(Phase.PREFILL), is_new_admit=True,
                 tail_prob=lambda x: 1.0))
+            # SSLO
+            waiting_blocks[req.request_id] = self._sslo_request_kv_blocks(req)
 
-        kv_per_admit = self.sslo_config.kv_blocks_per_new_admit
-
-        def kv_feasible(k: int) -> bool:
-            if kv_per_admit <= 0:
-                return True
-            free_blocks = (
-                self.kv_cache_manager.block_pool.get_num_free_blocks())
-            return free_blocks // kv_per_admit >= k
+        free_kv_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
 
         # SSLO: adaptive batching — shrink the decode batch when E_viol(B) >= 1
         # so the urgent few get faster iterations (lower Δ). Δ(b) comes from the
@@ -1850,7 +1845,8 @@ class Scheduler(SchedulerInterface):
             delta = self._sslo_hybrid_delta(b) or delta
 
         result = ps.schedule_step(
-            views_a, waiting_views, b, delta, kv_feasible, lead, share_parked,
+            views_a, waiting_views, b, delta, free_kv_blocks,
+            waiting_blocks.__getitem__, lead, share_parked,
             # SSLO: budget admission on the marginal E_viol(k) - E_viol(0)
             # instead of the absolute E_viol(k), so sunk in-flight risk cannot
             # pin k* to 0 while KV / compute are idle.
@@ -1874,15 +1870,10 @@ class Scheduler(SchedulerInterface):
             self._sslo_apply_offload(now, result, b, delta, admitted,
                                      new_pending)
 
-        # SSLO: Token Budget D axis — shrink the decode set to D' while each
-        # defer lowers E_viol at the resulting Δ_dec. Runs before the P axis so
-        # TB*_pre is priced against Δ_dec(D').
+        # SSLO: Token Budget P axis — TB*_pre on the same E_viol ledger, priced
+        # against Δ_dec at the decode set the run/defer split just settled.
+        # Recorded here; schedule_sslo's running / waiting loops spend it.
         if self.sslo_config.token_budget_control:
-            self._sslo_apply_decode_budget(
-                views_a, new_running, new_pending, b, delta, admitted,
-                result.k_star)
-            # SSLO: Token Budget P axis — TB*_pre on the same E_viol ledger.
-            # Recorded here; schedule_sslo's running / waiting loops spend it.
             self._sslo_step.token_budget_prefill = (
                 self._sslo_prefill_token_budget(
                     views_a, b, len(new_running), lead, share_parked,
@@ -1903,44 +1894,6 @@ class Scheduler(SchedulerInterface):
         return pressures
 
     # SSLO
-    def _sslo_apply_decode_budget(
-        self,
-        views_a: list["ps.ProgressView"],
-        new_running: list[Request],
-        new_pending: list[Request],
-        b: int,
-        delta: float,
-        admitted: list[Request],
-        k_star: int,
-    ) -> None:
-        """Token Budget D axis: defer slack-deep defer-safe requests while each
-        defer strictly lowers E_viol at the resulting Δ_dec(D').
-
-        Mutates ``new_running`` / ``new_pending`` in place (the deferred
-        requests move from one to the other) so the P axis, which prices
-        prefill against Δ_dec(len(new_running)), sees D'.
-        """
-        cfg = self.sslo_config
-        run_ids = {req.request_id for req in new_running}
-        run_views = [v for v in views_a if v.request_id in run_ids]
-        # Mirror build_plan's |A+| so the R_defer gating the defer decision is
-        # the same number the plan computed.
-        n_aplus = len(admitted) + len(self._sslo_onloading) + k_star
-        if cfg.kv_offload_share_includes_parked:
-            n_aplus += len(self._sslo_offloaded)
-        deferred = ps.select_decode_defer(
-            run_views, delta, ps.service_share(b, n_aplus),
-            cfg.token_budget_decode_risk_eps, self._sslo_decode_wall_ema)
-        if deferred:
-            defer_ids = set(deferred)
-            new_pending.extend(
-                req for req in new_running if req.request_id in defer_ids)
-            new_running[:] = [
-                req for req in new_running if req.request_id not in defer_ids]
-        self._sslo_step.token_budget_decode = len(new_running)
-        self._sslo_step.token_budget_d_defers = len(deferred)
-
-    # SSLO
     def _sslo_offload_view(
         self, req: Request, location: int, now: float
     ) -> "ps.ProgressView":
@@ -1954,6 +1907,19 @@ class Scheduler(SchedulerInterface):
             T_q=state.time_to_deadline(now),
             phase=int(state.phase), is_new_admit=False,
             tail_prob=state.length_tail_prob, location=location)
+
+    # SSLO
+    def _sslo_request_kv_blocks(self, request: Request) -> int:
+        """KV blocks a request still needs for its prompt:
+        ceil(remaining prompt tokens / block_size).
+
+        The measured admission currency (spec §3③). Replaces the flat
+        `kv_blocks_per_new_admit` constant, which underestimated the real
+        per-request demand ~18x (8 vs a measured p50 of 141 blocks).
+        """
+        remaining = max(
+            0, request.num_prompt_tokens - request.num_computed_tokens)
+        return (remaining + self.block_size - 1) // self.block_size
 
     # SSLO
     def _sslo_num_gpu_blocks(self, request_id: str) -> int:
@@ -2031,14 +1997,13 @@ class Scheduler(SchedulerInterface):
         # --- Offload: only when KV admission (not E_viol) capped k*. ---
         num_offloads = 0
         if result.kv_capped:
-            per_admit = cfg.kv_blocks_per_new_admit
-            blocks_needed = (
-                result.k_star_unconstrained - result.k_star) * per_admit
+            # Measured demand of the admits KV blocked (spec §3③).
+            blocks_needed = result.kv_blocks_needed
             # Onloading reqs still awaiting GPU allocation need blocks too.
-            pending_onload = sum(
-                1 for r in self._sslo_onloading.values()
+            blocks_needed += sum(
+                self._sslo_request_kv_blocks(r)
+                for r in self._sslo_onloading.values()
                 if r.status == RequestStatus.PREEMPTED)
-            blocks_needed += pending_onload * per_admit
 
             min_res = cfg.kv_offload_min_residency_steps
             cand_views: list[ps.ProgressView] = []
@@ -2240,12 +2205,9 @@ class Scheduler(SchedulerInterface):
             "k_star_unconstrained": self._sslo_step.k_star_unconstrained,
             "num_offloads": self._sslo_step.num_offloads,
             "num_onloads": self._sslo_step.num_onloads,
-            # SSLO: deadline-aware Token Budget diagnostics. TB*_pre (P axis),
-            # D' and this step's D-axis defers, and κ_p. All are None while
-            # the control is off / not yet armed.
+            # SSLO: deadline-aware Token Budget diagnostics — TB*_pre (P axis)
+            # and κ_p. Both are None while the control is off / not yet armed.
             "token_budget_prefill": self._sslo_step.token_budget_prefill,
-            "token_budget_decode": self._sslo_step.token_budget_decode,
-            "token_budget_d_defers": self._sslo_step.token_budget_d_defers,
             "prefill_kappa_ms_per_tok": (
                 None if kappa is None else kappa * 1000.0),
             # SSLO: per-step KV cache block usage

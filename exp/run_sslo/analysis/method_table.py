@@ -2,7 +2,7 @@
 """4-method comparison table for an output_sweep_v2 sweep root.
 
 Emits one row per (cap, mode, rate) with the metrics the SSLO judgment needs:
-violation rate, throughput, TTFC, concurrent users, and the TB* / D-axis
+violation rate, throughput, TTFC, concurrent users, and the TB*
 diagnostics from scheduler_stats.jsonl. When a cell has several run_N
 directories the runs are averaged and the spread is reported, which is the
 only way to tell a real regression from run-to-run noise.
@@ -67,7 +67,7 @@ def read_cell(cell: Path) -> dict | None:
     stats_path = cell / "scheduler_stats.jsonl"
     if not stats_path.exists():
         return out
-    users, budgets, kappas, d_defers = [], [], [], 0
+    users, budgets, kappas = [], [], []
     with stats_path.open() as f:
         for line in f:
             try:
@@ -80,13 +80,11 @@ def read_cell(cell: Path) -> dict | None:
                 budgets.append(step["token_budget_prefill"])
             if step.get("prefill_kappa_ms_per_tok"):
                 kappas.append(step["prefill_kappa_ms_per_tok"])
-            d_defers += step.get("token_budget_d_defers") or 0
     out["users"] = _median(users)
     if budgets:
         out["tb"] = _median(budgets)
         out["floor_pct"] = 100 * sum(b <= TB_FLOOR for b in budgets) / len(budgets)
         out["kappa"] = _median(kappas)
-        out["d_defers"] = d_defers
     return out
 
 
@@ -128,7 +126,7 @@ def report(root: Path) -> None:
         print(f"\n=== {cap} ===")
         print(f"{'mode':>8s} {'rate':>5s} {'viol%':>7s} {'tput':>9s} "
               f"{'TTFC':>8s} {'users':>7s} {'TB*':>7s} {'floor%':>8s} "
-              f"{'kappa':>7s} {'Ddef':>7s} {'runs':>4s}")
+              f"{'kappa':>7s} {'runs':>4s}")
         for mode, label in MODES:
             for rate in rates:
                 runs = cells.get((cap, mode, rate))
@@ -138,8 +136,7 @@ def report(root: Path) -> None:
                       f"{fmt(runs, 'tput', 0):>9s} {fmt(runs, 'ttfc', 0):>8s} "
                       f"{fmt(runs, 'users', 0):>7s} {fmt(runs, 'tb', 0):>7s} "
                       f"{fmt(runs, 'floor_pct', 1):>8s} "
-                      f"{fmt(runs, 'kappa', 3):>7s} "
-                      f"{fmt(runs, 'd_defers', 0):>7s} {len(runs):>4d}")
+                      f"{fmt(runs, 'kappa', 3):>7s} {len(runs):>4d}")
 
 
 def main() -> None:

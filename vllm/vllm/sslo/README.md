@@ -98,7 +98,7 @@ sequenceDiagram
 
     loop every scheduler step (schedule_sslo)
         Sched->>State: time_to_deadline / length_tail_prob / phase
-        Sched->>PS: schedule_step(views_A, waiting_views, b, Δ, kv_feasible)
+        Sched->>PS: schedule_step(views_A, waiting_views, b, Δ, free_kv_blocks, blocks_of)
         PS-->>Sched: scheduled_A / deferred_A / k* / E_viol
         opt adaptive_batching and E_viol ≥ 1
             Sched->>PS: pick_adaptive_batch (shrink to captured size)
@@ -145,8 +145,8 @@ M       = R_defer − R_run   (forced to 1 if R_defer ≥ 1, to avoid abandonmen
   slots go to measurable requests by largest `M`; the rest are deferred.
   `E_viol = Σ_scheduled R_run + Σ_deferred R_defer`.
 - **`schedule_step(...)`** — scans the FCFS waiting prefix upward for
-  `k* = max{k : E_viol(k) < 1}` (E_viol is monotone in k), hard-capped by a
-  `kv_feasible(k)` callback (free-KV-block based).
+  `k* = max{k : E_viol(k) < 1}` (E_viol is monotone in k), hard-capped by the
+  candidates' cumulative KV block demand (`blocks_of` vs `free_kv_blocks`).
   With `admission_delta_criterion` the test is the **marginal** one,
   `E_viol(k) − E_viol(0) < 1`: the risk the in-flight set already carries is
   sunk, so the budget covers only the violations the new admits add. This
@@ -256,31 +256,25 @@ Defaults shown; validation in `__post_init__`.
 | `method` | `"baseline"` | `"baseline"` = metrics only · `"progress_serve"` = enforce |
 | `adaptive_batching` | `False` | Allow decode-batch shrink when `E_viol ≥ 1` |
 | `admission_delta_criterion` | `False` | Admit on the marginal `E_viol(k) − E_viol(0) < 1` instead of the absolute `E_viol(k) < 1`. **Rejected** experiment option — see WORKLOG 2026-08-07 |
-| `kv_blocks_per_new_admit` | 8 | Admission cap = `free_kv_blocks // N`; 0 disables |
+
+Admission is also bounded by KV: `schedule_step` takes the free block count and
+a per-candidate `blocks_of` callback and admits the largest prefix whose
+`Σ ceil(remaining prompt tokens / block_size) ≤ free_kv_blocks`. The flat
+`kv_blocks_per_new_admit = 8` constant this replaced (2026-08-13) underestimated
+the real per-request demand ~18x (measured p50 141 blocks), so the scan never
+stopped on KV and `kv_capped` — the offload tier's trigger — stayed False even
+at 99% KV occupancy.
 
 ### Deadline-aware Token Budget (TB*)
 
-Both axes buy step time with the currency admission already spends — the
+It buys step time with the currency admission already spends — the
 expected violation count `E_viol` of the in-flight set, evaluated at the step
-time the choice implies — and are gated by the single `token_budget_control`
-flag. (Until 2026-08-11 both were priced off the worst-case constraint
+time the choice implies — and is gated by the `token_budget_control`
+flag. (Until 2026-08-11 it was priced off the worst-case constraint
 `Δ_dec(D) + κ_p·P ≤ γ·t_min`; one near-deadline survivor then held the whole
 step hostage — floor `TB*_pre` on 81% of recovery steps. Under `E_viol` a doomed
 request (`R ≈ 1` either way) has ~0 marginal weight, so sunk risk no longer
 blocks progress.)
-
-**D axis** (`progress_serve.select_decode_defer`). Defer-safe requests —
-GPU-resident, MEASURED, `R_defer ≤ token_budget_decode_risk_eps` — are deferred
-deepest-slack-first **while each defer strictly lowers `E_viol`** at the
-resulting `Δ_dec(D')`; the first non-improving defer stops the search and is not
-taken, so an unhelpful shrink costs nothing. Forced (PREFILL/WARMUP), onloading
-and at-risk requests are never deferred, which is the natural floor `D_floor`.
-Eligibility is self-limiting — a deferred request keeps burning its deadline, so
-its `R_defer` rises until it exceeds `eps` — so no starvation counter is needed
-(unlike the P axis floor). `Δ_dec(n)` is the batch-matched decode-only wall-EMA
-cell; a missing cell stops the search rather than falling back to a cross-batch
-average (R5). With deadlines far away (the read workload) `D' = D_policy`, i.e.
-the axis is a no-op.
 
 **P axis** (`progress_serve.token_budget_prefill_risk`). Caps the **total**
 prefill tokens of one scheduler step at
@@ -288,8 +282,8 @@ prefill tokens of one scheduler step at
 token_budget_risk_eps }`. `E(P)` re-prices the ledger under a **burst horizon**:
 `W` (this step's remaining prefill work — in-flight carry-over plus the prompts
 of the `k*` queue heads, onloading requests excluded) is spread over `W/P` steps
-of `Δ_dec(D') + κ_p·P`, after which the step time returns to `Δ_dec(D')`, where
-`D'` is what the D axis settled on. So a request whose deadline falls past the
+of `Δ_dec + κ_p·P`, after which the step time returns to `Δ_dec` at the
+current decode set size. So a request whose deadline falls past the
 burst window sees a horizon set only by the sunk total delay `κ_p·W` and is not
 charged for `P` at all; `P` prices the burst's *concentration*, not its cost.
 The reference is `E(floor)` — the floor is granted unconditionally, so it is the
@@ -312,20 +306,20 @@ Both prefill paths drain one shared per-step counter, in this order:
    and retried next step. A KV-onload is exempt from the clamp (it is
    deadline-forced) but still charged.
 
-Decode tokens are never clamped and never charged — the D axis works in whole
-requests, never in tokens (R4). The service share `s` is untouched by the P
-axis. κ_p is estimated online from `(Δ_observed − Δ_decode)/prefill_tokens` as a
+Decode tokens are never clamped and never charged; the decode set is settled by
+the run/defer split alone (R4 — the D axis that used to shrink it was dropped
+2026-08-13, see `paper/scheduling.md` §6). The service share `s` is untouched by
+the P axis. κ_p is estimated online from `(Δ_observed − Δ_decode)/prefill_tokens` as a
 ratio of sums over the same token population the cap binds; the remainder of a
 capped prefill carries to the next step via chunked prefill (the P axis
 self-disables when chunked prefill is off).
 
 | Field | Default | Meaning |
 |---|---|---|
-| `token_budget_control` | `False` | Enable the Token Budget (both axes) |
+| `token_budget_control` | `False` | Enable the Token Budget (P axis) |
 | `token_budget_prefill_floor` | 512 | Lower clamp on `TB*_pre` (tokens); must be > 0 so prefill always progresses |
 | `token_budget_risk_eps` | 0.5 | P axis: expected-violation budget `ε_p` the prefill dose may add over `E(floor)`; must be > 0 |
 | `token_budget_gamma` | 0.5 | **Deprecated** (2026-08-11) — γ of the rejected worst-case `token_budget_prefill()`, kept for A/B replay only |
-| `token_budget_decode_risk_eps` | 1e-3 | D axis: only `R_defer ≤ eps` requests may be dropped from the decode set |
 
 ### KV offload tier (see §9)
 
@@ -395,9 +389,8 @@ aggregated by `exp/run_sslo/analyze.py`.
 
 ## 9. KV Offload Tier (`kv_offload`)
 
-**Motivation.** In the KV-capped regime the admission cap
-(`free_kv_blocks // kv_blocks_per_new_admit`) — not the decode-batch width — is
-what throttles admission. Deep-slack **deferred** requests still occupy GPU KV
+**Motivation.** In the KV-capped regime the free KV block count — not the
+decode-batch width — is what throttles admission. Deep-slack **deferred** requests still occupy GPU KV
 blocks they will not consume for many iterations. Offloading that KV to CPU
 frees admission headroom so newly-arriving urgent requests can be admitted
 sooner, then onloading it back before the deferred request's deadline keeps its

@@ -15,7 +15,6 @@ def test_defaults():
     assert cfg.seconds_per_word == 0.28
     assert cfg.chunk_unit == "sentence"
     assert cfg.min_chunk_tokens == 16
-    assert cfg.kv_blocks_per_new_admit == 8
     assert cfg.progress_serve_min_denom == 4
     # Removed policy knobs must be gone.
     assert not hasattr(cfg, "policy")
@@ -39,7 +38,8 @@ def test_method_validation_rejects_old_modes():
 def test_removed_knobs_rejected_as_kwargs():
     for bad in ("policy", "critical_threshold",
                 "pending_in_threshold", "mlp_defer_constraint",
-                "mlp_kv_blocks_per_new_admit"):
+                "mlp_kv_blocks_per_new_admit", "kv_blocks_per_new_admit",
+                "token_budget_decode_risk_eps"):
         with pytest.raises(TypeError):
             SsloConfig(**{bad: 1})
 
@@ -52,7 +52,6 @@ def test_removed_knobs_rejected_as_kwargs():
         ("tpot_ema_alpha", 1.1),
         ("seconds_per_word", -0.1),
         ("min_chunk_tokens", -1),
-        ("kv_blocks_per_new_admit", -1),
         ("progress_serve_min_denom", 0),
     ],
 )
@@ -142,7 +141,6 @@ def test_token_budget_defaults():
     assert cfg.token_budget_prefill_floor == 512
     assert cfg.token_budget_risk_eps == 0.5
     assert cfg.token_budget_gamma == 0.5
-    assert cfg.token_budget_decode_risk_eps == 1e-3
 
 
 def test_token_budget_control_requires_progress_serve():
@@ -168,11 +166,6 @@ def test_token_budget_gamma_range(value):
 def test_token_budget_risk_eps_must_be_positive(value):
     with pytest.raises(ValueError, match="token_budget_risk_eps"):
         SsloConfig(token_budget_risk_eps=value)
-
-
-def test_token_budget_decode_risk_eps_rejects_negative():
-    with pytest.raises(ValueError, match="token_budget_decode_risk_eps"):
-        SsloConfig(token_budget_decode_risk_eps=-0.1)
 
 
 @pytest.mark.parametrize(

@@ -52,11 +52,6 @@ class SsloConfig:
     # point-estimate `expected_remaining_len`, used for ChunkRecord logging).
     mlp_predictor_escalate_threshold: float = 0.9
     mlp_predictor_overshoot_safety_factor: float = 3.5
-    # KV-aware admission cap. The FCFS waiting prefix admitted per step is
-    # capped at `free_kv_blocks // kv_blocks_per_new_admit` so we don't admit
-    # more reqs than the KV pool can absorb. Each admit needs prompt blocks
-    # (~7-10 for ShareGPT) + 1 first-decode block. Set 0 to disable (no cap).
-    kv_blocks_per_new_admit: int = 8
     # Max samples retained by ChunkLengthPredictor's history. The shared
     # global predictor accumulates many samples — keep enough to stabilise
     # the empirical tail.
@@ -118,26 +113,25 @@ class SsloConfig:
     # re-offloaded within this many scheduler steps. 0 disables. The step-count
     # check itself lives in the scheduler (stage 2); this is the knob only.
     kv_offload_min_residency_steps: int = 0
-    # Deadline-aware Token Budget TB*. Both axes buy step time with the same
+    # Deadline-aware Token Budget TB*. It buys step time with the same
     # currency the admission rule spends — the expected violation count E_viol
     # of the in-flight set, evaluated at the step time the choice implies:
-    #   [D axis] defer slack-deep defer-safe requests while each defer strictly
-    #            lowers E_viol at the resulting Δ_dec(D')
-    #            (progress_serve.select_decode_defer).
     #   [P axis] TB*_pre caps the TOTAL prefill tokens of a step —
     #            chunked-prefill carry-over in the running loop plus new admits
     #            in the waiting loop, sharing one budget — at the largest P
     #            whose burst-horizon E_viol (the burst runs W/P steps of
-    #            Δ_dec(D') + κ_p·P, then Δ_dec resumes) stays within
+    #            Δ_dec + κ_p·P, then Δ_dec resumes) stays within
     #            token_budget_risk_eps of E_viol at the floor
     #            (progress_serve.token_budget_prefill_risk). Measured
     #            (cap128/rate2 baseline): prefill-carrying steps are only 6% of
     #            steps but 18.4% of the wall clock (Δ p90 463 ms vs 78 ms
     #            decode-only) — deadline misses come from the prefill spike,
     #            not decode concurrency.
-    # Decode tokens are never charged to TB*_pre (the D axis works in whole
-    # requests, never in tokens). Requires method="progress_serve"; a single
-    # flag gates both axes because they share one ledger.
+    # Decode tokens are never charged to TB*_pre; the decode set is settled by
+    # the run/defer split alone (the D axis was dropped 2026-08-13 — it fired
+    # on 28% of steps with no non-intervention guarantee and cost throughput
+    # with no violation-rate gain, paper/scheduling.md §6). Requires
+    # method="progress_serve".
     token_budget_control: bool = False
     # Lower clamp on TB*_pre (tokens). Must be > 0 so prefill always makes
     # progress under chunked prefill (no prefill starvation). Keep it well
@@ -166,12 +160,6 @@ class SsloConfig:
     # pinned TB*_pre to the floor on 81% of recovery steps (WORKLOG
     # 2026-08-11).
     token_budget_gamma: float = 0.5
-    # D-axis defer-safety epsilon (in tail-posterior probability units, same
-    # grammar as kv_offload_risk_eps): only a MEASURED request whose deferred
-    # risk R_defer <= eps may be dropped from the decode set to shrink Δ_dec.
-    # Forced / onloading / at-risk requests are never deferred — they are the
-    # natural floor D_floor.
-    token_budget_decode_risk_eps: float = 1e-3
 
     def __post_init__(self) -> None:
         if self.method not in ("baseline", "progress_serve"):
@@ -233,10 +221,6 @@ class SsloConfig:
             raise ValueError(
                 "mlp_predictor_overshoot_safety_factor must be >= 0, "
                 f"got {self.mlp_predictor_overshoot_safety_factor}")
-        if self.kv_blocks_per_new_admit < 0:
-            raise ValueError(
-                "kv_blocks_per_new_admit must be >= 0 (0 disables), "
-                f"got {self.kv_blocks_per_new_admit}")
         if self.chunk_len_predictor_history_max < 1:
             raise ValueError(
                 "chunk_len_predictor_history_max must be >= 1, "
@@ -277,7 +261,3 @@ class SsloConfig:
             raise ValueError(
                 "token_budget_gamma must be in (0, 1], "
                 f"got {self.token_budget_gamma}")
-        if self.token_budget_decode_risk_eps < 0:
-            raise ValueError(
-                "token_budget_decode_risk_eps must be >= 0, "
-                f"got {self.token_budget_decode_risk_eps}")

@@ -774,10 +774,9 @@ async def run_one(args: argparse.Namespace) -> None:
             v = os.environ.get(env_name)
             if v is not None:
                 sslo_params[key] = cast(v)
-    # SSLO: deadline-aware Token Budget — one expected-risk ledger dosing both
-    # the prefill tokens (P axis) and the decode set size (D axis) so neither
-    # can blow the in-flight chunk deadlines. It composes with the offload
-    # tier.
+    # SSLO: deadline-aware Token Budget — an expected-risk ledger dosing the
+    # per-step prefill tokens (P axis) so a prefill burst cannot blow the
+    # in-flight chunk deadlines. It composes with the offload tier.
     if args.run_kind in TOKEN_BUDGET_RUN_KINDS:
         sslo_params["token_budget_control"] = True
         for env_name, key, cast in (
@@ -785,8 +784,6 @@ async def run_one(args: argparse.Namespace) -> None:
              "token_budget_prefill_floor", int),
             ("SSLO_TOKEN_BUDGET_RISK_EPS", "token_budget_risk_eps", float),
             ("SSLO_TOKEN_BUDGET_GAMMA", "token_budget_gamma", float),
-            ("SSLO_TOKEN_BUDGET_DECODE_RISK_EPS",
-             "token_budget_decode_risk_eps", float),
         ):
             v = os.environ.get(env_name)
             if v is not None:
@@ -815,11 +812,14 @@ async def run_one(args: argparse.Namespace) -> None:
     if args.max_model_len > 0:
         engine_kwargs["max_model_len"] = args.max_model_len
     # else: omit so vLLM picks the model's config max.
+    # SSLO: engine-configuration parity — prefix caching is on for EVERY run
+    # kind. The offload connector self-disables without it, and turning it on
+    # for that mode alone made prefix-cache hits (large on multi-turn data) a
+    # confound between modes (spec §4).
+    engine_kwargs["enable_prefix_caching"] = True
     # SSLO: the KV offload tier needs the CPU-offload connector. Eager
     # mirroring (lazy_offload=False) keeps a CPU copy of every block so
-    # an offload is ~free; SimpleCPUOffloadConnector self-disables unless
-    # enable_prefix_caching is True, so force it on here (offload mode only —
-    # other modes keep the engine default). CPU capacity from CPU_OFFLOAD_GB
+    # an offload is ~free. CPU capacity from CPU_OFFLOAD_GB
     # (default 16). Non-offload modes carry no kv_transfer plumbing.
     if args.run_kind in OFFLOAD_RUN_KINDS:
         from vllm.config import KVTransferConfig
@@ -833,7 +833,6 @@ async def run_one(args: argparse.Namespace) -> None:
             },
         )
         engine_kwargs["disable_hybrid_kv_cache_manager"] = False
-        engine_kwargs["enable_prefix_caching"] = True
     if args.enable_thinking:
         engine_kwargs["reasoning_parser"] = "qwen3"
     engine_args = AsyncEngineArgs(**engine_kwargs)

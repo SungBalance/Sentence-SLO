@@ -15,7 +15,6 @@ from vllm.sslo.progress_serve import (
     request_risk,
     request_risk_cpu,
     schedule_step,
-    select_decode_defer,
     select_onload,
     select_offload,
     service_share,
@@ -41,6 +40,13 @@ def _new_admit(rid: str) -> ProgressView:
 
 def _cpu(rid: str, c_q: int, t_q: float, tail) -> ProgressView:
     return ProgressView(rid, c_q, t_q, PHASE_MEASURED, False, tail, LOC_CPU)
+
+
+# schedule_step's KV accounting is a cumulative sum of per-candidate block
+# counts. `_one_block` gives every candidate the same unit demand, so
+# free_kv_blocks=n reads directly as "at most n admits".
+_one_block = lambda rid: 1
+_KV_UNLIMITED = dict(free_kv_blocks=10**9, blocks_of=_one_block)
 
 
 # ---- horizon ----------------------------------------------------------
@@ -170,10 +176,10 @@ def test_build_plan_new_admits_consume_slots_but_excluded_from_eviol():
 # ---- schedule_step ----------------------------------------------------
 
 def test_schedule_step_empty_A_bounded_by_kv():
-    # No in-flight; E_viol(k)=0<1 for all k, so k* bounded by kv_feasible.
+    # No in-flight; E_viol(k)=0<1 for all k, so k* is bounded by the KV blocks.
     waiting = [_new_admit(f"w{i}") for i in range(10)]
     res = schedule_step([], waiting, b=8, delta=1.0,
-                        kv_feasible=lambda k: k <= 3)
+                        free_kv_blocks=3, blocks_of=_one_block)
     assert res.k_star == 3
     assert res.e_viol == 0.0
 
@@ -182,7 +188,7 @@ def test_schedule_step_kv_caps_below_risk():
     v = _measurable("v", 0, 100.0, lambda x: 0.0)  # zero risk
     waiting = [_new_admit(f"w{i}") for i in range(10)]
     res = schedule_step([v], waiting, b=8, delta=1.0,
-                        kv_feasible=lambda k: k <= 2)
+                        free_kv_blocks=2, blocks_of=_one_block)
     assert res.k_star == 2
 
 
@@ -192,7 +198,7 @@ def test_schedule_step_matches_build_plan_boundary():
     tail = lambda x: max(0.0, 1.0 - x / 6.0)
     a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(3)]
     waiting = [_new_admit(f"w{i}") for i in range(5)]
-    res = schedule_step(a, waiting, b=3, delta=1.0, kv_feasible=lambda k: True)
+    res = schedule_step(a, waiting, b=3, delta=1.0, **_KV_UNLIMITED)
     # Oracle: largest k with build_plan(...,waiting[:k]).e_viol < 1.
     expected_k = 0
     for k in range(len(waiting) + 1):
@@ -208,7 +214,7 @@ def test_schedule_step_defer_only_when_infeasible_at_zero():
     tail = lambda x: 1.0  # everything still going → max risk
     a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(3)]
     res = schedule_step(a, [_new_admit("w0")], b=1, delta=1.0,
-                        kv_feasible=lambda k: True)
+                        **_KV_UNLIMITED)
     assert res.k_star == 0
     # one scheduled (R_run=1), two deferred (R_defer=1) → e_viol=3
     assert res.e_viol >= 1.0
@@ -223,10 +229,8 @@ def test_schedule_step_delta_criterion_unlocks_sunk_risk():
     tail = lambda x: 1.0
     a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(3)]
     waiting = [_new_admit(f"w{i}") for i in range(2)]
-    absolute = schedule_step(a, waiting, b=1, delta=1.0,
-                             kv_feasible=lambda k: True)
-    delta_res = schedule_step(a, waiting, b=1, delta=1.0,
-                              kv_feasible=lambda k: True,
+    absolute = schedule_step(a, waiting, b=1, delta=1.0, **_KV_UNLIMITED)
+    delta_res = schedule_step(a, waiting, b=1, delta=1.0, **_KV_UNLIMITED,
                               admission_delta_criterion=True)
     assert absolute.k_star == 0
     assert delta_res.k_star == 2
@@ -240,10 +244,8 @@ def test_schedule_step_delta_criterion_matches_absolute_at_low_risk():
     a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(3)]
     waiting = [_new_admit(f"w{i}") for i in range(5)]
     assert build_plan(a, [], 3, 1.0).e_viol == 0.0
-    absolute = schedule_step(a, waiting, b=3, delta=1.0,
-                             kv_feasible=lambda k: True)
-    delta_res = schedule_step(a, waiting, b=3, delta=1.0,
-                              kv_feasible=lambda k: True,
+    absolute = schedule_step(a, waiting, b=3, delta=1.0, **_KV_UNLIMITED)
+    delta_res = schedule_step(a, waiting, b=3, delta=1.0, **_KV_UNLIMITED,
                               admission_delta_criterion=True)
     assert 0 < absolute.k_star < len(waiting)  # the risk budget did bind
     assert delta_res.k_star == absolute.k_star
@@ -258,10 +260,8 @@ def test_schedule_step_delta_criterion_still_bounded_by_marginal_budget():
     a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(3)]
     a += [_measurable(f"d{i}", 0, 3.0, lambda x: 1.0) for i in range(2)]
     waiting = [_new_admit(f"w{i}") for i in range(4)]
-    absolute = schedule_step(a, waiting, b=5, delta=1.0,
-                             kv_feasible=lambda k: True)
-    delta_res = schedule_step(a, waiting, b=5, delta=1.0,
-                              kv_feasible=lambda k: True,
+    absolute = schedule_step(a, waiting, b=5, delta=1.0, **_KV_UNLIMITED)
+    delta_res = schedule_step(a, waiting, b=5, delta=1.0, **_KV_UNLIMITED,
                               admission_delta_criterion=True)
     assert absolute.k_star == 0
     # Oracle: largest k with E_viol(k) - E_viol(0) < 1.
@@ -439,7 +439,7 @@ def test_schedule_step_kv_capped_reports_unconstrained():
     # E_viol always 0 (zero risk), KV caps at 2 but 5 could be admitted.
     waiting = [_new_admit(f"w{i}") for i in range(5)]
     res = schedule_step([], waiting, b=8, delta=1.0,
-                        kv_feasible=lambda k: k <= 2)
+                        free_kv_blocks=2, blocks_of=_one_block)
     assert res.k_star == 2
     assert res.k_star_unconstrained == 5
     assert res.kv_capped is True
@@ -450,10 +450,82 @@ def test_schedule_step_not_capped_when_eviol_bounds():
     tail = lambda x: max(0.0, 1.0 - x / 6.0)
     a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(3)]
     waiting = [_new_admit(f"w{i}") for i in range(5)]
-    res = schedule_step(a, waiting, b=3, delta=1.0,
-                        kv_feasible=lambda k: True)
+    res = schedule_step(a, waiting, b=3, delta=1.0, **_KV_UNLIMITED)
     assert res.kv_capped is False
     assert res.k_star_unconstrained == res.k_star
+
+
+# ---- schedule_step: measured KV block accounting ----------------------
+
+# Uneven prompts: a flat per-admit constant cannot express this, which is the
+# whole point of the 2026-08-13 change. Cumulative demand: 141, 161, 461, 471.
+_BLOCKS = {"w0": 141, "w1": 20, "w2": 300, "w3": 10}
+
+
+def test_schedule_step_stops_at_cumulative_block_sum():
+    # Zero-risk in-flight → E_viol never binds, so only KV can stop the scan.
+    waiting = [_new_admit(f"w{i}") for i in range(4)]
+    # 400 free blocks covers w0+w1 (161) but not w0+w1+w2 (461).
+    res = schedule_step([], waiting, b=8, delta=1.0, free_kv_blocks=400,
+                        blocks_of=_BLOCKS.__getitem__)
+    assert res.k_star == 2
+    assert res.kv_capped is True
+    assert res.k_star_unconstrained == 4
+    # The offload tier must free the DEFICIT, not the incremental demand:
+    # the whole prefix wants 471 and 400 are already free.
+    assert res.kv_blocks_needed == 71
+    # One block short of the first candidate → nobody is admitted.
+    tight = schedule_step([], waiting, b=8, delta=1.0, free_kv_blocks=140,
+                          blocks_of=_BLOCKS.__getitem__)
+    assert tight.k_star == 0
+    assert tight.kv_capped is True
+    assert tight.kv_blocks_needed == 471 - 140
+
+
+def test_schedule_step_kv_boundary_is_inclusive():
+    # free_kv_blocks lands EXACTLY on a cumulative sum: that candidate still
+    # fits (the rule is <=), and the deficit is measured from there.
+    waiting = [_new_admit(f"w{i}") for i in range(4)]
+    res = schedule_step([], waiting, b=8, delta=1.0, free_kv_blocks=161,
+                        blocks_of=_BLOCKS.__getitem__)
+    assert res.k_star == 2  # w0 + w1 == 161 fits exactly
+    assert res.kv_blocks_needed == 471 - 161
+
+
+def test_schedule_step_no_blocks_needed_when_eviol_stops_at_the_kv_break():
+    # KV stops the scan at k=1, but E_viol would have stopped there too, so
+    # k*_unconstrained == k* — nothing to offload FOR, and the tier stays off.
+    tail = lambda x: 0.0 if x >= 3 else 0.9
+    a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(2)]
+    waiting = [_new_admit(f"w{i}") for i in range(4)]
+    assert build_plan(a, [], 2, 1.0).e_viol < 1.0            # k=0 feasible
+    assert build_plan(a, waiting[:1], 2, 1.0).e_viol >= 1.0  # k=1 is not
+    res = schedule_step(a, waiting, b=2, delta=1.0, free_kv_blocks=0,
+                        blocks_of=_BLOCKS.__getitem__)
+    assert res.k_star == 0
+    assert res.k_star_unconstrained == 0
+    assert res.kv_capped is False
+    assert res.kv_blocks_needed == 0
+
+
+def test_schedule_step_kv_not_capped_when_blocks_suffice():
+    # Same candidates, enough blocks for all of them → E_viol decides k* and
+    # the offload trigger stays quiet.
+    tail = lambda x: max(0.0, 1.0 - x / 2.0)
+    a = [_measurable(f"a{i}", 0, 3.0, tail) for i in range(3)]
+    waiting = [_new_admit(f"w{i}") for i in range(4)]
+    res = schedule_step(a, waiting, b=3, delta=1.0, free_kv_blocks=471,
+                        blocks_of=_BLOCKS.__getitem__)
+    expected_k = 0
+    for k in range(len(waiting) + 1):
+        if build_plan(a, waiting[:k], 3, 1.0).e_viol < 1.0:
+            expected_k = k
+        else:
+            break
+    assert 0 < expected_k < len(waiting)  # the risk budget really did bind
+    assert res.k_star == expected_k
+    assert res.kv_capped is False
+    assert res.kv_blocks_needed == 0
 
 
 def test_schedule_step_threads_share_includes_parked():
@@ -467,10 +539,8 @@ def test_schedule_step_threads_share_includes_parked():
     views = [_measurable(f"v{i}", 0, 20.0, tail) for i in range(2)] + [
         _cpu(f"c{i}", 0, 20.0, lambda x: 0.0) for i in range(2)]
     waiting = [_new_admit(f"w{i}") for i in range(5)]
-    inc = schedule_step(views, waiting, b=2, delta=1.0,
-                        kv_feasible=lambda k: True)
-    exc = schedule_step(views, waiting, b=2, delta=1.0,
-                        kv_feasible=lambda k: True,
+    inc = schedule_step(views, waiting, b=2, delta=1.0, **_KV_UNLIMITED)
+    exc = schedule_step(views, waiting, b=2, delta=1.0, **_KV_UNLIMITED,
                         share_includes_parked=False)
     assert inc.k_star < exc.k_star
     # Each result must match build_plan under the same flag (threaded, not
@@ -584,100 +654,16 @@ def test_pick_adaptive_batch_threads_share_includes_parked():
 
 
 # ---------------------------------------------------------------------------
-# Token Budget — D axis (select_decode_defer)
+# Token Budget — P axis (TB*_pre, risk dosing)
 # ---------------------------------------------------------------------------
 
 _SAFE = lambda x: 0.0  # deep slack → R_defer = 0, and no risk to save either
 _ATRISK = lambda x: 1.0  # certain miss → R_defer = 1
-# An urgent-but-savable request: its risk actually falls when the decode step
-# gets shorter, which is what makes a defer pay for itself.
+# An urgent-but-savable request: its risk actually falls when the step gets
+# shorter, which is what makes a smaller prefill dose pay for itself.
 _URGENT = lambda x: max(0.0, 1.0 - x / 40.0)
 
-
-def test_select_decode_defer_accepts_while_e_viol_improves():
-    # 1 urgent (T_q = 10 s) + 3 deep-slack requests. Δ_dec(4) = 1.0 s →
-    # R_run(urgent) = 0.75. Deferring one shortens the step to 0.5 s, which
-    # buys the urgent request a longer horizon (R_run 0.75 → 0.625) for the
-    # price of a smaller service share — E_viol drops, so the defer is taken.
-    # The next one (Δ_dec(2) = 0.4 s) no longer pays: the share loss outweighs
-    # the shorter step (0.675), so the search stops there.
-    views = [_measurable("u", 0, 10.0, _URGENT)] + [
-        _measurable(f"s{i}", 0, float(20 + i), _SAFE) for i in range(3)]
-    got = select_decode_defer(views, 1.0, 1.0, eps=1e-3,
-                              delta_decode_of={4: 1.0, 3: 0.5, 2: 0.4}.get)
-    assert got == ["s2"]  # deepest slack first, and only while it improves
-
-
-def test_select_decode_defer_no_op_when_no_defer_improves():
-    # (a) Every in-flight request is doomed (R_run = R_defer = 1): E_viol is
-    # flat in the decode set size, so the marginal value of a defer is 0 and
-    # the axis stays out of the way — the sunk-cost case the γ·t_min rule
-    # needed an explicit overdue guard for.
-    doomed = [_measurable(f"d{i}", 0, float(10 + i), _ATRISK) for i in range(4)]
-    assert select_decode_defer(doomed, 1.0, 1.0, eps=1e-3,
-                               delta_decode_of={4: 1.0, 3: 0.5}.get) == []
-    # (b) Same population as the accepting case, but the shorter step barely
-    # differs (1.0 → 0.99 s), so the lost service share dominates.
-    views = [_measurable("u", 0, 10.0, _URGENT)] + [
-        _measurable(f"s{i}", 0, float(20 + i), _SAFE) for i in range(3)]
-    assert select_decode_defer(views, 1.0, 1.0, eps=1e-3,
-                               delta_decode_of={4: 1.0, 3: 0.99}.get) == []
-    # (c) Deadlines far away (the read workload) → nothing to save.
-    relaxed = [_measurable(f"v{i}", 0, 100.0, _SAFE) for i in range(4)]
-    assert select_decode_defer(relaxed, 1.0, 1.0, eps=1e-3,
-                               delta_decode_of={4: 1.0, 3: 0.5}.get) == []
-
-
-def test_select_decode_defer_never_drops_forced_or_at_risk():
-    # D_floor = forced + at-risk. Shrinking keeps paying here (Δ_dec 1.0 →
-    # 0.5 → 0.3 s), so the search runs until the candidates are exhausted —
-    # yet only the two defer-safe reqs may go: the PREFILL one is not
-    # measurable and the R_defer = 1 one fails the eps test.
-    views = [_forced("f0"), _measurable("hot", 0, 10.0, _ATRISK),
-             _measurable("u", 0, 10.0, _URGENT)] + [
-        _measurable(f"safe{i}", 0, float(20 + i), _SAFE) for i in range(2)]
-    got = select_decode_defer(views, 1.0, 1.0, eps=1e-3,
-                              delta_decode_of={5: 1.0, 4: 0.5, 3: 0.3}.get)
-    assert got == ["safe1", "safe0"]
-    assert len(views) - len(got) == 3  # D' = D_floor = forced + hot + u
-
-
-def test_select_decode_defer_stops_without_batch_matched_cell():
-    views = [_measurable("u", 0, 10.0, _URGENT)] + [
-        _measurable(f"s{i}", 0, float(20 + i), _SAFE) for i in range(3)]
-    # No cell for the size below the current one → the search cannot price the
-    # shrink and stops rather than falling back to a cross-batch average (R5).
-    assert select_decode_defer(views, 1.0, 1.0, eps=1e-3,
-                               delta_decode_of={4: 1.0}.get) == []
-    # No cell for the current size either → the axis stays off.
-    assert select_decode_defer(views, 1.0, 1.0, eps=1e-3,
-                               delta_decode_of=lambda n: None) == []
-
-
-def test_select_decode_defer_eligibility_is_self_limiting():
-    # Sitting out steps burns the deferred request's deadline, so its R_defer
-    # rises until it crosses eps and the request stops being defer-safe —
-    # which is why the axis needs no starvation counter.
-    tail = lambda x: max(0.0, 1.0 - x / 10.0)
-    # Two forced fillers so "v" is the only defer candidate; deferring it
-    # shortens the step for the urgent request, so the defer does pay.
-    others = [_forced("f0"), _forced("f1"),
-              _measurable("u", 0, 10.0, _URGENT)]
-    kw = dict(eps=1e-3, delta_decode_of={4: 1.0, 3: 0.5}.get)
-    # T_q = 20 → N_defer = 19 → R_defer = tail(19) = 0 → defer-safe.
-    fresh = [_measurable("v", 0, 20.0, tail)] + others
-    assert select_decode_defer(fresh, 1.0, 1.0, **kw) == ["v"]
-    # Same request several defers later: T_q = 5 → N_defer = 4 →
-    # R_defer = 0.6 > eps → it keeps its slot.
-    stale = [_measurable("v", 0, 5.0, tail)] + others
-    assert select_decode_defer(stale, 1.0, 1.0, **kw) == []
-
-
-# ---------------------------------------------------------------------------
-# Token Budget — P axis (TB*_pre, risk dosing)
-# ---------------------------------------------------------------------------
-
-# Δ_dec(D') 80 ms, κ_p 1 ms/prefill-token, base 8192 tokens, floor 512, and a
+# Δ_dec 80 ms, κ_p 1 ms/prefill-token, base 8192 tokens, floor 512, and a
 # 4096-token burst W → the burst's sunk delay κ_p·W is 4.096 s and its window
 # wall(P) = 327.68/P + 4.096 s spans 4.14 s (at P = base) to 4.74 s (at floor).
 _PBR = dict(b=8, delta_dec=0.08, kappa_p=0.001, base_budget=8192, floor=512,

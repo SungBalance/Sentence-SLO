@@ -2937,3 +2937,34 @@ floor 체류 **0.0%**, TB*가 상한 2048 유지. 개정의 원래 동기였던 
   (D축 자격 임계 ε_d 주입 — adaptive 비수렴의 D축 귀속 실험용).
 - phaseE 중단(사용자 지시, 2026-08-12 말): 73 rate-run 확보 후 정지. GPU 전면 반납.
   미완: cap64/cap32 코어, cap128 코어 run_2, D축 ε_d=0 ablation, cap64 run_2.
+
+### 2026-08-13 — 알고리즘 단순화 3건 (KV 실측 회계 / D축 제거 / prefix caching 동등화)
+사용자 지적("증분은 불필요할 때 ProgressServe로 수렴해야 한다")에서 출발. GPU 미사용.
+
+**수정 1 — KV 가용성을 상수에서 실측 누적합으로**
+- `kv_blocks_per_new_admit=8` 폐기. `kv_feasible(k) ⟺ Σ_{i<k} ceil(잔여 프롬프트/block_size) ≤ free`.
+- `blocks_needed`도 정확한 deficit `max(0, cum[k*_unc−1] − free)`로 (증분형은 매 capped
+  스텝마다 1명분 과다 vacate).
+- 상상 실행(phaseE cap64 r4 실측: 프롬프트 p50 672tok→42블록, KV 포화 스텝 free=525):
+  구판은 64명 admit 허가(실제 필요 5,446블록 → 4,921 초과)에 kv_capped 영구 False.
+  신판은 4명 허가(415 ≤ 525), E_viol이 더 원하면 kv_capped=True + deficit 정확 산출.
+  **16배 과대 발급 제거, offload tier가 비로소 발동 가능.**
+- 한계(기록): admission 회계는 프롬프트 기준이라 생성 중 증가분(요청당 최종 141블록)은
+  미반영 — 스텝 단위로는 정확하나 생애 수요로는 낙관적. 성장분은 종전대로 엔진 preemption과
+  E_viol이 처리.
+
+**수정 2 — D축 전면 제거**
+`select_decode_defer`, `token_budget_decode_risk_eps`, `_sslo_apply_decode_budget`,
+D′ 배관, stats 2종, env 훅 삭제. 순 −207줄. P축/burst-horizon 무손상.
+근거는 §3⑤·§6 표: 구조적 상시 발동(무개입 보장 부재) + 실측 순수 비용(코어 대비
+−44/−45 tput, 위반율 이득 0).
+
+**수정 3 — prefix caching 전 모드 공통**
+offload 모드만 커넥터 요구로 켜던 것을 모든 run kind로. 이제 offload의 유일한 고유
+비용은 커넥터의 상시 KV 미러링. ※ baseline 포함 전 모드 성능이 바뀌므로 전체 재측정 필요.
+
+**검증**: 개발↔검증 agent 2라운드, 종료조건 "이슈 없음" 충족. `pytest tests/sslo/ -q`
+203 passed(기존 실패 1건 제외), 신규 KV 회계 테스트 5건. 검증 agent가 상수 기반·증분형으로
+각각 되돌려 신규 테스트가 실제로 회귀를 잡는지 재현 확인 후 원상 복구 대조.
+
+**미결**: `HANDOFF.md` 11/80행이 아직 D축을 언급. 전체 재측정은 GPU 확보 후.

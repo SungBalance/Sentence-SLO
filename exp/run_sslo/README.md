@@ -62,29 +62,25 @@ the pre-A1 semantics. `progress_serve_offload_adaptive` is the same mode with
 adaptive batching also enabled.
 
 `progress_serve_token_budget` runs `progress_serve` with the deadline-aware
-Token Budget (`token_budget_control=True`), which doses both axes on the
-expected-violation ledger `E_viol` (since 2026-08-11; the worst-case
-`Δ_dec(D) + κ_p·P ≤ γ·t_min` form let one near-deadline survivor pin the step):
+Token Budget (`token_budget_control=True`), which doses the per-step prefill
+allowance on the expected-violation ledger `E_viol` (since 2026-08-11; the
+worst-case `Δ_dec + κ_p·P ≤ γ·t_min` form let one near-deadline survivor pin
+the step):
 
 - **P axis** — the **total** prefill tokens of a step (chunked-prefill
   carry-over in the running loop plus new admits in the waiting loop, sharing
   one counter) are capped at the largest `P ∈ [floor, max_num_batched_tokens]`
-  whose `E_viol(Δ_dec(D') + κ_p·P) − E_viol(Δ_dec(D'))` stays within
+  whose `E_viol(Δ_dec + κ_p·P) − E_viol(Δ_dec)` stays within
   `token_budget_risk_eps`, with κ_p the online per-prefill-token step-time cost.
-- **D axis** — slack-deep defer-safe requests
-  (`R_defer ≤ token_budget_decode_risk_eps`) are deferred while each defer
-  strictly lowers `E_viol` at the resulting `Δ_dec(D')`. Forced / onloading /
-  at-risk requests are never deferred. With deadlines far away (the read
-  workload) this is a no-op.
 
-Decode tokens are never capped in token units. Both axes share one flag because
-they share one ledger, and the mode composes with the offload tier —
+Decode tokens are never capped: the decode set is settled by the run/defer
+split alone (the D axis that used to shrink it was dropped 2026-08-13 — see
+`paper/scheduling.md` §6). The mode composes with the offload tier —
 `progress_serve_offload_token_budget` is both.
 `SSLO_TOKEN_BUDGET_PREFILL_FLOOR` (default 512 tokens) and
 `SSLO_TOKEN_BUDGET_RISK_EPS` (default 0.01) override the knobs
 (`SSLO_TOKEN_BUDGET_GAMMA` is deprecated with the rejected rule). Per step,
-`scheduler_stats.jsonl` records `token_budget_prefill` (TB*_pre),
-`token_budget_decode` (D'), `token_budget_d_defers` (D-axis defers this step)
+`scheduler_stats.jsonl` records `token_budget_prefill` (TB*_pre)
 and `prefill_kappa_ms_per_tok` (κ_p).
 
 All aggregators default to all modes. Pass `--modes baseline,progress_serve` to restrict.
