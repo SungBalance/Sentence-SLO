@@ -51,6 +51,40 @@
      onload 먼저 — d−t ≤ ℓΔ+f̂ 인 offloaded를 복원 시작 (deadline 안전 우선)
      offload — pending 중 M_cpu ≤ ε ∧ residency ≥ ρ 를 slack 깊은 순으로,
                admission에 필요한 블록만큼만
+     **두 판정은 서로 다른 share를 쓴다 (2026-08-14 개정)**:
+       onload  : s_now  = B / (|A| + onloading + k* + parked)   — 지금의 실제 상태
+       offload : s_post = B / (|A| + onloading + **k\*_unconstrained** + parked)
+                 — 비운 자리를 실제로 admit에 쓴 뒤의 상태
+     이유: offload 자격 "M_cpu ≤ ε"는 *CPU에 둬도 위험이 거의 안 는다*는 판정인데,
+     이를 offload 이전 share로 하면 **자기 결정의 전제를 스스로 무효화한다** —
+     비운 블록으로 admit이 일어나면 |A+|가 커져 s가 떨어지고, 그 순간 방금 내보낸
+     요청의 M_cpu가 ε를 넘어 즉시 onload 대상이 된다.
+     실측(phaseF cap64 offload r4, offload 이벤트 21건): offload 스텝에 k*=26이
+     한꺼번에 허가되어 재적 32→48, e_viol 0.12 → +1스텝 0.96 → +3스텝 1.36,
+     k*→0으로 잠김. offload→onload 간격 **중앙값 2스텝(최소 1)**. 왕복 106/105회에
+     `num_offloaded` 중앙값 0 — 내보낸 것이 상주하지 못한다.
+     붕괴 실증: 재적 7~13, KV 점유 17~32%(메모리가 남는데 아무도 못 받음),
+     tput은 baseline의 58~65%. 코어·tb 단독에는 없고 offload 계열에만 발생.
+     **자격은 두 share 모두에서 성립해야 하고, doomed는 제외한다**:
+       offload 자격 ⟺ max( M_cpu(s_now), M_cpu(s_post) ) ≤ ε
+                      ∧ R_defer_cpu(s_now) < 1  ∧  R_defer_cpu(s_post) < 1
+     둘째 조건이 없으면 doomed 요청(R_defer≈1 ⇒ M_cpu≈0)이 자격을 통과하는데,
+     onload의 안전망 `R_defer_cpu ≥ 1`이 곧바로 되불러 왕복이 재발한다 — max
+     보장은 onload의 M_cpu leg만 덮기 때문이다. §2의 run-side doomed guard와
+     대칭을 맞추는 것이고, §8에 후보로 남아 있던 비대칭을 해소한다.
+     의미: **가망 없는 요청은 CPU로 내리지 않는다.** 내려도 곧 되불러야 하므로
+     자리를 못 벌고 전송만 낭비한다.
+     그러면 자격 통과 ⇒ M_cpu(s_now) ≤ ε ⇒ 같은 시점 onload 조건
+     (M_cpu(s_now) > ε)을 **정의상** 만족하지 않는다. 즉시 왕복이 원천 차단된다.
+     ※ 정정(2026-08-14, 구현 검증에서 발견): 초안은 "s_post ≤ s_now이므로
+     M_cpu(s_post) ≥ M_cpu(s_now)"라는 단조성을 근거로 s_post 단독 판정을
+     지시했으나 **이 단조성은 거짓이다.** 국소적으로 M_cpu ≈ f(c+N_defer)·ℓ·s
+     (f = tail 밀도)라 s가 커지면 평가점 간격이 벌어져 M_cpu가 오히려 커지는
+     구간이 있고, 특히 ℓ·s_post < 1이면 floor 이산화로 N_defer와 N_defer_cpu가
+     같은 토큰에 붙어 M_cpu(s_post)=0이 된다. 실측 그리드(s∈[0.35,1], ε=1e-3,
+     ℓ=2)에서 **11%(229/2100)** 조합이 "s_post 통과 & s_now onload 대상"으로
+     남았다. parked가 |A+|를 2B 이상으로 밀 때 열리므로 **offload가 활발할수록
+     커지는 구멍**이었다. max 형태만이 구조적 보장을 준다.
 ⑤ Token Budget TB* 계산 — **burst-horizon 기대-위험 예산** (2026-08-12 개정.
      이력: γ·T_min worst-case → 기각(t_min 인질, 회복기 floor 81%);
      무한-지평 재발 가격 Δ(P) 전지평 적용 → 기각(§6, phaseD 실증) → 현행):
@@ -157,7 +191,7 @@
 
 - ③축 self-lock: 소수 고위험 in-flight의 위험 합이 절대 예산을 소진하면 KV·연산이 남아도 k*≈0 (과포화 + 만기 경과 큐에서 발생; R3 트레이드오프의 대가).
 - o+pb cap64 저하: κ_p 오염(소분모 발산)으로 진단·수정 완료 — GPU 재실행으로 최종 확인 대기 (예측: κ→0.15 수렴, tput 392→~470).
-- `request_risk_cpu`에는 doomed guard($R_{defer}\ge1 \Rightarrow$ offload 부적격)가 없음 — §2의 run-side 가드와 비대칭. 현행 kv_capped 게이트 하에서 실해가 관측되지 않아 미구현 (후보 유지).
+- (해결됨 2026-08-14) `request_risk_cpu`의 doomed guard 비대칭 — §3④에 offload 자격 조건 `R_defer_cpu < 1`로 반영. 미구현으로 두었던 근거("실해 미관측")는 offload가 발동조차 못 하던 상태의 산물이었고, KV 회계 수정으로 발동이 시작되자 왕복 경로로 드러났다.
 - **[부분 해명 2026-08-12] offload 허가-집행 괴리 — 두 개의 독립 결함**
   (실측: phaseP2 cap64 r4, offload 단독 28,231스텝 vs baseline 16,282스텝):
   1. **KV 모델 18배 과소평가**: `kv_blocks_per_new_admit=8` vs 실측 요청당 KV
@@ -186,6 +220,13 @@
   좁은 부분집합(running==0 & k*≥5)에서만 관측된 값이었다.
   ※ 이 결함은 phaseP2/phaseD/phaseE 전부에 동일하게 존재하므로 세 실험 간
   비교는 유효하나, offload tier의 실효는 수정 후 재측정해야 한다.
+- **admission이 신규 admit의 미래 위험에 눈감음** (2026-08-14 관측, 미해결):
+  신규 admit은 PREFILL/WARMUP 동안 *forced*라 E_viol에서 제외되므로, k* 탐색은
+  "이들이 MEASURED가 된 뒤 지게 될 위험"을 계산에 넣지 않는다. 실측상 k*=26을
+  한 스텝에 허가한 직후 e_viol이 0.12→1.36으로 뛰고 k*=0으로 잠기는 진동이
+  나타난다. §3④의 share 개정은 offload 왕복을 막지만 이 과다-발급 자체는
+  남는다. 후보: admit 램프(비운 만큼을 한 번에 쓰지 않음) / forced 요청의
+  예상 위험을 할인 계상. 현행은 관측만 기록.
 - **borderline 인질** (burst-horizon의 잔존 한계): floor에서는 살릴 수 있으나
   base에서는 doomed가 되는 요청(R 0.6→1.0)은 한계 기여가 ~0.4로 크다. 완전
   doomed(기여 0)와 마감 먼 요청(기여 0)은 해소됐지만 이 경계층은 남는다.

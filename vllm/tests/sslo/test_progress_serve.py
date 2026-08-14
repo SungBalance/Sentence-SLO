@@ -564,7 +564,7 @@ _STEEP = lambda x: max(0.0, 1.0 - x / 20.0)
 
 def test_select_offload_zero_blocks_needed_is_empty():
     a = _measurable("a", 0, 10.0, _GENTLE)
-    assert select_offload([a], 1.0, 1.0, 2, eps=1.0, blocks_needed=0,
+    assert select_offload([a], 1.0, 1.0, 1.0, 2, eps=1.0, blocks_needed=0,
                           blocks_of=lambda r: 5) == []
 
 
@@ -572,7 +572,7 @@ def test_select_offload_filters_by_eps():
     a = _measurable("a", 0, 10.0, _GENTLE)  # M_cpu ~0.02
     b = _measurable("b", 0, 10.0, _STEEP)  # M_cpu ~0.10
     # eps excludes the steep one; only 'a' is offload-eligible.
-    got = select_offload([a, b], 1.0, 1.0, 2, eps=0.05, blocks_needed=100,
+    got = select_offload([a, b], 1.0, 1.0, 1.0, 2, eps=0.05, blocks_needed=100,
                         blocks_of=lambda r: 1)
     assert got == ["a"]
 
@@ -582,13 +582,22 @@ def test_select_offload_sorts_by_mcpu_then_meets_blocks():
     b = _measurable("b", 0, 10.0, _STEEP)  # M_cpu ~0.10 (larger)
     blocks = {"a": 3, "b": 5}
     # Ascending M_cpu → a first. blocks_needed=2 met by a alone.
-    got1 = select_offload([b, a], 1.0, 1.0, 2, eps=1.0, blocks_needed=2,
+    got1 = select_offload([b, a], 1.0, 1.0, 1.0, 2, eps=1.0, blocks_needed=2,
                          blocks_of=lambda r: blocks[r])
     assert got1 == ["a"]
     # blocks_needed=4 → a(3) then b(8) to cross the threshold.
-    got2 = select_offload([b, a], 1.0, 1.0, 2, eps=1.0, blocks_needed=4,
+    got2 = select_offload([b, a], 1.0, 1.0, 1.0, 2, eps=1.0, blocks_needed=4,
                          blocks_of=lambda r: blocks[r])
     assert got2 == ["a", "b"]
+
+
+def test_select_offload_doomed_guard_excludes_certain_miss():
+    # Saturated tail → M_cpu = 0 (clears eps) but R_defer_cpu = 1: parking it
+    # is pointless because select_onload's safety net recalls it at once. The
+    # mirror image of test_select_onload_certain_miss_safety_net.
+    miss = _measurable("miss", 0, 10.0, lambda x: 1.0)
+    assert select_offload([miss], 1.0, 1.0, 1.0, 2, eps=1.0, blocks_needed=1,
+                          blocks_of=lambda r: 1) == []
 
 
 def test_select_offload_tiebreak_prefers_larger_block_count():
@@ -596,7 +605,7 @@ def test_select_offload_tiebreak_prefers_larger_block_count():
     a = _measurable("a", 0, 10.0, _GENTLE)
     b = _measurable("b", 0, 10.0, _GENTLE)
     blocks = {"a": 2, "b": 9}
-    got = select_offload([a, b], 1.0, 1.0, 2, eps=1.0, blocks_needed=5,
+    got = select_offload([a, b], 1.0, 1.0, 1.0, 2, eps=1.0, blocks_needed=5,
                         blocks_of=lambda r: blocks[r])
     assert got == ["b"]  # b's 9 blocks alone meets the need
 
@@ -852,3 +861,198 @@ def test_token_budget_prefill_floor_above_base_never_exceeds_base():
     over = {**_PB, "floor": 20000}
     for t_min in (None, -1.0, 0.0, 0.5, 3.0, 1e6):
         assert token_budget_prefill(t_min=t_min, **over) == over["base_budget"]
+
+
+# ---- two-share offload / onload (spec §3④) ----------------------------
+
+# Onload is judged on s_now (|A+| counting k*); offload must clear eps under
+# BOTH s_now and s_post (|A+| counting k*_unconstrained — the state once the
+# freed blocks are spent on admits) and must not be doomed under either. The
+# max() form makes the anti-thrash property structural against select_onload's
+# M_cpu trigger: eligibility implies M_cpu(s_now) <= eps (not an onload
+# candidate on the same step) AND M_cpu(s_post) <= eps (not one on the next
+# step either, once the admits have landed and s_post is the live share). The
+# doomed guard covers select_onload's other trigger, the R_defer_cpu >= 1
+# safety net, which max() cannot reach: a doomed request has M_cpu ~ 0 and so
+# clears eps, but would be called straight back.
+_EPS = 1e-3
+_LEAD = 2
+_DELTA = 0.04
+
+
+def _geom(q):
+    return lambda x: q**x
+
+
+def _lin(n):
+    return lambda x: max(0.0, 1.0 - x / n)
+
+
+# The grid that disproved the monotonicity the first draft assumed. Shares
+# span the range the scheduler can actually produce (|A+| <= ~2B + parked);
+# tails mix fast/slow geometric decay with locally flat (linear) ones; T_q
+# spans a 120x horizon range. 5 tails x 5 horizons x 3 c_q x 28 ordered
+# share pairs = 2100 combinations.
+_GRID_TAILS = [_geom(0.999), _geom(0.99), _geom(0.95), _lin(1000), _lin(200)]
+_GRID_T_Q = [0.5, 2.0, 5.0, 20.0, 60.0]
+_GRID_C_Q = [0, 20, 100]
+_GRID_SHARES = [0.35, 0.4, 0.5, 0.6, 0.75, 0.9, 1.0]
+
+
+# Doomed extension. The base grid never reaches R_defer_cpu >= 1, so it could
+# not exercise the doomed guard: T_q below Delta collapses H_q to 0 (both
+# N_defer and N_defer_cpu are 0, so R_defer_cpu = tail(c_q) = 1 at c_q = 0),
+# and a saturated tail is doomed at any horizon.
+_DOOMED_T_Q = [0.01, 0.03]
+_DOOMED_TAILS = [lambda x: 1.0]
+
+
+def _grid_cases(tails=None, t_qs=None):
+    for tail in tails or _GRID_TAILS:
+        for t_q in t_qs or _GRID_T_Q:
+            for c_q in _GRID_C_Q:
+                for i, s_now in enumerate(_GRID_SHARES):
+                    for s_post in _GRID_SHARES[:i + 1]:  # s_post <= s_now
+                        yield tail, t_q, c_q, s_now, s_post
+
+
+def _all_grid_cases():
+    yield from _grid_cases()
+    yield from _grid_cases(t_qs=_DOOMED_T_Q)
+    yield from _grid_cases(tails=_DOOMED_TAILS,
+                           t_qs=_GRID_T_Q + _DOOMED_T_Q)
+
+
+def test_offload_never_round_trips_over_the_full_share_grid():
+    # Core regression line. Over every combination — no regime restriction,
+    # since max() needs no monotonicity — an offload-eligible request is an
+    # onload candidate under NEITHER share: not under s_now (same step) and
+    # not under s_post (next step, after the admits it freed room for land).
+    # Covers both of select_onload's triggers: the M_cpu one (negated by
+    # max()) and the R_defer_cpu >= 1 safety net (negated by the doomed
+    # guard), the latter only reachable on the doomed extension.
+    cases = offloads = doomed_but_cheap = 0
+    for tail, t_q, c_q, s_now, s_post in _all_grid_cases():
+        cases += 1
+        gpu = _measurable("r", c_q, t_q, tail)
+        cpu = _cpu("r", c_q, t_q, tail)
+        # Cases the doomed guard exists for: cheap enough to clear eps, yet
+        # certain to miss on CPU, so onload's safety net would recall them.
+        now = request_risk_cpu(gpu, _DELTA, s_now, _LEAD)
+        post = request_risk_cpu(gpu, _DELTA, s_post, _LEAD)
+        if max(now[2], post[2]) <= _EPS and max(now[1], post[1]) >= 1.0:
+            doomed_but_cheap += 1
+        picked = select_offload([gpu], _DELTA, s_now, s_post, _LEAD, _EPS,
+                                blocks_needed=1, blocks_of=lambda r: 1)
+        if not picked:
+            continue
+        offloads += 1
+        assert select_onload([cpu], _DELTA, s_now, _LEAD, _EPS) == []
+        assert select_onload([cpu], _DELTA, s_post, _LEAD, _EPS) == []
+    assert cases == 2100 + 840 + 588
+    assert offloads > 0  # the grid actually exercises the offload path
+    assert doomed_but_cheap > 0  # ...and the doomed guard's own cases
+
+
+def test_doomed_guard_leaves_non_doomed_selection_untouched():
+    # Regression fence for the guard: wherever R_defer_cpu < 1 under both
+    # shares, the outcome is still exactly the pre-guard rule
+    # (max-M_cpu <= eps). The guard only ever removes doomed reqs.
+    checked = 0
+    for tail, t_q, c_q, s_now, s_post in _all_grid_cases():
+        gpu = _measurable("r", c_q, t_q, tail)
+        now = request_risk_cpu(gpu, _DELTA, s_now, _LEAD)
+        post = request_risk_cpu(gpu, _DELTA, s_post, _LEAD)
+        if max(now[1], post[1]) >= 1.0:
+            continue  # doomed — this one is meant to change
+        checked += 1
+        assert select_offload(
+            [gpu], _DELTA, s_now, s_post, _LEAD, _EPS, blocks_needed=1,
+            blocks_of=lambda r: 1) == (
+                ["r"] if max(now[2], post[2]) <= _EPS else [])
+    assert checked > 0
+
+
+def test_single_share_forms_leave_round_trips_on_the_same_grid():
+    # Why max() and not either share alone. Judging on s_post only leaves
+    # same-step round trips (the measured 229/2100 that killed the first
+    # draft); judging on s_now only — the original code — leaves next-step
+    # ones, which is the offload→onload median-2-step thrash.
+    same_step = next_step = 0
+    for tail, t_q, c_q, s_now, s_post in _grid_cases():
+        gpu = _measurable("r", c_q, t_q, tail)
+        cpu = _cpu("r", c_q, t_q, tail)
+        by_post = select_offload([gpu], _DELTA, s_post, s_post, _LEAD, _EPS,
+                                 blocks_needed=1, blocks_of=lambda r: 1)
+        by_now = select_offload([gpu], _DELTA, s_now, s_now, _LEAD, _EPS,
+                                blocks_needed=1, blocks_of=lambda r: 1)
+        if by_post and select_onload([cpu], _DELTA, s_now, _LEAD, _EPS):
+            same_step += 1
+        if by_now and select_onload([cpu], _DELTA, s_post, _LEAD, _EPS):
+            next_step += 1
+    assert same_step == 229
+    assert next_step > 0
+
+
+def test_max_form_closes_the_regime_counterexamples():
+    # The two mechanisms that break "M_cpu(s_post) >= M_cpu(s_now)". Under the
+    # s_post-only draft each produced a request that offloads and is onload-
+    # eligible in the same breath; under max() neither offloads at all.
+    # (a) locally flat tail: M_cpu ~ f * lead * s *grows* with s.
+    flat_gpu = _measurable("r", 0, 20.0, _lin(1500))
+    flat_cpu = _cpu("r", 0, 20.0, _lin(1500))
+    assert select_offload([flat_gpu], _DELTA, 1.0, 0.5, _LEAD, _EPS,
+                          blocks_needed=1, blocks_of=lambda r: 1) == []
+    assert select_onload([flat_cpu], _DELTA, 1.0, _LEAD, _EPS) == ["r"]
+    # (b) sub-token lead: at s_post < 1/lead the floor()s in N_defer /
+    #     N_defer_cpu collapse onto the same token, so M_cpu(s_post) is 0 by
+    #     discretisation alone. Reachable once parked reqs push |A+| past
+    #     lead * B (R1 keeps them in the denominator).
+    h_q = horizon(5.0, _DELTA)
+    assert n_defer_cpu(h_q, 0.395, _LEAD) == n_run_defer(h_q, 0.395)[1]
+    steep_gpu = _measurable("r", 0, 5.0, _geom(0.95))
+    steep_cpu = _cpu("r", 0, 5.0, _geom(0.95))
+    assert select_offload([steep_gpu], _DELTA, 0.4, 0.395, _LEAD, _EPS,
+                          blocks_needed=1, blocks_of=lambda r: 1) == []
+    assert select_onload([steep_cpu], _DELTA, 0.4, _LEAD, _EPS) == ["r"]
+
+
+def test_single_share_thrashes_across_steps_two_shares_do_not():
+    # The measured defect, end to end: step t offloads on the pre-admit share,
+    # step t+1 runs at the post-admit share and onloads it right back.
+    b, n_base, k_star, k_star_unconstrained = 64, 64, 0, 16
+    s_now = service_share(b, n_base + k_star)  # 1.0
+    s_post = service_share(b, n_base + k_star_unconstrained)  # 0.8
+    gpu = _measurable("r", 20, 3.0, _geom(0.95))
+    cpu = _cpu("r", 20, 3.0, _geom(0.95))
+    picked = lambda sn, sp: select_offload([gpu], _DELTA, sn, sp, _LEAD, _EPS,
+                                           blocks_needed=1,
+                                           blocks_of=lambda r: 1)
+
+    # Old behaviour: both judgements used the k* share, so offload passes...
+    assert picked(s_now, s_now) == ["r"]
+    # ...and once the admits land, the live share is s_post, under which the
+    # request it just parked is already onload-eligible → round trip.
+    assert select_onload([cpu], _DELTA, s_post, _LEAD, _EPS) == ["r"]
+
+    # Fixed: the s_post leg of max() rejects it, so it never leaves the GPU.
+    assert picked(s_now, s_post) == []
+
+
+def test_two_shares_coincide_when_not_kv_capped():
+    # k*_unconstrained == k* (E_viol, not KV, stopped the scan) → s_post is
+    # s_now, max() degenerates to the single M_cpu the old code used, and
+    # every selection is identical to the single-share behaviour.
+    for b, n_aplus in [(64, 64), (64, 80), (64, 96), (32, 40), (32, 48)]:
+        s = service_share(b, n_aplus)
+        for tail in _GRID_TAILS:
+            for t_q in _GRID_T_Q:
+                gpu = _measurable("r", 0, t_q, tail)
+                cpu = _cpu("r", 0, t_q, tail)
+                offloaded = select_offload(
+                    [gpu], _DELTA, s, s, _LEAD, _EPS, blocks_needed=1,
+                    blocks_of=lambda r: 1)
+                m_cpu = request_risk_cpu(gpu, _DELTA, s, _LEAD)[2]
+                assert offloaded == (["r"] if m_cpu <= _EPS else [])
+                assert select_onload([cpu], _DELTA, s, _LEAD, _EPS) == (
+                    [] if m_cpu <= _EPS else ["r"])

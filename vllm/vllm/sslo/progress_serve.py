@@ -666,7 +666,8 @@ def token_budget_prefill(
 def select_offload(
     deferred_views: list[ProgressView],
     delta: float,
-    s: float,
+    s_now: float,
+    s_post: float,
     lead: int,
     eps: float,
     blocks_needed: int,
@@ -674,20 +675,52 @@ def select_offload(
 ) -> list[str]:
     """Pick deferred GPU reqs whose KV to offload to CPU to free ``blocks_needed``.
 
-    Only reqs with a cheap CPU stay (M_cpu <= eps) are eligible. They are
-    chosen by ascending M_cpu (cheapest first), ties broken by descending
-    block count so fewer requests are moved. Selection stops once the
-    cumulative freed block count reaches ``blocks_needed``. Returns [] when
-    ``blocks_needed`` <= 0. ``deferred_views`` are all LOC_GPU and measurable.
+    Eligibility is judged on BOTH service shares, and doomed reqs are excluded
+    (spec §3④):
+
+        max(M_cpu(s_now), M_cpu(s_post)) <= eps
+        and R_defer_cpu(s_now) < 1 and R_defer_cpu(s_post) < 1
+
+    ``s_now`` is the share as it stands (|A+| counting k*), ``s_post`` the
+    share once the freed blocks are spent on admits (|A+| counting
+    k*_unconstrained). Judging on s_post alone would let the decision
+    invalidate its own premise; judging on s_now alone ignores the admits the
+    offload is FOR. Requiring both makes the s_now leg the exact negation of
+    ``select_onload``'s M_cpu trigger, so an offloaded request cannot be an
+    onload candidate on the same step — structurally, with no monotonicity
+    assumption on M_cpu(s) (it is not monotone: locally
+    M_cpu ~ f(c + N_defer) * lead * s, so a rising s can widen the evaluation
+    gap faster than the tail density f decays).
+
+    The doomed guard covers what max() cannot: a doomed request has
+    R_defer ~ 1, hence M_cpu ~ 0, so it clears the eps gate, but
+    ``select_onload``'s R_defer_cpu >= 1 safety net calls it straight back.
+    Parking it frees no room and only spends transfers. Mirrors the run-side
+    doomed guard in ``request_risk`` (R_defer >= 1 => M = 1). The onload safety
+    net stays as it is — a doomed request already on CPU should be restored;
+    only sending it there in the first place is wrong.
+
+    Eligible reqs are chosen by ascending max-M_cpu — the same statistic the
+    gate uses, so the cheapest CPU stay under the worse of the two states goes
+    first — ties broken by descending block count so fewer requests are moved.
+    Selection stops once the cumulative freed block count reaches
+    ``blocks_needed``. Returns [] when ``blocks_needed`` <= 0.
+    ``deferred_views`` are all LOC_GPU and measurable.
     """
     if blocks_needed <= 0:
         return []
     candidates = []
     for v in deferred_views:
-        _r_defer, _r_defer_cpu, m_cpu = request_risk_cpu(v, delta, s, lead)
+        _r_defer_now, r_cpu_now, m_cpu_now = request_risk_cpu(
+            v, delta, s_now, lead)
+        _r_defer_post, r_cpu_post, m_cpu_post = request_risk_cpu(
+            v, delta, s_post, lead)
+        if r_cpu_now >= 1.0 or r_cpu_post >= 1.0:
+            continue  # doomed under either share — onload would call it back
+        m_cpu = max(m_cpu_now, m_cpu_post)
         if m_cpu <= eps:
             candidates.append((m_cpu, blocks_of(v.request_id), v.request_id))
-    # Ascending M_cpu; ties → larger block count first.
+    # Ascending max-M_cpu; ties → larger block count first.
     candidates.sort(key=lambda t: (t[0], -t[1]))
     selected: list[str] = []
     acc = 0

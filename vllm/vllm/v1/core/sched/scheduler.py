@@ -1968,13 +1968,21 @@ class Scheduler(SchedulerInterface):
         cfg = self.sslo_config
         lead = cfg.kv_onload_lead_iters
         eps = cfg.kv_offload_risk_eps
-        n_aplus = len(admitted) + len(self._sslo_onloading) + result.k_star
+        n_aplus = len(admitted) + len(self._sslo_onloading)
         # SSLO: mirror build_plan's |A+| — CPU-parked reqs stay in the service
         # share unless the config opts out, so the M_cpu that gates
         # offload/onload matches the one inside the plan.
         if cfg.kv_offload_share_includes_parked:
             n_aplus += len(self._sslo_offloaded)
-        s = ps.service_share(b, n_aplus)
+        # SSLO: two shares (spec §3④). Onload is judged on the state as it is
+        # now (k*); offload must hold under BOTH s_now and the state after the
+        # blocks it frees are spent on admits (k*_unconstrained) — see
+        # select_offload. Judging offload on s_now alone lets the decision
+        # invalidate its own premise and the request it just parked comes
+        # straight back as an onload candidate (measured: offload→onload median
+        # 2 steps). k*_unconstrained >= k*, so s_post <= s_now.
+        s_now = ps.service_share(b, n_aplus + result.k_star)
+        s_post = ps.service_share(b, n_aplus + result.k_star_unconstrained)
 
         # --- Onload (before offload). ---
         cpu_views = [
@@ -1983,7 +1991,7 @@ class Scheduler(SchedulerInterface):
             if req.slo_state is not None
         ]
         num_onloads = 0
-        for rid in ps.select_onload(cpu_views, delta, s, lead, eps):
+        for rid in ps.select_onload(cpu_views, delta, s_now, lead, eps):
             req = self._sslo_offloaded.pop(rid, None)
             if req is None:
                 continue
@@ -2025,7 +2033,7 @@ class Scheduler(SchedulerInterface):
                 cand_by_id[rid] = req
 
             for rid in ps.select_offload(
-                    cand_views, delta, s, lead, eps, blocks_needed,
+                    cand_views, delta, s_now, s_post, lead, eps, blocks_needed,
                     self._sslo_num_gpu_blocks):
                 req = cand_by_id[rid]
                 if not self._sslo_offload_conn.pin_request_cpu_blocks(req):

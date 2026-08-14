@@ -2985,3 +2985,59 @@ offload 모드만 커넥터 요구로 켜던 것을 모든 run kind로. 이제 o
   `AGENTS.md`의 규칙 문구도 "HF_HOME만 설정, HF_HUB_CACHE 설정 금지"로 개정 —
   예시가 두 손잡이를 함께 못 박고 있어 그대로 두면 재도입된다.
   검증: 변경 셸 17개 `bash -n` 통과, python compileall 통과, 각 파일에 HF_HOME 잔존 확인.
+
+## 2026-08-14 — offload 왕복(thrash) 수정: 두 share 판정 + doomed guard (스펙 §3④)
+
+**수정**: `_sslo_apply_offload`가 쓰던 단일 service share를 둘로 분리.
+`s_now = service_share(b, |A|+onloading+k*+parked)` / `s_post`(k* 대신 `k*_unconstrained`).
+onload는 `s_now` 단독, offload 자격은
+**`max(M_cpu(s_now), M_cpu(s_post)) ≤ ε ∧ R_defer_cpu(s_now) < 1 ∧ R_defer_cpu(s_post) < 1`**.
+`select_offload` 시그니처를 `(views, delta, s_now, s_post, lead, eps, blocks_needed,
+blocks_of)`로 확장. 정렬 키도 `max` 값(자격 판정과 동일 통계)으로, 동률 시 블록 수 내림차순
+유지. `blocks_needed` 산출·`select_onload`·`kv_offload_share_includes_parked` 분기는 불변.
+
+**근거(2단계 개정)**: 초안은 offload를 `s_post` 단독으로 판정하도록 지시했고 그 근거는
+"s_post ≤ s_now ⇒ M_cpu(s_post) ≥ M_cpu(s_now)"라는 단조성이었으나, **이 단조성은 거짓**임을
+구현 검증에서 확인했다. 국소적으로 M_cpu ≈ f(c+N_defer)·ℓ·s 라 s가 커지면 평가점 간격이
+벌어져 M_cpu가 오히려 커지는 구간이 있고, ℓ·s_post < 1이면 floor 이산화로 N_defer와
+N_defer_cpu가 같은 토큰에 붙어 M_cpu(s_post)=0이 된다(parked가 |A+|를 2B 넘게 밀 때 발생 —
+offload가 활발할수록 커지는 구멍). 실측 그리드(s∈[0.35,1], ε=1e-3, ℓ=2, 2,100조합)에서
+s_post 단독은 **229건**이 "offload 통과 & 같은 스텝 onload 대상"으로 남았다. max 형태는
+자격 통과 ⇒ M_cpu(s_now) ≤ ε ⇒ onload의 M_cpu 트리거를 **정의상** 불성립시키므로 단조성
+가정 없이 구조적 보장을 준다. 스펙 소유자가 max 형태를 채택해 §3④에 정정 이력과 함께 반영.
+
+**추가 테스트**: `test_progress_serve.py` 7건 — 2,100조합 그리드에서 왕복 0건(같은 스텝
+s_now / 다음 스텝 s_post 양쪽), 단독 share 두 형태가 같은 그리드에서 각각 남기는 왕복
+(same-step 229건 / next-step >0)로 차이 문서화, 단조성 반례 2종(평탄 꼬리 / sub-token lead)이
+max 형태에선 offload되지 않음, 스텝 간 왕복 재현 vs 미재현, k*_u==k* 시 단일 share 동작과
+동일, doomed guard 단위 케이스, doomed 아닌 케이스 무변화. `test_scheduler_sslo.py` 3건 — spy로 두 share 배선 확인(parked 포함/제외 파라미터화)
+및 k*_u==k* 시 두 값 일치.
+
+**검증**: `pytest tests/sslo/ -q` → 213 passed(기존 실패 `test_tts_consume_path` 1건 제외),
+compileall 통과. mutation 확인: 자격을 `s_now` 단독으로 되돌리면 그리드의 next-step leg와
+스텝 간 왕복 테스트가, `s_post` 단독으로 되돌리면 그리드의 same-step leg와 반례 테스트가
+각각 실패함을 확인 후 원복. GPU 실행 불가로 실측 재확인은 미실시.
+
+**doomed guard(같은 라운드 3차 개정)**: max 형태는 onload의 M_cpu leg만 부정하므로
+`R_defer_cpu ≥ 1` 안전망 경로가 남아 있었다 — doomed 요청은 `R_defer≈1 ⇒ M_cpu≈0`이라
+ε 게이트를 통과하는데 안전망이 즉시 되불러 왕복이 재발한다. offload 자격에
+`R_defer_cpu < 1`(두 share 모두)을 추가해 닫았다: **가망 없는 요청은 CPU로 내리지 않는다.**
+§2의 run-side guard(`R_defer ≥ 1 ⇒ M = 1`)와 대칭이며 §8의 비대칭 항목을 해소한다.
+`select_onload`의 안전망은 그대로 — 이미 CPU에 있는 doomed는 되부르는 것이 맞다.
+그리드를 doomed 케이스로 확장(H_q=0이 되는 T_q<Δ 840조합 + 포화 tail 588조합, 총 3,528)해
+양쪽 leg 반례 0건을 단언하고, doomed가 아닌 케이스의 선택 결과가 게이트 이전 규칙
+(`max-M_cpu ≤ ε`)과 완전히 일치함을 별도 테스트로 고정했다(회귀 없음, same-step 229 불변).
+mutation: guard만 제거하면 신규 doomed 케이스에서 왕복이 재현됨을 확인 후 원복.
+
+**잔존**: §8의 "신규 admit 미래 위험 미계상"(k*=26 과다 발급)은 이 수정 범위 밖으로 남는다.
+
+**상상 실행의 한계 (2026-08-14, 오케스트레이터 기록)**: 실측 offload 발동 스텝의
+share(s_now 0.889, s_post 0.634 — 발동 스텝은 100%가 s<1이고 전체 스텝의 1.7%뿐)로
+후보 300개를 재구성해 구판/현행을 대조했으나 **구판에서도 즉시 왕복 0건**이었다.
+청크 슬랙 분포에서 뽑은 후보가 그 스텝의 실제 pending 상태를 복원하지 못한 탓으로
+보인다. 또한 실측 offload→onload 간격은 2스텝인데 이번 보장은 **같은-스텝** 배제라
+범위가 다르다(next-step leg는 모델 안 그리드에서만 확인됨).
+⇒ **"이 수정이 실측 붕괴(재적 7~13)를 없앤다"는 미검증**이며 GPU 재실행이 유일한
+확인 수단이다. 다만 자격 통과율이 289→279/300으로 3% 축소에 그쳐 tier를 무력화할
+위험은 낮다. 재실행에서 볼 것: num_offloads 대비 num_onloads 비율, num_offloaded
+중앙값(>0이어야 상주), 붕괴 셀의 재적 회복 여부.

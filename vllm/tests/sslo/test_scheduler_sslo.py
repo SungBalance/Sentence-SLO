@@ -705,6 +705,87 @@ def test_residency_guard_blocks_reoffload():
     assert new_pending == [p0]
 
 
+def _spy_shares(monkeypatch):
+    """Record the service share each offload-tier selector is handed."""
+    seen = {}
+    real_onload, real_offload = ps.select_onload, ps.select_offload
+
+    def onload(views, delta, s, lead, eps):
+        seen["onload"] = s
+        return real_onload(views, delta, s, lead, eps)
+
+    def offload(views, delta, s_now, s_post, lead, eps, blocks_needed,
+                blocks_of):
+        seen["offload"] = (s_now, s_post)
+        return real_offload(views, delta, s_now, s_post, lead, eps,
+                            blocks_needed, blocks_of)
+
+    monkeypatch.setattr(ps, "select_onload", onload)
+    monkeypatch.setattr(ps, "select_offload", offload)
+    return seen
+
+
+def _offload_share_scheduler(cfg):
+    """pending p0 (offload candidate) + one parked + one onloading req."""
+    p0 = make_offload_request(
+        "p0", make_state(deadline=1000.0), status=RequestStatus.RUNNING)
+    parked = make_offload_request(
+        "c0", make_state(deadline=1000.0), status=RequestStatus.PREEMPTED)
+    onloading = make_offload_request(
+        "o0", make_state(deadline=1000.0), status=RequestStatus.PREEMPTED)
+    for r in (p0, parked, onloading):
+        r.slo_state.length_tail_prob = lambda x: 0.0
+    scheduler = make_scheduler(pending=[p0], max_num_running_reqs=8, cfg=cfg)
+    scheduler.waiting = FakeWaitingQueue()
+    scheduler._sslo_offload_conn = FakeOffloadConnector(mirrored={"p0": True})
+    scheduler._sslo_offloaded = {"c0": parked}
+    scheduler._sslo_onloading = {"o0": onloading}
+    return scheduler, p0
+
+
+@pytest.mark.parametrize("share_parked, n_base", [(True, 3), (False, 2)])
+def test_offload_gets_both_shares_onload_gets_the_current_one(
+        monkeypatch, share_parked, n_base):
+    # Spec §3④: onload is judged on s_now (|A| + onloading + k* + parked);
+    # offload gets both s_now and s_post, the share once the blocks it frees
+    # are spent on admits (k*_unconstrained). The share_includes_parked branch
+    # applies to both alike.
+    cfg = SsloConfig(method="progress_serve", kv_offload=True,
+                     kv_offload_share_includes_parked=share_parked)
+    scheduler, p0 = _offload_share_scheduler(cfg)
+    seen = _spy_shares(monkeypatch)
+
+    scheduler._sslo_apply_offload(
+        0.0, _result(deferred=["p0"], k_star=2, k_star_unconstrained=18,
+                     kv_capped=True),
+        b=8, delta=1.0, admitted=[p0], new_pending=[p0])
+
+    # n_base = |A| (1) + onloading (1) [+ parked (1)].
+    s_now = ps.service_share(8, n_base + 2)
+    s_post = ps.service_share(8, n_base + 18)
+    assert seen["onload"] == s_now
+    assert seen["offload"] == (s_now, s_post)
+    assert s_post < s_now
+
+
+def test_offload_shares_both_equal_onload_share_when_k_star_not_capped(
+        monkeypatch):
+    # k*_unconstrained == k* → s_post is s_now, max() degenerates to the
+    # single M_cpu, i.e. identical to the single-share behaviour this replaced.
+    cfg = SsloConfig(method="progress_serve", kv_offload=True)
+    scheduler, p0 = _offload_share_scheduler(cfg)
+    seen = _spy_shares(monkeypatch)
+
+    scheduler._sslo_apply_offload(
+        0.0, _result(deferred=["p0"], k_star=4, k_star_unconstrained=4,
+                     kv_capped=True),
+        b=8, delta=1.0, admitted=[p0], new_pending=[p0])
+
+    s = ps.service_share(8, 3 + 4)
+    assert seen["onload"] == s
+    assert seen["offload"] == (s, s)
+
+
 def test_finish_cleanup_unpins():
     cfg = SsloConfig(method="progress_serve", kv_offload=True)
     req = make_offload_request(
