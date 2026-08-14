@@ -204,9 +204,16 @@ def load_dialogues(
     conversation_only: bool = False,
     english_only: bool = False,
     exclude_code: bool = False,
+    min_response_chars: int = 0,
     seed: int = 42,
 ) -> list[list[dict[str, Any]]]:
-    """Return filtered dialogues as lists of {role, content} dicts."""
+    """Return filtered dialogues as lists of {role, content} dicts.
+
+    `min_response_chars` (0 = disabled) keeps only dialogues whose
+    reference response — the assistant turn right after the last user
+    turn — is at least that many characters long; see
+    `_apply_dialogue_filters`.
+    """
     if max_dialogues is not None and max_dialogues <= 0:
         raise ValueError("max_dialogues must be positive when set.")
 
@@ -225,6 +232,7 @@ def load_dialogues(
             conversation_only=conversation_only,
             english_only=english_only,
             exclude_code=exclude_code,
+            min_response_chars=min_response_chars,
         )
     if dataset_id == LMSYS_DATASET_ID:
         return _load_lmsys_dialogues(
@@ -233,6 +241,7 @@ def load_dialogues(
             conversation_only=conversation_only,
             english_only=english_only,
             exclude_code=exclude_code,
+            min_response_chars=min_response_chars,
         )
     if dataset_id == "__combine__":
         return _load_combine_dialogues(
@@ -240,6 +249,7 @@ def load_dialogues(
             conversation_only=conversation_only,
             english_only=english_only,
             exclude_code=exclude_code,
+            min_response_chars=min_response_chars,
             seed=seed,
         )
     raise ValueError(f"No loader implemented for dataset id: {dataset_id}")
@@ -368,6 +378,7 @@ def _apply_dialogue_filters(
     conversation_only: bool,
     english_only: bool,
     exclude_code: bool,
+    min_response_chars: int = 0,
 ):
     yielded = 0
     for row in rows_iter:
@@ -406,6 +417,23 @@ def _apply_dialogue_filters(
             )
         if has_code_turn or has_non_english_turn or not dialogue:
             continue
+        # SSLO: reference-response length gate for long-output workloads.
+        # The reference response is the assistant turn right after the
+        # last user turn — exactly the message run_test.py's
+        # build_dialogue_prompts() drops when it truncates the dialogue to
+        # its last user turn. Its length correlates (weakly) with how long
+        # the served response will be. Measured in chars: tokenizing every
+        # streamed row of a 4.8 M-row dataset is far too expensive.
+        if min_response_chars:
+            last_user = max(
+                (i for i, m in enumerate(dialogue) if m["role"] == "user"),
+                default=-1)
+            if last_user < 0 or last_user + 1 >= len(dialogue):
+                continue
+            reference = dialogue[last_user + 1]
+            if (reference["role"] != "assistant"
+                    or len(reference["content"]) < min_response_chars):
+                continue
         yielded += 1
         yield dialogue
 
@@ -418,6 +446,7 @@ def _load_wildchat_dialogues(
     conversation_only: bool = False,
     english_only: bool = False,
     exclude_code: bool = False,
+    min_response_chars: int = 0,
 ) -> list[list[dict[str, Any]]]:
     from datasets import load_dataset
 
@@ -430,6 +459,7 @@ def _load_wildchat_dialogues(
             conversation_only=conversation_only,
             english_only=english_only,
             exclude_code=exclude_code,
+            min_response_chars=min_response_chars,
         )
     )
 
@@ -442,6 +472,7 @@ def _load_lmsys_dialogues(
     conversation_only: bool = False,
     english_only: bool = False,
     exclude_code: bool = False,
+    min_response_chars: int = 0,
 ) -> list[list[dict[str, Any]]]:
     from datasets import load_dataset
 
@@ -454,6 +485,7 @@ def _load_lmsys_dialogues(
             conversation_only=conversation_only,
             english_only=english_only,
             exclude_code=exclude_code,
+            min_response_chars=min_response_chars,
         )
     )
 
@@ -465,6 +497,7 @@ def _load_combine_dialogues(
     conversation_only: bool = False,
     english_only: bool = False,
     exclude_code: bool = False,
+    min_response_chars: int = 0,
     seed: int = 42,
 ) -> list[list[dict[str, Any]]]:
     import random
@@ -487,6 +520,7 @@ def _load_combine_dialogues(
                 conversation_only=conversation_only,
                 english_only=english_only,
                 exclude_code=exclude_code,
+                min_response_chars=min_response_chars,
             )
         except Exception as e:  # noqa: BLE001 - intentional broad catch
             print(

@@ -28,6 +28,10 @@
 #                                 (needs DATASET_NAME=wildchat|lmsys|combine;
 #                                  the default koala has no dialogue rows)
 #   MAX_PROMPT_TOKENS=0           drop dialogue prompts over N tokens (0 = off)
+#   MIN_RESPONSE_CHARS=0          keep only dialogues whose reference response
+#                                 (assistant turn after the last user turn) is
+#                                 at least N chars — long-output workload
+#                                 (0 = off; own dialogue cache file)
 #
 # KV offload tier (progress_serve_offload[_adaptive] run_kinds only; read by
 # run_test.py):
@@ -62,6 +66,9 @@ model="$3"
 : "${OUTPUT_DIR:?OUTPUT_DIR env var is required}"
 
 NUM_PROMPTS="${NUM_PROMPTS:-4096}"
+# Completions measured per rate. Lower it when each request generates much
+# more (long-response pools), or a cell runs for hours.
+MEASUREMENT_TARGET="${MEASUREMENT_TARGET:-1024}"
 GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS:-512}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-0}"  # 0 = auto (vLLM uses model config max)
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
@@ -145,6 +152,7 @@ else
   DIALOGUE_PROMPTS_FLAG=""
 fi
 MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-0}"
+MIN_RESPONSE_CHARS="${MIN_RESPONSE_CHARS:-0}"
 
 # HF_HUB_CACHE is intentionally unset: HF derives $HF_HOME/hub, which is where
 # the model and dataset caches already live.
@@ -160,6 +168,7 @@ python3 exp/run_sslo/run_test.py \
   --model "${model}" \
   --max-num-seqs "${max_num_seqs}" \
   --num-prompts "${NUM_PROMPTS}" \
+  --measurement-target "${MEASUREMENT_TARGET}" \
   --generation-max-tokens "${GENERATION_MAX_TOKENS}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
@@ -178,6 +187,7 @@ python3 exp/run_sslo/run_test.py \
   --max-response-chunk-chars "${MAX_RESPONSE_CHUNK_CHARS}" \
   ${DIALOGUE_PROMPTS_FLAG} \
   --max-prompt-tokens "${MAX_PROMPT_TOKENS}" \
+  --min-response-chars "${MIN_RESPONSE_CHARS}" \
   ${THINKING_FLAG} \
   ${SAMPLING_ARGS} \
   "${CONSUME_ARGS[@]}"

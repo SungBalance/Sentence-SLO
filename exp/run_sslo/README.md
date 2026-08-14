@@ -92,14 +92,22 @@ multi-turn dialogue prefixes: each conversation is truncated to its last user
 turn and rendered with the model's chat template, so prefill sees the whole
 history. It requires `DATASET_NAME=wildchat|lmsys|combine` — the default
 `koala` is a single-turn instruction set and raises immediately.
-`MAX_PROMPT_TOKENS=N` drops prompts longer than N tokens (0 = off). Both env
-vars are honored by `run_test.sh` and passed through by `run_sweep.sh`.
+`MAX_PROMPT_TOKENS=N` drops prompts longer than N tokens (0 = off).
+`MIN_RESPONSE_CHARS=N` keeps only dialogues whose reference response — the
+assistant turn right after the last user turn, i.e. the message dropped when
+the prompt is built — is at least N chars (0 = off). The reference length
+correlates with the served output length, so the filter yields a long-output
+workload with a larger per-request KV footprint. All three env vars are
+honored by `run_test.sh` and passed through by `run_sweep.sh`.
 
 Filtered dialogues are cached raw (before chat-template application, so the
 file is reusable across models) at
 `exp/tools/dataset_cache/dialogues_{dataset}_{filters}.jsonl`, keyed by source
-dataset and the `CONVERSATION_ONLY` / `ENGLISH_ONLY` / `EXCLUDE_CODE` filter
-combination; only the first cold run pays the HF streaming cost. If the cache
+dataset and the `CONVERSATION_ONLY` / `ENGLISH_ONLY` / `EXCLUDE_CODE` /
+`MIN_RESPONSE_CHARS` filter combination (e.g.
+`dialogues_wildchat_conv-en-nocode.jsonl`, and
+`dialogues_wildchat_conv-en-nocode-minresp3000.jsonl` with the length gate);
+only the first cold run pays the HF streaming cost. If the cache
 holds fewer dialogues than `NUM_PROMPTS`, the run logs the shortfall and uses
 what is there — delete the file to rebuild it larger.
 

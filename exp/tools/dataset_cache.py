@@ -79,6 +79,7 @@ def dialogue_cache_path(
     conversation_only: bool,
     english_only: bool,
     exclude_code: bool,
+    min_response_chars: int = 0,
 ) -> Path:
     """Path to the raw-dialogue cache for one source/filter combination."""
     flags = [
@@ -86,7 +87,12 @@ def dialogue_cache_path(
         ("en", english_only),
         ("nocode", exclude_code),
     ]
-    filters = "-".join(tag for tag, on in flags if on) or "all"
+    tags = [tag for tag, on in flags if on]
+    # SSLO: reference-response length gate keys its own cache file so the
+    # unfiltered pool stays reusable.
+    if min_response_chars:
+        tags.append(f"minresp{min_response_chars}")
+    filters = "-".join(tags) or "all"
     return cache_dir() / DIALOGUE_FILENAME_TMPL.format(
         dataset=dataset_name, filters=filters)
 
@@ -97,6 +103,7 @@ def load_or_build_dialogue_pool(
     conversation_only: bool,
     english_only: bool,
     exclude_code: bool,
+    min_response_chars: int = 0,
     max_dialogues: int,
     seed: int,
     build_fn: Callable[[], list[list[dict]]],
@@ -113,7 +120,8 @@ def load_or_build_dialogue_pool(
         dataset_name,
         conversation_only=conversation_only,
         english_only=english_only,
-        exclude_code=exclude_code)
+        exclude_code=exclude_code,
+        min_response_chars=min_response_chars)
     if path.exists():
         with path.open() as f:
             dialogues = [json.loads(line)["messages"]

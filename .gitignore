@@ -79,3 +79,6 @@ exp/tools/dataset_cache/*.bak
 *.pt
 *.pth
 *.safetensors
+
+# 긴-출력 워크로드 캐시 (104MB, GitHub 100MB 한도 초과 — 재빌드 가능)
+exp/tools/dataset_cache/dialogues_*-minresp*.jsonl

@@ -65,6 +65,7 @@ fi
 TTS_PROFILE_PATH="${TTS_PROFILE_PATH:-exp/run_sslo/profiles/word_count_duration_stats.csv}"
 
 NUM_PROMPTS="${NUM_PROMPTS:-4000}"
+MEASUREMENT_TARGET="${MEASUREMENT_TARGET:-1024}"
 GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS:-2048}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-0}"
 DATASET_NAME="${DATASET_NAME:-koala}"
@@ -76,6 +77,11 @@ MAX_RESPONSE_CHUNK_CHARS="${MAX_RESPONSE_CHUNK_CHARS:-1000}"
 SECONDS_PER_WORD="${SECONDS_PER_WORD:-0.28}"
 DIALOGUE_PROMPTS="${DIALOGUE_PROMPTS:-0}"
 MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-0}"
+# Long-output workload: keep only dialogues whose reference response (the
+# assistant turn after the last user turn) is at least N chars. Raises the
+# per-request KV footprint so the KV pool, not compute, is the binding
+# constraint. 0 = off; each value keys its own dialogue cache file.
+MIN_RESPONSE_CHARS="${MIN_RESPONSE_CHARS:-0}"
 
 # Parse "read" or "tts:<HF_id>" → echoes "<consume_mode> <tts_slug> <tts_model>"
 # Uses "-" placeholder for empty tts_model (read mode) to keep token count fixed.
@@ -124,6 +130,7 @@ launch_job() {
     REPEAT="$repeat" \
     SUMMARY_CSV="${OUTPUT_ROOT}/summary.csv" \
     NUM_PROMPTS="$NUM_PROMPTS" \
+    MEASUREMENT_TARGET="$MEASUREMENT_TARGET" \
     GENERATION_MAX_TOKENS="$GENERATION_MAX_TOKENS" \
     MAX_MODEL_LEN="$MAX_MODEL_LEN" \
     CHUNK_UNIT=sentence \
@@ -137,6 +144,7 @@ launch_job() {
     SECONDS_PER_WORD="$SECONDS_PER_WORD" \
     DIALOGUE_PROMPTS="$DIALOGUE_PROMPTS" \
     MAX_PROMPT_TOKENS="$MAX_PROMPT_TOKENS" \
+    MIN_RESPONSE_CHARS="$MIN_RESPONSE_CHARS" \
     bash exp/run_sslo/run_test.sh "$mode" "$cap" "$model" \
     > "$outdir/run.log" 2>&1
 }

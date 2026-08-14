@@ -76,6 +76,15 @@ def parse_args() -> argparse.Namespace:
              "comma lists, ASCII output, repeated tokens) that lack "
              "sentence-end punctuation. 0 = disabled.",
     )
+    # SSLO
+    parser.add_argument(
+        "--min-response-chars", type=int, default=0,
+        help="Keep only dialogues whose reference response (the assistant "
+             "turn right after the last user turn, dropped when the prompt "
+             "is built) is at least this many chars. Biases the pool toward "
+             "long-output requests, which raises per-request KV footprint. "
+             "0 = disabled. Only used with --dialogue-prompts.",
+    )
     parser.add_argument(
         "--dataset-seed", type=int, default=42,
         help="Seed used by the pool builder shuffle.",
@@ -266,13 +275,15 @@ def _build_pool(args: argparse.Namespace) -> list[str]:
                 args.dataset_name, max_dialogues=args.num_prompts,
                 exclude_code=args.exclude_code, seed=DIALOGUE_BUILD_SEED,
                 conversation_only=args.conversation_only,
-                english_only=args.english_only)
+                english_only=args.english_only,
+                min_response_chars=args.min_response_chars)
 
         dialogues = load_or_build_dialogue_pool(
             dataset_name=args.dataset_name,
             conversation_only=args.conversation_only,
             english_only=args.english_only,
             exclude_code=args.exclude_code,
+            min_response_chars=args.min_response_chars,
             max_dialogues=args.num_prompts,
             seed=args.dataset_seed,
             build_fn=_build_dialogues)
