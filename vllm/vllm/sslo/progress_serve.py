@@ -664,7 +664,7 @@ def token_budget_prefill(
 
 
 def select_offload(
-    deferred_views: list[ProgressView],
+    gpu_views: list[ProgressView],
     delta: float,
     s_now: float,
     s_post: float,
@@ -673,7 +673,13 @@ def select_offload(
     blocks_needed: int,
     blocks_of: Callable[[str], int],
 ) -> list[str]:
-    """Pick deferred GPU reqs whose KV to offload to CPU to free ``blocks_needed``.
+    """Pick GPU-resident reqs whose KV to offload to CPU to free ``blocks_needed``.
+
+    Candidates are every GPU-resident measured request, whether the run/defer
+    split scheduled or deferred it (spec §3④): what makes a request parkable is
+    its slack, not this step's slot assignment. Restricting candidates to the
+    deferred set made the tier unreachable — in the KV-bound regime KV fills
+    before the batch cap, so nothing is ever deferred.
 
     Eligibility is judged on BOTH service shares, and doomed reqs are excluded
     (spec §3④):
@@ -705,12 +711,12 @@ def select_offload(
     first — ties broken by descending block count so fewer requests are moved.
     Selection stops once the cumulative freed block count reaches
     ``blocks_needed``. Returns [] when ``blocks_needed`` <= 0.
-    ``deferred_views`` are all LOC_GPU and measurable.
+    ``gpu_views`` are all LOC_GPU and measurable.
     """
     if blocks_needed <= 0:
         return []
     candidates = []
-    for v in deferred_views:
+    for v in gpu_views:
         _r_defer_now, r_cpu_now, m_cpu_now = request_risk_cpu(
             v, delta, s_now, lead)
         _r_defer_post, r_cpu_post, m_cpu_post = request_risk_cpu(

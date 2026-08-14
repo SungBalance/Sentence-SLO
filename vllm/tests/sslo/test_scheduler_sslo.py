@@ -583,7 +583,8 @@ def test_offload_only_fully_mirrored_when_kv_capped():
     scheduler._sslo_apply_offload(
         0.0, _result(deferred=["p0", "p1", "p2"], k_star=0,
                      k_star_unconstrained=2, kv_capped=True),
-        b=3, delta=1.0, admitted=[p0, p1, p2], new_pending=new_pending)
+        b=3, delta=1.0, admitted=[p0, p1, p2], new_running=[],
+        new_pending=new_pending)
 
     assert "p0" in scheduler._sslo_offloaded
     assert "p1" not in scheduler._sslo_offloaded
@@ -599,6 +600,67 @@ def test_offload_only_fully_mirrored_when_kv_capped():
     assert p0.slo_state.chunk_stats._current_offloaded_iters == 1
 
 
+def test_offload_candidates_include_the_run_set_when_pending_is_empty():
+    # Spec §3④ (2026-08-14): candidates are every GPU-resident measured req,
+    # not just the deferred ones. Under KV pressure KV fills before the batch
+    # cap, so nothing is ever deferred and a pending-only candidate set left
+    # the tier structurally unreachable (measured: pending == 0 on all 9,669
+    # kv_capped steps). Reverting to `for req in new_pending` fails this.
+    cfg = SsloConfig(method="progress_serve", kv_offload=True)
+    r0 = make_offload_request(
+        "r0", make_state(deadline=1000.0), status=RequestStatus.RUNNING)
+    r0.slo_state.length_tail_prob = lambda x: 0.0  # slack-deep → M_cpu ~ 0
+    scheduler = make_scheduler(running=[r0], max_num_running_reqs=4, cfg=cfg)
+    scheduler.waiting = FakeWaitingQueue()
+    scheduler._sslo_offload_conn = FakeOffloadConnector(mirrored={"r0": True})
+    new_running = [r0]
+    new_pending = []
+
+    scheduler._sslo_apply_offload(
+        0.0, _result(deferred=[], k_star=0, k_star_unconstrained=2,
+                     kv_capped=True),
+        b=4, delta=1.0, admitted=[r0], new_running=new_running,
+        new_pending=new_pending)
+
+    assert "r0" in scheduler._sslo_offloaded
+    # A req parked out of the run set must also leave this step's decode set.
+    assert new_running == []
+    assert new_pending == []
+    assert scheduler._sslo_step.num_offloads == 1
+    assert r0.status == RequestStatus.PREEMPTED
+
+
+def test_offload_skips_forced_and_onloading_requests():
+    # Only MEASURED GPU-resident reqs are candidates: a PREFILL req in the run
+    # set is forced (no deadline yet → not measurable) and an onloading req
+    # lives in self.waiting, so neither can be parked.
+    cfg = SsloConfig(method="progress_serve", kv_offload=True)
+    forced = make_offload_request(
+        "f0", make_state(phase=Phase.PREFILL), status=RequestStatus.RUNNING)
+    onloading = make_offload_request(
+        "o0", make_state(deadline=1000.0), status=RequestStatus.PREEMPTED)
+    for r in (forced, onloading):
+        r.slo_state.length_tail_prob = lambda x: 0.0
+    scheduler = make_scheduler(running=[forced], max_num_running_reqs=4,
+                               cfg=cfg)
+    scheduler.waiting = FakeWaitingQueue([onloading])
+    scheduler._sslo_offload_conn = FakeOffloadConnector(
+        mirrored={"f0": True, "o0": True})
+    scheduler._sslo_onloading = {"o0": onloading}
+    new_running = [forced]
+
+    scheduler._sslo_apply_offload(
+        0.0, _result(deferred=[], k_star=0, k_star_unconstrained=2,
+                     kv_capped=True),
+        b=4, delta=1.0, admitted=[forced], new_running=new_running,
+        new_pending=[])
+
+    assert scheduler._sslo_offloaded == {}
+    assert new_running == [forced]
+    assert scheduler._sslo_onloading == {"o0": onloading}
+    assert scheduler._sslo_step.num_offloads == 0
+
+
 def test_offload_skipped_when_not_kv_capped():
     cfg = SsloConfig(method="progress_serve", kv_offload=True)
     p0 = make_offload_request(
@@ -611,7 +673,8 @@ def test_offload_skipped_when_not_kv_capped():
     scheduler._sslo_apply_offload(
         0.0, _result(deferred=["p0"], k_star=1, k_star_unconstrained=1,
                      kv_capped=False),
-        b=2, delta=1.0, admitted=[p0], new_pending=new_pending)
+        b=2, delta=1.0, admitted=[p0], new_running=[],
+        new_pending=new_pending)
 
     assert scheduler._sslo_offloaded == {}
     assert new_pending == [p0]
@@ -651,7 +714,7 @@ def test_onload_forced_insert_off_budget_and_reserves_slot():
     scheduler._sslo_apply_offload(
         0.0, _result(deferred=[], k_star=1, k_star_unconstrained=1,
                      kv_capped=False),
-        b=2, delta=1.0, admitted=[], new_pending=[])
+        b=2, delta=1.0, admitted=[], new_running=[], new_pending=[])
 
     assert "o0" in scheduler._sslo_onloading
     assert "o0" not in scheduler._sslo_offloaded
@@ -699,7 +762,8 @@ def test_residency_guard_blocks_reoffload():
     scheduler._sslo_apply_offload(
         0.0, _result(deferred=["p0"], k_star=0, k_star_unconstrained=1,
                      kv_capped=True),
-        b=2, delta=1.0, admitted=[p0], new_pending=new_pending)
+        b=2, delta=1.0, admitted=[p0], new_running=[],
+        new_pending=new_pending)
 
     assert scheduler._sslo_offloaded == {}
     assert new_pending == [p0]
@@ -758,7 +822,7 @@ def test_offload_gets_both_shares_onload_gets_the_current_one(
     scheduler._sslo_apply_offload(
         0.0, _result(deferred=["p0"], k_star=2, k_star_unconstrained=18,
                      kv_capped=True),
-        b=8, delta=1.0, admitted=[p0], new_pending=[p0])
+        b=8, delta=1.0, admitted=[p0], new_running=[], new_pending=[p0])
 
     # n_base = |A| (1) + onloading (1) [+ parked (1)].
     s_now = ps.service_share(8, n_base + 2)
@@ -779,7 +843,7 @@ def test_offload_shares_both_equal_onload_share_when_k_star_not_capped(
     scheduler._sslo_apply_offload(
         0.0, _result(deferred=["p0"], k_star=4, k_star_unconstrained=4,
                      kv_capped=True),
-        b=8, delta=1.0, admitted=[p0], new_pending=[p0])
+        b=8, delta=1.0, admitted=[p0], new_running=[], new_pending=[p0])
 
     s = ps.service_share(8, 3 + 4)
     assert seen["onload"] == s
@@ -865,6 +929,38 @@ def test_schedule_sslo_disabled_admits_up_to_budget(monkeypatch):
     # budget=2 → exactly n0, n1 admitted FCFS; n2 stays in the waiting queue.
     assert request_ids(scheduler.running) == ["n0", "n1"]
     assert request_ids(scheduler.waiting) == ["n2"]
+
+
+def test_schedule_sslo_run_set_offload_leaves_no_trace(monkeypatch):
+    # Coherence of the run-set offload (spec §3④): the real policy runs inside
+    # schedule_sslo, so a request parked out of the run set must be gone from
+    # self.running, self.sslo_pending AND the step's outputs — otherwise the
+    # engine would decode a request whose GPU blocks were just freed.
+    cfg = SsloConfig(method="progress_serve", kv_offload=True)
+    r0 = make_offload_request(
+        "r0", make_state(deadline=1000.0), status=RequestStatus.RUNNING)
+    r0.slo_state.length_tail_prob = lambda x: 0.0
+    scheduler = make_scheduler(running=[r0], max_num_running_reqs=4, cfg=cfg)
+    # One waiting req whose measured block demand (1600/16 = 100) exceeds the
+    # free pool → the k* scan stops on KV → kv_capped, the offload trigger.
+    scheduler.waiting = FakeWaitingQueue(
+        [_waiting_request("w0", num_tokens=1600)])
+    scheduler.kv_cache_manager.block_pool = SimpleNamespace(
+        get_num_free_blocks=lambda: 10)
+    scheduler._sslo_offload_conn = FakeOffloadConnector(mirrored={"r0": True})
+    _prep_schedule_sslo(scheduler, budget=0, cur_max=4, monkeypatch=monkeypatch)
+    # _prep_schedule_sslo stubs the policy; this test needs the real one.
+    scheduler._apply_sslo_policy = scheduler._resolve_sslo_policy_dispatch()
+
+    output = scheduler.schedule_sslo()
+
+    assert "r0" in scheduler._sslo_offloaded
+    assert scheduler.running == []
+    assert scheduler.sslo_pending == []
+    assert "r0" not in output.num_scheduled_tokens
+    assert "r0" not in [req.request_id for req in scheduler.waiting]
+    # The worker/connector drop it exactly like a preemption.
+    assert "r0" in output.preempted_req_ids
 
 
 def test_schedule_sslo_onload_traverses_off_budget(monkeypatch):

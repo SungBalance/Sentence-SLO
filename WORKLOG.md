@@ -3041,3 +3041,40 @@ share(s_now 0.889, s_post 0.634 — 발동 스텝은 100%가 s<1이고 전체 �
 확인 수단이다. 다만 자격 통과율이 289→279/300으로 3% 축소에 그쳐 tier를 무력화할
 위험은 낮다. 재실행에서 볼 것: num_offloads 대비 num_onloads 비율, num_offloaded
 중앙값(>0이어야 상주), 붕괴 셀의 재적 회복 여부.
+
+## 2026-08-14 — offload tier 후보 집합을 GPU 상주 measured 전체로 확대 (§3④ 개정 구현)
+
+**수정 내용**: `_sslo_apply_offload`가 offload 후보를 `new_pending`에서만 뽑던 것을
+`new_running + new_pending`(GPU 상주 measured 전체)로 넓혔다. pending은 디코드 슬롯이
+모자랄 때만 채워지는데 offload가 겨냥하는 KV-bound regime에서는 KV가 batch cap보다
+먼저 차서 재적이 cap에 닿지 않는다 → pending 항상 0 → 후보 부재로 tier가 원리적으로
+발동 불가였다(실측: kv_capped 9,669스텝 전부 pending=0). 자격 조건(2-share max M_cpu ≤ ε,
+두 share의 doomed guard, is_fully_mirrored, residency)은 그대로다.
+
+**정합성 처리**: 후보를 `rid -> (req, 그 요청이 든 리스트)`로 들고 있다가 offload 확정 시
+`home.remove(req)`로 원래 리스트에서 뺀다. `new_running`은 `_sslo_commit_step`에서
+`self.running`으로 그대로 대입되고 그 뒤에 schedule_sslo의 running 루프가 돌므로,
+commit 전에 리스트에서 빼는 것만으로 self.running / num_scheduled_tokens / 워커 입력이
+모두 일관된다(별도 self.running 조작 불필요 — pending 경로가 쓰던 계약과 동일).
+`_preempt_request`의 `status == RUNNING` assert는 run 집합 요청에 오히려 자명하게 성립하고,
+offload된 id는 기존대로 `_sslo_offloaded_this_step` → `preempted_req_ids`로 전달된다.
+forced(PREFILL/WARMUP)는 `is_measurable()`에서, onloading은 self.waiting에 있어
+두 리스트 어디에도 없으므로 후보에서 계속 제외된다.
+`select_offload`의 파라미터명 `deferred_views` → `gpu_views` (docstring 동기화).
+
+**추가 테스트** (`tests/sslo/test_scheduler_sslo.py`):
+`test_offload_candidates_include_the_run_set_when_pending_is_empty`(이번 결함 회귀 방어선),
+`test_schedule_sslo_run_set_offload_leaves_no_trace`(실제 정책으로 schedule_sslo를 돌려
+running/sslo_pending/num_scheduled_tokens/waiting 어디에도 안 남고 preempted_req_ids에는
+드는지 단언), `test_offload_skips_forced_and_onloading_requests`.
+
+**검증**: `pytest tests/sslo/ -q` → 216 passed(기존 실패 `test_tts_consume_path` 1건 제외),
+compileall 통과. mutation: 후보를 `new_pending` 단독으로 되돌리면 위 회귀 테스트 2건이
+실패함을 확인 후 원복. 기존 2-share + doomed guard 왕복 차단 그리드 테스트는 순수 함수
+레벨이라 영향 없이 통과. GPU 실행 금지 조건이라 실측 재확인은 미실시.
+
+**잔존 위험**: `token_budget_control=True`일 때 `_sslo_prefill_token_budget`의 W는
+commit 전 `self.running + self.sslo_pending`을 훑는데, offload된 요청은 그 시점에도
+아직 옛 리스트에 남아 있고 `_preempt_request`가 `num_computed_tokens`를 0으로 되돌린
+탓에 그 스텝 한 번 프롬프트 전체가 W에 잡힌다. pending 경로에도 동일하게 있던
+기존 거동이며 방향은 보수적(W 과대 → P 짧음)이라 이번 범위에서는 두었다.

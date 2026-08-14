@@ -49,8 +49,23 @@
      KV가 스캔을 멈췄으면 kv_capped ← true (이제 실제 용량 기준)
 ④ offload/onload (kv_capped일 때만):
      onload 먼저 — d−t ≤ ℓΔ+f̂ 인 offloaded를 복원 시작 (deadline 안전 우선)
-     offload — pending 중 M_cpu ≤ ε ∧ residency ≥ ρ 를 slack 깊은 순으로,
-               admission에 필요한 블록만큼만
+     offload — **GPU 상주 measured 전체**(②가 run으로 정했든 defer했든) 중
+               자격을 만족하는 것을 slack 깊은 순으로, admission에 필요한
+               블록만큼만. run으로 정해졌던 요청을 내보내면 이번 스텝의
+               디코드 집합에서 제거한다.
+     **후보를 pending으로 한정하던 것을 폐기 (2026-08-14 개정)**: pending은
+     디코드 슬롯이 모자랄 때만 채워지는데(`decode_cap = b − forced −
+     onloading − admits`), offload가 겨냥하는 KV-bound regime에서는 KV가
+     batch cap보다 먼저 차서 **재적이 cap에 닿지 않는다 → pending이 항상 0 →
+     후보가 없어 tier가 원리적으로 발동 불가**. 두 조건이 상호 배타적이었다.
+     실측(phaseH cap64 r0.3, 긴-출력 워크로드): kv_capped가 발화한 9,669스텝
+     **전부에서 pending=0**, 그런데 같은 스텝의 running 36 / waiting 26 /
+     k*=1 vs k*_unconstrained=26 / e_viol p50 **0.00** — 위험은 전혀 없고
+     메모리만 25명분 admission을 막는, 교과서적 offload 상황인데 메커니즘이
+     닿지 못했다. 이것이 전 phase에서 offload 실행이 0회였던 진짜 원인이다.
+     근거: 소비자보다 한참 앞선 요청은 run 집합에 있든 pending에 있든
+     M_cpu ≈ 0으로 똑같이 안전하다 — park 가능성을 정하는 것은 슬랙이지
+     이번 스텝의 슬롯 배정이 아니다.
      **두 판정은 서로 다른 share를 쓴다 (2026-08-14 개정)**:
        onload  : s_now  = B / (|A| + onloading + k* + parked)   — 지금의 실제 상태
        offload : s_post = B / (|A| + onloading + **k\*_unconstrained** + parked)
@@ -227,6 +242,15 @@
   나타난다. §3④의 share 개정은 offload 왕복을 막지만 이 과다-발급 자체는
   남는다. 후보: admit 램프(비운 만큼을 한 번에 쓰지 않음) / forced 요청의
   예상 위험을 할인 계상. 현행은 관측만 기록.
+- **W 산입이 stale 속성을 읽음** (2026-08-14 기록, 기존 결함·빈도만 증가):
+  `_sslo_prefill_token_budget`의 W 합산은 `_sslo_apply_offload` 이후·commit
+  이전의 `self.running`/`self.sslo_pending`을 읽으므로, 이번 스텝에 offload된
+  요청이 아직 그 안에 남아 있고 `_preempt_request`가 `num_computed_tokens`를
+  0으로 리셋한 뒤라 **프롬프트 전체 길이가 한 스텝 동안 W로 잡힌다.** pending
+  전용이던 시절에도 있던 구조이나 후보 확대(§3④)로 빈도가 오른다. W 과대는
+  TB*를 짧게 만드는 방향이라 대체로 보수적이지만, `token_budget_prefill_risk`가
+  W 증가에 대해 항상 단조 감소는 아니어서 "항상 안전"은 증명되지 않았다.
+  확인 방법: kv_capped 스텝의 TB* 분포를 offload 발생/미발생으로 갈라 대조.
 - **borderline 인질** (burst-horizon의 잔존 한계): floor에서는 살릴 수 있으나
   base에서는 doomed가 되는 요청(R 0.6→1.0)은 한계 기여가 ~0.4로 크다. 완전
   doomed(기여 0)와 마감 먼 요청(기여 0)은 해소됐지만 이 경계층은 남는다.

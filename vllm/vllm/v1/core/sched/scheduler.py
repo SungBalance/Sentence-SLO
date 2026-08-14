@@ -1868,7 +1868,7 @@ class Scheduler(SchedulerInterface):
         # onloading reqs are already queued for the waiting-admission loop.
         if self._sslo_offload_conn is not None:
             self._sslo_apply_offload(now, result, b, delta, admitted,
-                                     new_pending)
+                                     new_running, new_pending)
 
         # SSLO: Token Budget P axis — TB*_pre on the same E_viol ledger, priced
         # against Δ_dec at the decode set the run/defer split just settled.
@@ -1959,12 +1959,14 @@ class Scheduler(SchedulerInterface):
         b: int,
         delta: float,
         admitted: list[Request],
+        new_running: list[Request],
         new_pending: list[Request],
     ) -> None:
         """Onload CPU-resident requests nearing their deadline, then (only
-        under KV admission pressure) offload slack-deep fully-mirrored deferred
-        requests to CPU. Mutates ``new_pending`` in place (offloaded reqs are
-        removed before commit)."""
+        under KV admission pressure) offload slack-deep fully-mirrored
+        GPU-resident requests to CPU. Mutates ``new_running`` / ``new_pending``
+        in place (offloaded reqs are removed before commit, so a request parked
+        out of the run set also leaves this step's decode set)."""
         cfg = self.sslo_config
         lead = cfg.kv_onload_lead_iters
         eps = cfg.kv_offload_risk_eps
@@ -2015,30 +2017,42 @@ class Scheduler(SchedulerInterface):
 
             min_res = cfg.kv_offload_min_residency_steps
             cand_views: list[ps.ProgressView] = []
-            cand_by_id: dict[str, Request] = {}
-            for req in new_pending:
-                if req.slo_state is None:
-                    continue
-                rid = req.request_id
-                if min_res > 0:
-                    last = self._sslo_last_onload_step.get(rid)
-                    if last is not None and self._sslo_step_idx - last < min_res:
+            # rid -> (request, the list it currently sits in). Candidates are
+            # ALL GPU-resident measured in-flight reqs, run set included (spec
+            # §3④): pending is only filled when the batch cap binds, but under
+            # KV pressure KV fills first, so a defer-only candidate set is
+            # always empty and the tier could never fire. Non-measured (forced
+            # PREFILL/WARMUP) reqs drop out on `is_measurable`; onloading reqs
+            # are in self.waiting, hence in neither list.
+            cand_by_id: dict[str, tuple[Request, list[Request]]] = {}
+            for home in (new_running, new_pending):
+                for req in home:
+                    if req.slo_state is None:
                         continue
-                if not self._sslo_offload_conn.is_fully_mirrored(req):
-                    continue
-                view = self._sslo_offload_view(req, ps.LOC_GPU, now)
-                if not view.is_measurable():
-                    continue
-                cand_views.append(view)
-                cand_by_id[rid] = req
+                    rid = req.request_id
+                    if min_res > 0:
+                        last = self._sslo_last_onload_step.get(rid)
+                        if (last is not None
+                                and self._sslo_step_idx - last < min_res):
+                            continue
+                    if not self._sslo_offload_conn.is_fully_mirrored(req):
+                        continue
+                    view = self._sslo_offload_view(req, ps.LOC_GPU, now)
+                    if not view.is_measurable():
+                        continue
+                    cand_views.append(view)
+                    cand_by_id[rid] = (req, home)
 
             for rid in ps.select_offload(
                     cand_views, delta, s_now, s_post, lead, eps, blocks_needed,
                     self._sslo_num_gpu_blocks):
-                req = cand_by_id[rid]
+                req, home = cand_by_id[rid]
                 if not self._sslo_offload_conn.pin_request_cpu_blocks(req):
                     continue
-                new_pending.remove(req)
+                # Drop from the run/defer set BEFORE commit: `new_running`
+                # becomes self.running, so a req parked out of the run set must
+                # leave it or the engine would try to decode freed KV.
+                home.remove(req)
                 self._sslo_offload_request(req, now)
                 num_offloads += 1
                 self._sslo_log_offload_event("offload", rid, now)
@@ -2050,7 +2064,7 @@ class Scheduler(SchedulerInterface):
 
     # SSLO
     def _sslo_offload_request(self, request: Request, now: float) -> None:
-        """Offload a fully-mirrored deferred request's KV to CPU.
+        """Offload a fully-mirrored GPU-resident request's KV to CPU.
 
         Reuses ``_preempt_request`` for the exact preemption bookkeeping (free
         GPU blocks, reset computed tokens, status PREEMPTED, count preemption)
