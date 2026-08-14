@@ -121,7 +121,7 @@ lever pays for itself, in which regime, and do they compose*.
 | Configuration | Lever added | Binding resource it relieves | Acts when |
 |---|---|---|---|
 | **ProgressServe** (§4.1) | run/defer + $E_{viol}$-budgeted admission | none — it *harvests* slack and spends it on concurrency | always |
-| **+ Offload** (§4.2) | park deferred requests' KV on CPU, restore before the deadline | **KV memory** — deferred requests keep their blocks | `kv-capped` steps only |
+| **+ Offload** (§4.2) | park the KV of requests far ahead of their consumer on CPU, restore before the deadline | **KV memory** — in-flight requests hold blocks whether or not they decode | `kv-capped` steps only |
 | **+ Adaptive** (§4.3) | per-step prefill token budget $TB^{*}$ | **step-time compute** — prefill spikes freeze every consumer | prefill work coexists with at-risk in-flight requests |
 | **+ Both** | both of the above | either | union of the two triggers |
 
@@ -195,13 +195,14 @@ are §4.2 and §4.3.
 
 ### 4.2 Offloading
 
-**Why it is needed.** Deferral separates a request's *service* from its *memory*: a
-pending request consumes no compute but still occupies its full KV footprint. On
+**Why it is needed.** Being ahead of one's consumer separates a request's *urgency*
+from its *memory*: a request with several units of slack needs no tokens this step but
+still occupies its full KV footprint. On
 long-context workloads this is the dominant admission constraint — the KV pool saturates
 while the risk budget $E_{viol}$ still has room ($k^{*}$ wants to admit; free blocks do
 not allow it). The slack harvested by §4.1 is then stranded: it cannot be spent on new
 users because departed-but-parked state is holding the room. Offloading un-strands it by
-moving the KV of the *safest* pending requests to host memory, on the observation that a
+moving the KV of the *safest* in-flight requests to host memory, on the observation that a
 request that is many units ahead of its consumer does not need its KV on the GPU *right
 now* — it needs it back *before its deadline*.
 
@@ -209,13 +210,20 @@ now* — it needs it back *before its deadline*.
 CPU) and the transient `onloading` (KV streaming back). Three rules govern it, all
 expressed in the §4.1 risk model:
 
-- *Eligibility (offload).* For a pending request, define $N_{defer\_cpu}$ as $N_{defer}$
+- *Eligibility (offload).* For any GPU-resident measured request — whether or not this
+  step's run/defer partition gave it a slot — define $N_{defer\_cpu}$ as $N_{defer}$
   minus the tokens forgone during the *onload lead* $\ell$ (the iterations needed to
   stream KV back before it can decode), and
   $$M_{cpu} \;=\; R_{defer\_cpu} - R_{defer} \;\ge\; 0$$
   — the *risk premium of a CPU stay*. Only requests with $M_{cpu} \le \varepsilon$
   (default $10^{-3}$) may be offloaded: parking them is, to within $\varepsilon$,
-  free in violation probability. A minimum-residency guard suppresses thrashing.
+  free in violation probability. Two refinements make that test honest. It is
+  evaluated under *both* the current service share and the share that will hold once
+  the freed blocks are spent on admissions — otherwise the admission the offload
+  enables shrinks everyone's share and immediately makes the just-parked request an
+  onload candidate. And a request that will miss regardless ($R_{defer\_cpu} \ge 1$)
+  is excluded, mirroring the run-side guard of §4.1: parking it frees nothing, because
+  the deadline-safety net pulls it straight back.
 - *Trigger.* Offloading fires only on **kv-capped** steps (§4.1), and frees only as many
   blocks as admission actually needs. On every other step the mechanism is a no-op —
   in KV-slack regimes the system is bit-for-bit the scheduler of §4.1.
